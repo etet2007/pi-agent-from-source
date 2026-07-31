@@ -6,7 +6,7 @@
 
 本仓库是一本**中文源码解析书**的工程：《Pi Agent 源码解析》。它从源码角度剖析 Pi Agent（一个刻意保持最小化的开源编码 Agent）的实现。书的全部内容是自包含的 Markdown 文档，位于 `books/`。根目录 `README.md` 是全书的入口（简介 + 目录）。
 
-本书的写作参考了 `.tmp/claude-code-from-source-cn-zh-cn`（一本 Claude Code 源码解析书）的叙事结构，但分析对象与章节结构均针对 Pi Agent 重新设计。全书主线是 Pi Agent 的**最小化核心哲学**（"复杂性守恒"：核心保持最小，把复杂性推到扩展/容器/可选包等边缘）。
+本书的写作参考了 [Claude Code 源码解析](https://github.com/kuwii/claude-code-from-source-cn)（一本 Claude Code 源码解析书）的叙事结构，但分析对象与章节结构均针对 Pi Agent 重新设计。全书主线是 Pi Agent 的**最小化核心哲学**（"复杂性守恒"：核心保持最小，把复杂性推到扩展/容器/可选包等边缘）。
 
 ## 仓库结构
 
@@ -21,7 +21,6 @@
 ├── pi-agent-src/      # git 子模块 → https://github.com/earendil-works/pi.git
 │                      #   被分析的 Pi Agent 源码。只读参考。
 │                      #   注意：它有自己的 AGENTS.md，那是给"开发 pi"用的，不适用于本仓库。
-├── .tmp/              # git-ignored。claude-code-from-source-cn-zh-cn 参考书。只读参考。
 ├── .gitmodules
 └── LICENSE
 ```
@@ -48,12 +47,10 @@
 - **commit message 用英文。**
 - **只暂存明确的路径**（`git add <path1> <path2>`）；**绝不**使用 `git add -A` / `git add .`。
 - 书的内容在外层仓库提交。`pi-agent-src` 是子模块——**不要**进入其中提交，也不要改动其指针，除非用户明确要求。
-- `.tmp/` 被 git 忽略，不要尝试提交。
 - 提交前用 `git status` 确认只包含本次改动的文件。
 
 ## 禁止事项
 
 - **不要修改 `pi-agent-src/` 的任何源码**——它是被分析的对象，是只读参考。
 - **不要把 `pi-agent-src/AGENTS.md` 里的规则当作本仓库的规则**——那些规则用于开发 pi 本身（如其 biome 检查、测试命令、changelog 流程），与"写这本书"无关。
-- **不要修改 `.tmp/` 下的参考书。**
 - 不要在未读源码核对的情况下，凭印象书写或"修正"代码引用。
