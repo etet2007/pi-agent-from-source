@@ -150,59 +150,59 @@ sequenceDiagram
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 1 | [架构总览：最小化 Agent 的设计哲学](./books/ch01-architecture.md) | 九个包的依赖栈、核心/Harness 二分、项目信任、与单体路线的对照 |
-| 2 | [与模型对话：pi-ai 统一 LLM 层](./books/ch02-ai-layer.md) | `Api`/`Provider` 二层抽象、统一消息格式、`EventStream`、SSE 解析、惰性加载、模型元数据生成、双层重试、成本核算 |
+| 1 | [架构总览：最小化 Agent 的设计哲学](./book/ch01-architecture.md) | 九个包的依赖栈、核心/Harness 二分、项目信任、与单体路线的对照 |
+| 2 | [与模型对话：pi-ai 统一 LLM 层](./book/ch02-ai-layer.md) | `Api`/`Provider` 二层抽象、统一消息格式、`EventStream`、SSE 解析、惰性加载、模型元数据生成、双层重试、成本核算 |
 
 ### 第二部分：Agent 核心
 *系统的心跳：流式输出、执行工具、观察结果、重复。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 3 | [Agent Loop：两层嵌套循环](./books/ch03-agent-loop.md) | `runLoop` 状态机、`StreamFn` 边界、`AgentEvent` 事件流、续接/停止决策、截断保护 |
-| 4 | [工具系统：从定义到执行](./books/ch04-tools.md) | `AgentTool` 接口、prepare/execute/finalize 三阶段、sequential vs parallel、文件互斥队列、七个内置工具 |
-| 5 | [状态、消息与会话树](./books/ch05-state-and-session-tree.md) | 可变 `AgentState`、`AgentMessage` 与声明合并、`convertToLlm`、可追加可分支的会话树、JSONL/SQLite 存储后端 |
+| 3 | [Agent Loop：两层嵌套循环](./book/ch03-agent-loop.md) | `runLoop` 状态机、`StreamFn` 边界、`AgentEvent` 事件流、续接/停止决策、截断保护 |
+| 4 | [工具系统：从定义到执行](./book/ch04-tools.md) | `AgentTool` 接口、prepare/execute/finalize 三阶段、sequential vs parallel、文件互斥队列、七个内置工具 |
+| 5 | [状态、消息与会话树](./book/ch05-state-and-session-tree.md) | 可变 `AgentState`、`AgentMessage` 与声明合并、`convertToLlm`、可追加可分支的会话树、JSONL/SQLite 存储后端 |
 
 ### 第三部分：持久化编排
 *让 Agent 拥有跨轮次、跨会话的记忆与结构。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 6 | [AgentHarness：可持久化的编排器](./books/ch06-harness.md) | 核心/Harness 分层、phase 状态机、turn 快照、hook 系统、写缓冲、`ExecutionEnv` 依赖反转 |
-| 7 | [上下文压缩与分支摘要](./books/ch07-compaction.md) | `shouldCompact`、切点选择、摘要生成、分支摘要、token 估算 |
+| 6 | [AgentHarness：可持久化的编排器](./book/ch06-harness.md) | 核心/Harness 分层、phase 状态机、turn 快照、hook 系统、写缓冲、`ExecutionEnv` 依赖反转 |
+| 7 | [上下文压缩与分支摘要](./book/ch07-compaction.md) | `shouldCompact`、切点选择、摘要生成、分支摘要、token 估算 |
 
 ### 第四部分：编码 Agent 产品
 *`pi` 命令如何把上述一切组装成一个可用的产品。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 8 | [启动流水线：从 cli.ts 到模式分发](./books/ch08-bootstrap.md) | 入口 shim、`main()` 引导序列、`resolveAppMode`、参数解析、三种运行模式 |
-| 9 | [AgentSession：中央编排器](./books/ch09-agent-session.md) | `createAgentSession` 的装配点、事件系统、`prompt()` 生命周期、steering/follow-up 队列 |
-| 10 | [系统提示词与资源装配](./books/ch10-system-prompt.md) | `buildSystemPrompt`、skills、prompt 模板、项目上下文文件、斜杠命令 |
-| 11 | [三种运行模式](./books/ch11-modes.md) | 交互式 TUI REPL、print/headless 模式、RPC 模式如何消费同一条事件流 |
+| 8 | [启动流水线：从 cli.ts 到模式分发](./book/ch08-bootstrap.md) | 入口 shim、`main()` 引导序列、`resolveAppMode`、参数解析、三种运行模式 |
+| 9 | [AgentSession：中央编排器](./book/ch09-agent-session.md) | `createAgentSession` 的装配点、事件系统、`prompt()` 生命周期、steering/follow-up 队列 |
+| 10 | [系统提示词与资源装配](./book/ch10-system-prompt.md) | `buildSystemPrompt`、skills、prompt 模板、项目上下文文件、斜杠命令 |
+| 11 | [三种运行模式](./book/ch11-modes.md) | 交互式 TUI REPL、print/headless 模式、RPC 模式如何消费同一条事件流 |
 
 ### 第五部分：终端界面
 *用户看到的一切都经过这一层——而这一层是从零写的。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 12 | [pi-tui：自研渲染器](./books/ch12-tui-rendering.md) | 组件即 `render(width) => string[]`、逐行差分、主屏/备屏双渲染器、帧调度、同步输出 |
-| 13 | [输入、按键与编辑器](./books/ch13-input-and-editor.md) | Kitty 键盘协议协商、`StdinBuffer` 序列重组、按键解析、快捷键、`Editor` 组件 |
+| 12 | [pi-tui：自研渲染器](./book/ch12-tui-rendering.md) | 组件即 `render(width) => string[]`、逐行差分、主屏/备屏双渲染器、帧调度、同步输出 |
+| 13 | [输入、按键与编辑器](./book/ch13-input-and-editor.md) | Kitty 键盘协议协商、`StdinBuffer` 序列重组、按键解析、快捷键、`Editor` 组件 |
 
 ### 第六部分：扩展与连接
 *最小化核心如何向外延伸，而不被复杂性淹没。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 14 | [扩展系统：最小化核心的延伸](./books/ch14-extensions.md) | `ExtensionAPI`、注册工具/命令/快捷键/flag、skills/模板/主题、为什么没有 MCP 与钩子 |
-| 15 | [远程控制：守护进程、RPC 与协议](./books/ch15-remote.md) | `pi-server` 监督器、无头 RPC 子进程、Radius 中继、`pi-protocol`/`pi-client` 的 CBOR 通道 |
+| 14 | [扩展系统：最小化核心的延伸](./book/ch14-extensions.md) | `ExtensionAPI`、注册工具/命令/快捷键/flag、skills/模板/主题、为什么没有 MCP 与钩子 |
+| 15 | [远程控制：守护进程、RPC 与协议](./book/ch15-remote.md) | `pi-server` 监督器、无头 RPC 子进程、Radius 中继、`pi-protocol`/`pi-client` 的 CBOR 通道 |
 
 ### 第七部分：质量与结语
 *如何验证一个 Agent 真的变好了，以及我们从中学到了什么。*
 
 | # | 章节 | 你将学到什么 |
 |---|------|-------------|
-| 16 | [行为评估：pi-evals](./books/ch16-evals.md) | 模型驱动的端到端评估、harness 对照表、pass-rate lift、token/延迟/成本配对差 |
-| 17 | [结语：最小化的赌注](./books/ch17-epilogue.md) | 六个架构赌注、可迁移的经验、最小化与综合性的权衡 |
+| 16 | [行为评估：pi-evals](./book/ch16-evals.md) | 模型驱动的端到端评估、harness 对照表、pass-rate lift、token/延迟/成本配对差 |
+| 17 | [结语：最小化的赌注](./book/ch17-epilogue.md) | 六个架构赌注、可迁移的经验、最小化与综合性的权衡 |
 
 ---
 
