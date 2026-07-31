@@ -1,0 +1,16 @@
+{
+	"name": "pi-agent-from-source",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"gen:preface": "node scripts/gen-preface.mjs",
+		"docs:dev": "node scripts/gen-preface.mjs && vitepress dev",
+		"docs:build": "node scripts/gen-preface.mjs && vitepress build",
+		"docs:preview": "vitepress preview"
+	},
+	"devDependencies": {
+		"mermaid": "^11.4.1",
+		"vitepress": "^1.6.3",
+		"vitepress-plugin-mermaid": "^2.0.17"
+	}
+}

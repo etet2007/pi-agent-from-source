@@ -1,2 +1,7 @@
 .DS_Store
 .tmp/
+
+# 站点构建产物与依赖
+node_modules/
+.vitepress/dist/
+.vitepress/cache/

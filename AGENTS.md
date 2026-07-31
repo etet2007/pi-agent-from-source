@@ -12,9 +12,14 @@
 
 ```
 .
-├── README.md          # 全书入口：简介 + 目录（链接指向 book/）
+├── README.md          # 全书入口：简介 + 目录（链接指向 book/）；也是站点序言页的来源
 ├── AGENTS.md          # 本文件
+├── package.json       # 站点构建依赖与脚本（VitePress）
+├── .vitepress/        # VitePress 站点配置（config.mts）
+├── scripts/           # gen-preface.mjs：由 README.md 生成 book/index.md
+├── .github/workflows/ # deploy.yml：构建并发布到 GitHub Pages
 ├── book/              # 书的正文：ch01–ch17，自包含 Markdown
+│   ├── index.md       # 序言页（由 scripts/gen-preface.mjs 从 README.md 生成）
 │   ├── ch01-architecture.md
 │   ├── ...
 │   └── ch17-epilogue.md
@@ -41,6 +46,17 @@
 - **交叉引用**：用"第 N 章"形式；新增/改动章节时检查相关引用是否仍然准确。
 - **主线一致**：保持"最小化核心 / 复杂性守恒 / 与 Claude Code 综合体路线对照"这条主线连贯。
 - 修改既有章节时，模仿其既有风格与结构，不要引入不一致的语气或格式。
+
+## 静态网站（VitePress + GitHub Pages）
+
+书用 [VitePress](https://vitepress.dev)（默认主题）构建为静态网站，mermaid 图由 `vitepress-plugin-mermaid` 渲染，经 GitHub Actions 发布到 GitHub Pages。
+
+- **本地命令**：`npm install` 之后，`npm run docs:dev`（开发预览）、`npm run docs:build`（构建到 `.vitepress/dist`）、`npm run docs:preview`（预览构建产物）。
+- **序言页**：`book/index.md` 是站点首页（序言），由 `scripts/gen-preface.mjs` 从根 `README.md` 生成（`docs:dev`/`docs:build` 会先自动运行它）。**序言内容的唯一来源是 `README.md`**——要改序言请改 `README.md`，不要手改 `book/index.md`（会被覆盖）。脚本只做一件事：把 README 里 `./book/chXX.md` 的章节链接前缀重写为 `./chXX.md`。
+- **新增章节**：在 `book/` 加 `chNN-slug.md` 后，需在 `.vitepress/config.mts` 的 `sidebar` 中登记，否则不会出现在侧边栏。
+- **base 路径**：`config.mts` 的 `base: "/pi-agent-from-source/"` 必须与 GitHub 仓库名一致，否则 Pages 上资源会 404。
+- **部署**：push 到 `main` 触发 `.github/workflows/deploy.yml`（构建 + `actions/deploy-pages`）。需在仓库 Settings → Pages 把 Source 设为 “GitHub Actions”。
+- **Markdown 即 Vue**：VitePress 把 Markdown 当 Vue 组件编译——正文（非代码块）里避免裸的 `{{ }}`、`<script>` 等会被 Vue 解析的字符；代码块内不受影响。
 
 ## Git 规范
 
