@@ -1,0 +1,234 @@
+# 第 13 章：输入、按键与编辑器
+
+## 被低估的难题
+
+如果说渲染是"把字符串写到终端"，那输入就是"从终端读字符串"——听起来都不难。但任何写过终端应用的人都知道，输入是个泥潭。
+
+终端键盘输入的历史包袱极重。一个按键到达你的程序时，可能是一字节（`a`）、一个传统转义序列（方向键 `\x1b[A`）、一个 modifyOtherKeys 序列（`Ctrl+Shift+p`）、或一个 Kitty 协议序列（带修饰键、按下/释放、基础布局键）。`Ctrl+C` 是 `\x03` 还是 `\x1b[99;5u`？`Shift+Tab` 是 `\x1b[Z` 还是别的？粘贴的多行文本如何与逐字节到达的键盘输入区分？Windows 的控制台又是另一套规则。
+
+`pi-tui` 的输入栈就是为了驯服这个泥潭。本章追踪一个按键从 `process.stdin` 到焦点组件 `handleInput` 的完整旅程，看 Pi Agent 如何在协议协商、序列重组、按键解析、快捷键绑定每一层上做正确的工程决策。最后我们看那个 2,352 行的 `Editor`——一个 Emacs 风格的多行编辑器，是这套输入栈最重的消费者。
+
+---
+
+## 输入的旅程
+
+一个按键的完整流水线：
+
+```mermaid
+graph LR
+    A["process.stdin<br/>(raw mode)"] --> B["StdinBuffer<br/>重组转义序列<br/>分离粘贴"]
+    B --> C["ProcessTerminal<br/>输入处理器"]
+    C --> D["TuiBase.handleTerminalInput"]
+    D --> E["输入监听器<br/>(可 consume/改写)"]
+    E --> F["焦点组件<br/>handleInput(data)"]
+    F --> G["requestRender()"]
+```
+
+每一层解决一个问题：`StdinBuffer` 解决"字节流如何切成完整的序列"，`ProcessTerminal` 解决"终端协议如何协商"，`keys.ts` 解决"序列如何映射到语义按键"，`keybindings.ts` 解决"语义按键如何绑定到动作"。让我们自底向上看。
+
+---
+
+## 终端设置：raw mode 与协议协商
+
+`ProcessTerminal.start`（`packages/tui/src/terminal.ts`）是输入的起点。它做几件事：
+
+```typescript
+// 1. 进入 raw mode：按键逐字节到达，不等回车、不回显
+process.stdin.setRawMode(true);
+process.stdin.setEncoding("utf8");
+process.stdin.resume();
+
+// 2. 启用 bracketed paste：粘贴内容被特殊序列包裹
+process.stdout.write("\x1b[?2004h");
+
+// 3. Windows：加载原生 addon 启用 VT 输入
+this.enableWindowsVTInput();
+
+// 4. 协商键盘协议
+this.queryAndEnableKittyProtocol();
+```
+
+**raw mode** 是前提：默认终端是"行模式"——输入缓冲到回车才发给程序，且自动回显。raw mode 关掉这些，让每个按键立即、原样到达。这是任何交互式 TUI 的基础。
+
+**bracketed paste**（`\x1b[?2004h`）让终端把粘贴的内容用 `\x1b[200~` ... `\x1b[201~` 包裹。这样程序能区分"用户粘贴了一段代码"和"用户飞快敲了一串键"——前者要作为整体处理（甚至折叠成一个粘贴标记），后者要逐键处理。没有它，粘贴多行文本会被误当成一系列命令。
+
+### Kitty 键盘协议协商
+
+最精妙的是键盘协议协商。传统终端键盘协议有一堆歧义：`Ctrl+Shift+p` 和 `Ctrl+p` 可能发出相同序列；按键释放没有事件；很多组合键根本无法表达。[Kitty 键盘协议](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)是一个现代解决方案——它能无歧义地报告所有按键、修饰键、按下/释放。但不是所有终端都支持它。
+
+`pi-tui` 的协商策略（`packages/tui/src/terminal.ts:220`）很巧妙：
+
+```typescript
+const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;
+```
+
+这一行写了三个序列：
+
+1. `\x1b[>Nu`：请求启用 Kitty 协议，标志位 `N = 1|2|4`（无歧义 + 事件类型 + 备用键）
+2. `\x1b[?u`：查询当前 Kitty 协议状态
+3. `\x1b[c`：请求设备属性（Device Attributes, DA）——这是一个**哨兵**
+
+然后看终端怎么回应：
+
+- 如果终端支持 Kitty，它会回报 Kitty 标志（非 0）→ 激活 Kitty 协议
+- 如果终端不支持 Kitty 但支持 DA，它会回一个 DA 响应（而不是 Kitty 标志）→ 哨兵触发，**降级到 xterm 的 modifyOtherKeys**（`\x1b[>4;2m`）
+
+这个"DA 哨兵"设计解决了一个经典难题：你怎么知道终端"不支持 Kitty"？不支持的终端对 Kitty 查询**不回应**——如果你傻等，就会卡住。但如果紧跟一个 DA 查询，支持的终端回 DA、不支持的也回 DA，于是收到 DA 就知道"Kitty 没戏，用 modifyOtherKeys"。**不需要超时**——哨兵序列把"无响应"转化成了"另一种响应"。这是一个把异步探测变成确定性分支的漂亮技巧。
+
+### Windows 的特殊处理
+
+Windows 控制台默认不发出标准 VT 序列。`enableWindowsVTInput`（`:338`）加载一个预编译的原生 addon（`native/win32/.../win32-console-mode.node`），设置 `ENABLE_VIRTUAL_TERMINAL_INPUT` 标志，让 `Shift+Tab` 正确到达为 `\x1b[Z`。这是 `pi-tui` 大量终端特异性工程的一个缩影——`native/darwin/` 下还有 macOS 的原生 addon。
+
+---
+
+## `StdinBuffer`：重组碎片化的序列
+
+字节到达时是碎片化的。一个 `\x1b[A`（方向键）可能分三次到达：`\x1b`、`[`、`A`。如果逐字节处理，会把一个转义序列误当成三个独立输入。`StdinBuffer`（`packages/tui/src/stdin-buffer.ts`）负责重组：
+
+```typescript
+export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
+	public process(data: string | Buffer): void {
+		// 累积字节，分离 bracketed paste，提取完整序列
+	}
+}
+
+function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
+	// 用 isCompleteSequence 判断每个候选序列是否完整
+}
+
+function isCompleteSequence(data: string): "complete" | "incomplete" | "not-escape" {
+	// 处理 CSI/OSC/DCS/APC/SS3 框架，SGR 鼠标 <B;X;Y[Mm]
+}
+```
+
+`process` 把到达的字节累积进缓冲，`extractCompleteSequences` 用 `isCompleteSequence` 判断每个序列是否完整。`isCompleteSequence` 理解各种转义序列的框架：CSI（`\x1b[...`）、OSC（`\x1b]...`）、DCS、APC、SS3，以及 SGR 鼠标序列（`\x1b[<B;X;YM`）。完整的序列被切出，不完整的尾巴留在缓冲里等下一批字节。
+
+不完整的尾巴怎么办？`StdinBuffer` 设一个 10ms 超时——如果 10ms 后还没有后续字节，就把尾巴当作普通字符 flush 掉。这处理了"用户真的敲了一个 ESC 键"的情况（ESC 本身是 `\x1b`，也是一个转义序列的开头——10ms 内没有后续，说明它就是单独的 ESC）。
+
+`StdinBuffer` 还专门处理 bracketed paste：识别 `\x1b[200~` ... `\x1b[201~` 边界，把粘贴内容作为一个 `paste` 事件发出，而不是拆成一串 `data` 事件。它甚至处理了一些终端的怪癖，比如 WezTerm 把 ESC 和 Kitty 释放序列拆开发送、Kitty 可打印字符的重复去重。
+
+`StdinBuffer` 发出两种事件：`data`（单个完整序列）和 `paste`（粘贴体）。这一层把"原始字节流"变成了"结构化的输入事件"。
+
+---
+
+## 按键解析：`keys.ts`
+
+完整的序列到了 `keys.ts`（`packages/tui/src/keys.ts`），要被映射成一个**语义按键**。这里有一个值得称道的设计：按键 id 是**类型安全**的。
+
+```typescript
+type ModifiedKeyId<Key extends string, RemainingModifiers extends ModifierName = ModifierName> = {
+	[M in RemainingModifiers]: `${M}+${Key}` | `${M}+${ModifiedKeyId<Key, Exclude<RemainingModifiers, M>>}`;
+}[RemainingModifiers];
+
+export type KeyId = BaseKey | ModifiedKeyId<BaseKey>;
+```
+
+`KeyId` 是一个模板字面量类型——`"ctrl+c"`、`"ctrl+shift+p"`、`"escape"` 这些字符串都是类型。`Key` 辅助对象（`:163`）用工厂方法构建它们：`Key.ctrl("c")`、`Key.ctrlShift("p")`、`Key.escape`。于是绑定快捷键时，写错按键名会在**编译期**报错，而不是运行时静默失效。
+
+核心 API 是两个函数：
+
+```typescript
+export function matchesKey(data: string, keyId: KeyId): boolean; // :820
+export function parseKey(data: string): string | undefined;      // :1251
+```
+
+`matchesKey` 判断一个原始序列是否匹配某个语义按键。它内部要分派到多套协议：
+
+- **Kitty CSI-u**：`\x1b[99;5u` 形式，带修饰键、shift/基础布局键、方向键、功能键、事件类型
+- **modifyOtherKeys**：`\x1b[27;mod;keycode~` 形式
+- **传统序列表**：`LEGACY_KEY_SEQUENCES`、`LEGACY_SHIFT_SEQUENCES`、`LEGACY_CTRL_SEQUENCES`
+- **原始控制字符**：`code & 0x1f`（`Ctrl+a` = `a` 的码点 & 0x1f = `\x01`）
+
+这套分派的复杂性是终端键盘历史包袱的直接映射——同一个 `Ctrl+C`，在不同终端、不同协议下可能是四种不同的字节序列。`matchesKey` 要把它们都认出来。
+
+还有对非拉丁布局的细心处理：Kitty 协议会同时报告"基础布局键"和"shift 后的键"，`pi-tui` 只在码点不是可识别的拉丁字母/符号时才用基础布局键回退——避免在法语、德语键盘上误判。以及 Windows Terminal 的 backspace 歧义处理。这些都是真实世界的终端碎片化留下的伤疤。
+
+事件类型辅助函数 `isKeyRelease(data)`/`isKeyRepeat(data)` 扫描序列里的 `:3u`/`:2u` 标记——Kitty 协议能区分按下、重复、释放。默认情况下释放事件被过滤掉（除非组件 `wantsKeyRelease`），因为大多数组件只关心按下。
+
+---
+
+## 快捷键绑定：语义动作，可配置
+
+解析出的语义按键，通过 `keybindings.ts`（`packages/tui/src/keybindings.ts`）绑定到**动作**。这里的设计是"动作 id + 默认键 + 用户覆盖"：
+
+```typescript
+// 语义动作 id（可通过声明合并扩展）
+export interface Keybindings {
+	"tui.editor.cursorWordLeft": ...;
+	"tui.input.submit": ...;
+	"tui.altScreen.pageUp": ...;
+	// ...
+}
+
+// 默认绑定
+export const TUI_KEYBINDINGS = {
+	"tui.editor.deleteToLineEnd": { defaultKeys: "ctrl+k" },
+	// ...
+};
+
+export class KeybindingsManager {
+	// 解析用户覆盖、检测冲突、matches(data, keybinding)
+}
+```
+
+每个动作有一个语义 id（`tui.editor.deleteToLineEnd`）和默认键（`ctrl+k`）。`KeybindingsManager` 解析用户覆盖、检测冲突、提供 `matches(data, keybinding)`。全局单例通过 `getKeybindings()`/`setKeybindings()` 访问。
+
+这个设计呼应了 Pi Agent 项目的一条规则。`AGENTS.md` 明确规定：
+
+> Never hardcode key checks (e.g. `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
+
+也就是说，代码里不允许写死"如果是 Ctrl+X 就做某事"，而必须通过快捷键系统注册一个语义动作。这保证了**所有快捷键都可配置**——用户可以把任何动作改绑到任何键。把"哪个键"和"哪个动作"分离，是可达性（accessibility）和个性化的基础。
+
+---
+
+## 焦点与 overlay
+
+输入到达 `TuiBase.handleTerminalInput` 后，先经过注册的输入监听器（每个可以 `consume` 掉或改写 `data`），处理全局调试键（`shift+ctrl+d`），过滤按键释放事件，然后路由到焦点组件的 `handleInput`，最后 `requestRender()`。
+
+`setFocus(component)` 切换焦点——它设置 `Focusable` 组件的 `focused` 标志（组件因此在 `render` 里发出 `CURSOR_MARKER`，第 12 章）。
+
+还有一个 overlay 焦点栈（`overlayStack`）管理模态焦点：当弹出一个选择器（比如模型选择、信任确认），焦点被捕获到 overlay；关闭后恢复到之前的组件。这套状态机处理 `preFocus` 恢复、`nonCapturing` overlay、"blocked/eligible"焦点恢复策略。第 11 章交互式模式里那些 `/model`、`/trust` 弹出的选择器，都靠这个 overlay 系统管理焦点。
+
+---
+
+## `Editor`：2,352 行的 Emacs 风格编辑器
+
+这套输入栈最重的消费者是 `Editor`（`packages/tui/src/components/editor.ts`，约 2,352 行）——交互式模式里用户输入提示词的多行编辑器。它实现 `Component` 和 `Focusable`，提供：
+
+- **多行编辑 + 自动换行**（`wordWrapLine`）和垂直滚动
+- **自动补全**（`autocomplete.ts`）：斜杠命令补全、文件路径补全（`CombinedAutocompleteProvider`）
+- **kill ring**（`kill-ring.ts`）：Emacs 风格的剪切/粘贴环——`Ctrl+K` 剪切到行尾进环，`Ctrl+Y` yank 回来，连续 yank 可以循环历史
+- **undo 栈**（`undo-stack.ts`）：编辑快照
+- **单词导航**（`word-navigation.ts`）：`Ctrl+Left/Right` 按单词跳转
+- **粘贴标记**：大段粘贴被折叠成一个标记，而不是撑爆编辑器
+- **历史**：上下方向键浏览历史输入
+
+`Editor` 不是孤立的——它由几个专门模块支撑：`kill-ring.ts`、`undo-stack.ts`、`word-navigation.ts`、`autocomplete.ts`、`fuzzy.ts`（模糊匹配）。这种"重组件 + 专门子模块"的组织，让一个 2,352 行的组件保持可维护——每个编辑特性都有自己的模块。
+
+`Editor` 也是 `EditorComponent` 接口（`packages/tui/src/editor-component.ts`）的实现——这个接口是"自定义编辑器"的契约，允许产品层替换或扩展编辑器行为。
+
+为什么一个编码 Agent 需要这么重的编辑器？因为用户会在里面写多行提示词、粘贴代码片段、用快捷键编辑——输入体验直接决定产品好不好用。`Editor` 的 Emacs 风格快捷键（kill ring、单词导航、undo）让熟悉终端的用户能高效编辑，而不需要鼠标。这是"给人用的产品"在输入层的投入。
+
+---
+
+## 实践应用
+
+`pi-tui` 的输入栈为"如何处理终端输入"提供了四条可迁移的模式，每一条都来自与终端碎片化的真实搏斗。
+
+**用哨兵序列把"无响应"变成"另一种响应"。** Kitty 协议查询后紧跟一个 DA 查询作为哨兵——收到 DA 就知道 Kitty 不支持，无需超时等待。它解决的问题是：探测一个可选能力时，"不支持"表现为"无响应"，导致要么卡住要么靠脆弱的超时判断。当哨兵序列把沉默转化成确定的信号，异步探测就成了确定性分支。
+
+**先重组，再解析。** `StdinBuffer` 把碎片化的字节流重组为完整序列、分离粘贴，然后才交给按键解析。它解决的问题是：转义序列分多批到达，逐字节处理会误判。当输入被切成"完整序列"这个正确的粒度，上层解析才能正确工作。重组（framing）和解析（parsing）是两个层次，不要混在一起。
+
+**按键 id 类型安全，快捷键语义化且可配置。** 按键 id 是模板字面量类型（写错编译报错），动作有语义 id + 默认键 + 用户覆盖，代码里禁止写死按键检查。它解决的问题是：按键名拼错运行时才暴露、快捷键不可配置。当按键是类型、动作是语义、绑定可覆盖，正确性和可达性都有了保障。
+
+**重组件拆成专门子模块。** 2,352 行的 `Editor` 由 kill ring、undo 栈、单词导航、自动补全等独立模块支撑。它解决的问题是：一个大组件把所有特性揉在一起，无法测试和维护。当每个编辑特性是自己的模块，重组件也能保持可维护。
+
+---
+
+## 总结
+
+`pi-tui` 的输入栈自底向上分四层：`ProcessTerminal` 进入 raw mode、启用 bracketed paste、用"DA 哨兵"协商 Kitty 键盘协议（降级到 modifyOtherKeys）、在 Windows 加载原生 addon；`StdinBuffer` 把碎片化字节流重组为完整序列、分离粘贴；`keys.ts` 用类型安全的 `KeyId` 和 `matchesKey` 把序列映射到语义按键，分派 Kitty/modifyOtherKeys/传统/原始控制字符四套协议；`keybindings.ts` 用语义动作 id + 可配置绑定把按键接到动作。焦点系统路由输入到焦点组件，overlay 栈管理模态焦点。最重的消费者是 2,352 行的 Emacs 风格 `Editor`，由 kill ring、undo 栈、单词导航、自动补全等专门模块支撑。
+
+它和渲染层一样，体现了一种"贴近金属"的工程品味：不依赖高层框架，而是直面终端协议的碎片化，在每一层做正确的处理。那些看似过度的细节——DA 哨兵、10ms 超时、非拉丁布局回退、Windows VT addon——每一个都是某个真实终端某个真实 bug 的解决方案。
+
+下一部分，我们离开 TUI，看 Pi Agent 如何向外延伸：扩展系统如何让最小化核心拥有无限能力，以及远程控制如何让 Agent 跑在守护进程里。
