@@ -84,6 +84,18 @@ const config = defineConfig({
 	},
 	mermaid: {
 		theme: "default",
+		// Fix CJK text clipping: mermaid miscalculates foreignObject height
+		// for CJK characters, causing bottom lines to be cut off.
+		themeCSS: `
+			.node foreignObject,
+			.node foreignObject > * {
+				overflow: visible !important;
+			}
+			.label foreignObject,
+			.label foreignObject > * {
+				overflow: visible !important;
+			}
+		`,
 	},
 });
 
