@@ -32,7 +32,7 @@ Pi Agent 的几次关键"外推"：
 |--------|------------------|---------------------|
 | 权限与安全 | 内置七种权限模式 + 逐工具审批弹窗 | **容器/沙箱** + 一次性的"项目信任"决策 |
 | 工具生态 | 内置 40+ 工具 | 7 个内置工具 + **扩展注册自定义工具** |
-| 生命周期拦截 | 27 种运行时钩子事件 | 强类型 `ExtensionAPI`（约 40 种事件）|
+| 生命周期拦截 | 27 种运行时钩子事件 | 强类型 `ExtensionAPI`（33 种事件）|
 | 外部工具协议 | 内置 MCP（8 种传输）| **不提供**；由扩展自行集成 |
 | 远程控制 | 内置 bridge / 云端执行 | 独立的可选包 `pi-server` / `pi-protocol` |
 | 会话存储后端 | 内置 | 抽象接口 + 可插拔后端（JSONL / SQLite）|
@@ -93,7 +93,7 @@ graph TD
     AgentTool["AgentTool<br/>自描述工具<br/>schema + 执行 + 并发模式"]
     AgentMessage["AgentMessage<br/>可扩展消息<br/>+ convertToLlm 桥"]
     Session["Session 树<br/>可追加可分支的持久转录"]
-    ExtAPI["ExtensionAPI<br/>类型化扩展面<br/>约 40 种事件"]
+    ExtAPI["ExtensionAPI<br/>类型化扩展面<br/>33 种事件"]
 
     StreamFn --> Loop["Agent 循环"]
     Loop --> AgentEvent
@@ -114,7 +114,27 @@ export type StreamFn = (
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 ```
 
-它的契约里有一条至关重要的约定：**永不抛出**。请求失败、模型错误、网络中断，统统不能以异常形式出现，而必须编码进流末尾那个 `stopReason: "error" | "aborted"` 的 `AssistantMessage`。这一条约定让循环的错误处理逻辑变得极其简单——它永远不需要 `try/catch` 模型调用，只需要检查流的结果。`pi-ai` 的 `Models.streamSimple` 满足这个形状；第 2 章会看到整个 `pi-ai` 包如何围绕"把失败编码进流"这一原则组织。
+它返回的 `AssistantMessageEventStream` 是一个事件流，其末尾必然以 `done` 或 `error` 收尾，而这两种终止事件携带的都是同一个 `AssistantMessage`（`packages/ai/src/types.ts`，节选）：
+
+```typescript
+export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
+
+export interface AssistantMessage {
+	role: "assistant";
+	content: (TextContent | ThinkingContent | ToolCall)[];
+	// ... api / provider / model / usage 等元数据字段
+	stopReason: StopReason;
+	errorMessage?: string;
+	// ...
+}
+
+export type AssistantMessageEvent =
+	// ... 中间的 text_delta / thinking_delta 等增量事件
+	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
+	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
+```
+
+`StreamFn` 的契约里有一条至关重要的约定：**永不抛出**。请求失败、模型错误、网络中断，统统不能以异常形式出现，而必须编码进流末尾那个 `error` 事件——它携带的 `AssistantMessage` 以 `stopReason: "error" | "aborted"` 标记失败，细节放在 `errorMessage` 里。这一条约定让循环的错误处理逻辑变得极其简单——它永远不需要 `try/catch` 模型调用，只需要检查流的结果。`pi-ai` 的 `Models.streamSimple` 满足这个形状；第 2 章会看到整个 `pi-ai` 包如何围绕"把失败编码进流"这一原则组织。
 
 **2. `AgentEvent`——循环的输出**（`packages/agent/src/types.ts`）。循环不返回一个大对象，而是发出一串生命周期事件：
 
@@ -163,7 +183,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
 ```
 
-扩展拿到一个 `pi` 对象，可以 `on(event, handler)` 订阅约 40 种事件、`registerTool(...)` 注册工具、`registerCommand(...)` 注册斜杠命令、`registerShortcut(...)` 注册快捷键、`registerFlag(...)` 注册 CLI flag。因为一切都是 TypeScript 类型，扩展能在编译期得到完整的类型检查与自动补全。第 14 章详述。
+扩展拿到一个 `pi` 对象，可以 `on(event, handler)` 订阅 33 种事件、`registerTool(...)` 注册工具、`registerCommand(...)` 注册斜杠命令、`registerShortcut(...)` 注册快捷键、`registerFlag(...)` 注册 CLI flag。因为一切都是 TypeScript 类型，扩展能在编译期得到完整的类型检查与自动补全。第 14 章详述。
 
 ---
 
