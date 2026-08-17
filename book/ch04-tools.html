@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 章 · 工具系统：从定义到执行 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch04">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第二部分 · Agent 核心</p>
+  <h1>第 4 章：工具系统——从定义到执行</h1>
+  <p class="chapter-sub">自描述的工具对象、prepare / execute / finalize 三段管线，以及预检串行、执行并行、路径互斥的并发哲学</p>
+</header>
+
+<h2 id="hook">工具是 Agent 的双手</h2>
+
+<p>模型本身只能做一件事：生成文本。它读不了文件、跑不了命令、改不了代码。让模型能"做事"的，是工具——Agent 的双手。第 3 章的循环在 <code>executeToolCalls</code> 处一笔带过；本章把它彻底拆开。</p>
+
+<p>Pi Agent 的工具系统有两个值得玩味的设计决策。第一，<strong>工具是自描述对象</strong>：并发模式、参数 schema、UI 渲染方式都内聚在工具定义里，循环对工具的内部一无所知。第二，<strong>工具有两副面孔</strong>：核心运行时认识的 <code>AgentTool</code> 是精简的，产品层使用的 <code>ToolDefinition</code> 是丰富的（多了提示词元数据和 TUI 渲染器），两者之间只隔着一个薄薄的包装函数。</p>
+
+<p>这两个决策共同服务一个目标：让"新增一个工具"不需要改动循环、改动系统提示词组装、改动 UI 渲染中的任何一处。工具把自己需要的一切都说清楚，系统只是照单全收。</p>
+
+<hr class="sep">
+
+<h2 id="two-faces">两副面孔：<code>AgentTool</code> 与 <code>ToolDefinition</code></h2>
+
+<h3 id="agenttool">核心认识的是 <code>AgentTool</code></h3>
+
+<p>核心运行时（<code>pi-agent-core</code>）只认识一个精简的接口（<code>packages/agent/src/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface AgentTool&lt;TParameters extends TSchema = TSchema, TDetails = any&gt;
+	extends Tool&lt;TParameters&gt; {
+	label: string;
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParameters&gt;;
+	execute: (
+		toolCallId: string,
+		params: Static&lt;TParameters&gt;,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback&lt;TDetails&gt;,
+	) =&gt; Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	executionMode?: ToolExecutionMode; // "sequential" | "parallel"
+}</pre>
+
+<p>它继承自 <code>pi-ai</code> 的 <code>Tool&lt;TParameters&gt;</code>（带来 <code>name</code>、<code>description</code>、<code>parameters</code> schema、<code>constrainedSampling</code>），再加上四样东西：</p>
+
+<ul>
+<li><code>label</code>：UI 显示用的标签</li>
+<li><code>prepareArguments</code>：执行前的参数预处理（可选）</li>
+<li><code>execute</code>：真正的执行逻辑，接收工具调用 id、参数、中止信号、进度回调</li>
+<li><code>executionMode</code>：声明自己是该串行还是可并行</li>
+</ul>
+
+<p>注意 <code>execute</code> 的返回值 <code>AgentToolResult&lt;T&gt;</code>（<code>packages/agent/src/types.ts</code>）携带 <code>content</code>（回灌给模型的内容）、<code>details</code>（给 UI 的结构化细节）、可选的 <code>usage</code>、<code>addedToolNames</code>，以及一个 <code>terminate</code> 提示——后者告诉循环"这个工具完成后可以停了"。</p>
+
+<p>核心刻意<strong>不知道</strong>工具该如何渲染、该往系统提示词里加什么。这些是产品的事。</p>
+
+<h3 id="tooldefinition">产品使用的是 <code>ToolDefinition</code></h3>
+
+<p>产品层（<code>pi-coding-agent</code>）需要一个更丰富的接口，因为产品还要管"这个工具怎么出现在提示词里"和"怎么渲染在终端上"。<code>ToolDefinition</code>（<code>packages/coding-agent/src/core/extensions/types.ts</code>）在 <code>AgentTool</code> 的基础上加了这些：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export interface ToolDefinition&lt;TParams extends TSchema = TSchema, TDetails = unknown, TState = any&gt; {
+	name: string;          // LLM 工具调用用的名字
+	label: string;         // UI 标签
+	description: string;   // 给 LLM 的描述
+	promptSnippet?: string;    // "Available tools" 提示词段落里的一行简介
+	promptGuidelines?: string[]; // 工具激活时追加的指南要点
+	parameters: TParams;       // TypeBox schema
+	constrainedSampling?: false | ConstrainedSamplingConfig;
+	renderShell?: "default" | "self";
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParams&gt;;
+	executionMode?: ToolExecutionMode;
+	execute(toolCallId, params, signal, onUpdate, ctx: ExtensionContext): Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	renderCall?(args, theme, context): Component;    // TUI：如何渲染这次调用
+	renderResult?(result, options, theme, context): Component; // TUI：如何渲染结果
+}</pre>
+
+<p>多出来的字段分两类：</p>
+
+<ul>
+<li><strong>提示词元数据</strong>（<code>promptSnippet</code>、<code>promptGuidelines</code>）：第 10 章会看到，系统提示词的"Available tools"段落是从激活工具的 <code>promptSnippet</code> 拼出来的，"Guidelines"段落则收集它们的 <code>promptGuidelines</code>。工具激活，它的提示词片段就自动出现；工具关闭，片段就消失。</li>
+<li><strong>TUI 渲染器</strong>（<code>renderCall</code>、<code>renderResult</code>）：返回一个 <code>pi-tui</code> 的 <code>Component</code>。第 12 章会看到，工具调用在终端里长什么样（比如 edit 工具的彩色 diff），完全由工具自己决定。</li>
+</ul>
+
+<h3 id="wrapper">桥梁：<code>wrapToolDefinition</code></h3>
+
+<p>两副面孔之间只隔着一个薄函数（<code>packages/coding-agent/src/core/tools/tool-definition-wrapper.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/tool-definition-wrapper.ts">export function wrapToolDefinition&lt;TDetails = unknown&gt;(
+	definition: ToolDefinition&lt;any, TDetails&gt;,
+	ctxFactory?: () =&gt; ExtensionContext,
+): AgentTool&lt;any, TDetails&gt; {
+	return {
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		constrainedSampling: definition.constrainedSampling,
+		prepareArguments: definition.prepareArguments,
+		executionMode: definition.executionMode,
+		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) =&gt;
+			definition.execute(toolCallId, params, signal, onUpdate, ctx ?? (ctxFactory?.() as ExtensionContext)),
+	};
+}</pre>
+
+<p>它把丰富的 <code>ToolDefinition</code> 投影成精简的 <code>AgentTool</code>——丢掉 <code>promptSnippet</code>、<code>promptGuidelines</code>、<code>renderCall</code>、<code>renderResult</code>，只保留核心需要的字段。还有一个反向的 <code>createToolDefinitionFromAgentTool</code>，当调用方直接提供一个裸 <code>AgentTool</code>（没有提示词元数据和渲染器）时，合成一个最小的 <code>ToolDefinition</code>，让产品层的注册表保持"定义优先"。</p>
+
+<p>这种"丰富接口 + 精简接口 + 薄包装"的模式，是 Pi Agent 分层哲学的微观体现：核心只拿它需要的，产品保留它额外的，两者互不污染。扩展系统（第 14 章）注册自定义工具时用的也是 <code>ToolDefinition</code>——自定义工具因此天然获得提示词集成和 UI 渲染的能力。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="two-faces" data-w="860" data-h="380"></canvas></div>
+  <figcaption>图 1：两副面孔与桥。核心循环只认识精简的 <code>AgentTool</code>，产品层与扩展使用丰富的 <code>ToolDefinition</code>，<code>wrapToolDefinition</code> 完成两者之间的投影。</figcaption>
+</figure>
+
+<hr class="sep">
+
+<h2 id="pipeline">执行管线：prepare / execute / finalize</h2>
+
+<p>现在进入循环内部。第 3 章的 <code>executeToolCalls</code> 先做一个分派决策：</p>
+
+<pre class="code" data-lang="ts">async function executeToolCalls(currentContext, assistantMessage, config, signal, emit) {
+	const toolCalls = assistantMessage.content.filter((c) =&gt; c.type === "toolCall");
+	const hasSequentialToolCall = toolCalls.some(
+		(tc) =&gt; currentContext.tools?.find((t) =&gt; t.name === tc.name)?.executionMode === "sequential",
+	);
+	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	}
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}</pre>
+
+<p>规则很简单：只要这一批里<strong>有一个</strong>工具声明了 <code>executionMode: "sequential"</code>，或者全局配置是 sequential，整批就串行；否则并行。注意这是"一颗老鼠屎坏一锅汤"的策略——一个串行工具会让同批所有工具都串行。这是保守而正确的：串行工具往往有副作用顺序要求，与它并行的工具可能踩到它。</p>
+
+<p>无论串行还是并行，每个工具调用都经过同样的三个阶段。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="pipeline" data-w="900" data-h="410"></canvas></div>
+  <figcaption>图 2：每个工具调用的三段式执行管线。失败一律编码进结果对象（<code>kind: "immediate"</code> / <code>isError: true</code>），而不是抛出。</figcaption>
+</figure>
+
+<h3 id="prepare">阶段一：prepare</h3>
+
+<p><code>prepareToolCall</code> 做执行前的一切准备，返回一个 <code>PreparedToolCall</code> 或一个立即的失败结果：</p>
+
+<pre class="code" data-lang="ts">async function prepareToolCall(currentContext, assistantMessage, toolCall, config, signal) {
+	// 1. 找到工具，找不到立即报错
+	const tool = currentContext.tools?.find((t) =&gt; t.name === toolCall.name);
+	if (!tool) {
+		return { kind: "immediate", result: createErrorToolResult(`Tool ${toolCall.name} not found`), isError: true };
+	}
+	try {
+		// 2. 参数预处理（可选）
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		// 3. 按 schema 校验参数（来自 pi-ai）
+		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		// 4. beforeToolCall 钩子，可以 block
+		if (config.beforeToolCall) {
+			const beforeResult = await config.beforeToolCall({ assistantMessage, toolCall, args: validatedArgs, context: currentContext }, signal);
+			if (signal?.aborted) return { kind: "immediate", result: createErrorToolResult("Operation aborted"), isError: true };
+			if (beforeResult?.block) {
+				return { kind: "immediate", result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"), isError: true };
+			}
+		}
+		if (signal?.aborted) return { kind: "immediate", result: createErrorToolResult("Operation aborted"), isError: true };
+		return { kind: "prepared", toolCall, tool, args: validatedArgs };
+	} catch (error) {
+		return { kind: "immediate", result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
+	}
+}</pre>
+
+<p>四个步骤：查工具、<code>prepareArguments</code> 预处理、<code>validateToolArguments</code> 按 TypeBox schema 校验、<code>beforeToolCall</code> 钩子。<code>beforeToolCall</code> 是产品层和扩展的拦截点——它可以返回 <code>{ block: true, reason }</code> 来阻止执行。回忆第 1 章：Pi Agent 没有逐工具审批弹窗，但扩展可以通过 <code>beforeToolCall</code>（或产品层通过 <code>tool_call</code> 事件）实现自己的拦截逻辑。安全机制是外推的，但接缝留在这里。</p>
+
+<p>注意所有失败都返回 <code>kind: "immediate"</code> 的结果对象，而不是抛出——又一次贯彻了"失败是数据"的契约。</p>
+
+<h3 id="execute">阶段二：execute</h3>
+
+<p><code>executePreparedToolCall</code> 真正调用工具，并处理进度上报与异常：</p>
+
+<pre class="code" data-lang="ts">async function executePreparedToolCall(prepared, signal, emit) {
+	const updateEvents: Promise&lt;void&gt;[] = [];
+	let acceptingUpdates = true;
+	try {
+		const result = await prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args,
+			signal,
+			(partialResult) =&gt; {
+				if (!acceptingUpdates) return;
+				updateEvents.push(Promise.resolve(emit({
+					type: "tool_execution_update",
+					toolCallId: prepared.toolCall.id,
+					toolName: prepared.toolCall.name,
+					args: prepared.toolCall.arguments,
+					partialResult,
+				})));
+			},
+		);
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result, isError: false };
+	} catch (error) {
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
+	} finally {
+		acceptingUpdates = false;
+	}
+}</pre>
+
+<p>工具通过第四个参数 <code>onUpdate</code> 回调上报进度，循环把它转成 <code>tool_execution_update</code> 事件。<code>acceptingUpdates</code> 标志确保工具返回后不再接受迟到的进度更新。工具抛出的异常被捕获，转换成一个错误工具结果——工具执行失败不会炸掉循环，而是变成一个 <code>isError: true</code> 的结果回灌给模型，让模型自己决定如何应对（重试？换个方法？放弃？）。</p>
+
+<h3 id="finalize">阶段三：finalize</h3>
+
+<p><code>finalizeExecutedToolCall</code> 给 <code>afterToolCall</code> 钩子最后一次修改结果的机会：</p>
+
+<pre class="code" data-lang="ts">async function finalizeExecutedToolCall(currentContext, assistantMessage, prepared, executed, config, signal) {
+	let result = executed.result;
+	let isError = executed.isError;
+	if (config.afterToolCall) {
+		try {
+			const afterResult = await config.afterToolCall({ assistantMessage, toolCall: prepared.toolCall, args: prepared.args, result, isError, context: currentContext }, signal);
+			if (afterResult) {
+				result = {
+					...result,
+					content: afterResult.content ?? result.content,
+					details: afterResult.details ?? result.details,
+					usage: afterResult.usage ?? result.usage,
+					terminate: afterResult.terminate ?? result.terminate,
+				};
+				isError = afterResult.isError ?? isError;
+			}
+		} catch (error) {
+			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			isError = true;
+		}
+	}
+	return { toolCall: prepared.toolCall, result, isError };
+}</pre>
+
+<p><code>afterToolCall</code> 可以覆盖 <code>content</code>、<code>details</code>、<code>usage</code>、<code>terminate</code>、<code>isError</code>。这给了产品层和扩展一个"事后审查"的槽位——比如记录审计日志、修改回灌给模型的内容、或设置 <code>terminate</code> 强制循环停止。</p>
+
+<p>最后，<code>createToolResultMessage</code> 把最终结果打包成一条 <code>toolResult</code> 消息：</p>
+
+<pre class="code" data-lang="ts">function createToolResultMessage(finalized): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: finalized.toolCall.id,
+		toolName: finalized.toolCall.name,
+		content: finalized.result.content ?? [],
+		details: finalized.result.details,
+		usage: finalized.result.usage,
+		...(finalized.result.addedToolNames?.length ? { addedToolNames: finalized.result.addedToolNames } : {}),
+		isError: finalized.isError,
+		timestamp: Date.now(),
+	};
+}</pre>
+
+<p>这条消息会被追加进上下文，成为下一次模型调用的输入。<code>addedToolNames</code> 是一个有趣的字段：工具可以声明"我执行之后，请把这些工具也加入可用集合"——这是工具动态扩展工具集的一条暗道。</p>
+
+<hr class="sep">
+
+<h2 id="concurrency">并发：并行执行如何安全发生</h2>
+
+<p>默认 <code>toolExecution: "parallel"</code>。并行执行的设计有一个精妙之处——<strong>预检串行，执行并行</strong>：</p>
+
+<pre class="code" data-lang="ts">async function executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit) {
+	const finalizedCalls: FinalizedToolCallEntry[] = [];
+
+	for (const toolCall of toolCalls) {
+		await emit({ type: "tool_execution_start", toolCallId: toolCall.id, toolName: toolCall.name, args: toolCall.arguments });
+
+		// 预检（prepare）是串行的
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		if (preparation.kind === "immediate") {
+			// 立即结果直接收尾
+			const finalized = { toolCall, result: preparation.result, isError: preparation.isError };
+			await emitToolExecutionEnd(finalized, emit);
+			finalizedCalls.push(finalized);
+			continue;
+		}
+
+		// 真正的执行被包成一个 thunk，稍后并行跑
+		finalizedCalls.push(async () =&gt; {
+			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const finalized = await finalizeExecutedToolCall(currentContext, assistantMessage, preparation, executed, config, signal);
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		});
+	}
+
+	// 所有 thunk 并行执行
+	const orderedFinalizedCalls = await Promise.all(
+		finalizedCalls.map((entry) =&gt; (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+
+	// 结果按助手消息里的原始顺序发出
+	const messages: ToolResultMessage[] = [];
+	for (const finalized of orderedFinalizedCalls) {
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+	return { messages, terminate: shouldTerminateToolBatch(orderedFinalizedCalls) };
+}</pre>
+
+<p>为什么要"预检串行、执行并行"？因为 <code>prepareToolCall</code> 里的 <code>beforeToolCall</code> 钩子可能有副作用（记录日志、弹审批、修改状态），让它们按模型发出的顺序确定性地发生，比让它们竞态要可预测得多。而真正的执行（读文件、跑命令）是耗时的，并行它们才有收益。于是：</p>
+
+<ul>
+<li><strong><code>tool_execution_start</code></strong> 按原始顺序发出（预检是串行的）</li>
+<li><strong><code>tool_execution_end</code></strong> 按<strong>完成顺序</strong>发出（谁先跑完谁先发，UI 可以即时显示）</li>
+<li><strong><code>toolResult</code> 消息</strong>按<strong>原始顺序</strong>追加进上下文（保证转录的确定性）</li>
+</ul>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="parallel" data-w="880" data-h="460"></canvas></div>
+  <figcaption>图 3：预检串行、执行并行。事件按完成顺序发出，<code>toolResult</code> 消息按原始顺序追加进上下文——UI 想要即时反馈，转录必须保持确定。</figcaption>
+</figure>
+
+<p>这个"事件按完成序、消息按原始序"的区分很关键：UI 想要即时反馈（谁好了先显示谁），但模型看到的转录必须是确定的（同样的输入产生同样的消息序列，否则缓存和重放都会出问题）。Pi Agent 用 <code>Promise.all</code> 保住了执行顺序与数组顺序的一致，从而让消息序列确定。</p>
+
+<h3 id="terminate">终止信号</h3>
+
+<p>一批工具执行完后，<code>shouldTerminateToolBatch</code> 决定是否停止循环：</p>
+
+<pre class="code" data-lang="ts">function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
+	return finalizedCalls.length &gt; 0 &amp;&amp; finalizedCalls.every((finalized) =&gt; finalized.result.terminate === true);
+}</pre>
+
+<p>只有当<strong>每一个</strong>最终结果都设置了 <code>terminate: true</code>，这一批才终止循环。这是一个"全票通过"的规则：只要有一个工具没说"该停了"，循环就继续。这避免了某个工具过早地掐断还在进行中的工作。</p>
+
+<hr class="sep">
+
+<h2 id="mutex">文件互斥：并行写同一个文件怎么办</h2>
+
+<p>并行执行带来一个真实的危险：如果模型在同一批里发出两个 <code>edit</code> 调用，都改同一个文件，会怎样？两个写操作交错，文件可能被写坏。</p>
+
+<p>Pi Agent 的解法是一个按路径的互斥队列 <code>withFileMutationQueue</code>（<code>packages/agent/src/harness/tools/file-mutation-queue.ts</code>）。它的核心是一个 <code>WeakMap</code>，按 <code>ExecutionEnv</code> 维护一张"路径 → promise 链"的表：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/tools/file-mutation-queue.ts">const states = new WeakMap&lt;ExecutionEnv, MutationQueueState&gt;();
+
+export async function withFileMutationQueue&lt;T&gt;(env: ExecutionEnv, path: string, fn: () =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+	const state = getState(env);
+	const registration = state.registration.then(async () =&gt; {
+		const key = await getMutationQueueKey(env, path); // 规范化路径作为 key
+		const currentQueue = state.queues.get(key) ?? Promise.resolve();
+
+		let releaseNext = () =&gt; {};
+		const nextQueue = new Promise&lt;void&gt;((resolve) =&gt; { releaseNext = resolve; });
+		const chainedQueue = currentQueue.then(() =&gt; nextQueue);
+		state.queues.set(key, chainedQueue);
+		return { key, currentQueue, chainedQueue, releaseNext };
+	});
+	state.registration = registration.then(() =&gt; undefined, () =&gt; undefined);
+
+	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	await currentQueue; // 等前面的写操作完成
+	try {
+		return await fn();
+	} finally {
+		releaseNext(); // 放行下一个
+		if (state.queues.get(key) === chainedQueue) state.queues.delete(key);
+	}
+}</pre>
+
+<p>机制是经典的"promise 链互斥"：每个针对同一规范化路径的写操作，都把自己接到该路径当前 promise 链的末尾，先 <code>await currentQueue</code> 等前面的完成，执行完再 <code>releaseNext()</code> 放行下一个。于是并行的 <code>edit</code>/<code>write</code> 调用到了文件层面会自动排成串行，彼此不交错。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="mutex" data-w="880" data-h="420"></canvas></div>
+  <figcaption>图 4：按路径的 promise 链互斥。循环层允许并行，工具层用规范化路径把同一文件的写操作排成串行，两者各司其职。</figcaption>
+</figure>
+
+<p>两个细节值得注意。其一，key 是<strong>规范化路径</strong>（<code>canonicalPath</code>）——这样 <code>./foo/bar.ts</code> 和 <code>/abs/foo/bar.ts</code> 指向同一个队列，不会因为写法不同而漏掉互斥。其二，用 <code>WeakMap</code> 以 <code>ExecutionEnv</code> 为键，意味着不同执行环境（比如不同的沙箱）有各自独立的队列，且环境被回收时队列也自动清理。<code>createEditTool</code> 和 <code>createWriteTool</code> 把自己的执行体包在这个队列里，而 <code>read</code> 不需要（读不冲突）。</p>
+
+<p>这是一个"在正确的层次解决并发"的好例子：循环层允许工具并行（收益），工具层用路径互斥消除写冲突（安全），两者各司其职。</p>
+
+<hr class="sep">
+
+<h2 id="builtin-tools">七个内置工具</h2>
+
+<p>产品层提供七个内置工具，每个都在 <code>packages/coding-agent/src/core/tools/</code> 下有自己的文件：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>工具</th><th>文件</th><th>职责</th><th>默认激活</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td><code>read.ts</code></td><td>读文件/图片，支持 offset/limit，自动截断</td><td>是</td></tr>
+<tr><td><code>bash</code></td><td><code>bash.ts</code></td><td>执行 shell 命令</td><td>是</td></tr>
+<tr><td><code>edit</code></td><td><code>edit.ts</code></td><td>精确字符串替换编辑</td><td>是</td></tr>
+<tr><td><code>write</code></td><td><code>write.ts</code></td><td>写入/创建文件</td><td>是</td></tr>
+<tr><td><code>grep</code></td><td><code>grep.ts</code></td><td>内容搜索（只读）</td><td>否</td></tr>
+<tr><td><code>find</code></td><td><code>find.ts</code></td><td>文件查找（只读）</td><td>否</td></tr>
+<tr><td><code>ls</code></td><td><code>ls.ts</code></td><td>列目录（只读）</td><td>否</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>注册表在 <code>packages/coding-agent/src/core/tools/index.ts</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/index.ts">export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
+export const allToolNames: Set&lt;ToolName&gt; = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+export function createCodingToolDefinitions(cwd, options?)  // read, bash, edit, write
+export function createReadOnlyToolDefinitions(cwd, options?) // read, grep, find, ls</pre>
+
+<p>默认激活集合是 <code>["read", "bash", "edit", "write"]</code>（在 <code>packages/coding-agent/src/core/sdk.ts</code> 里设定）。<code>grep</code>/<code>find</code>/<code>ls</code> 可用但默认关闭——因为有 <code>bash</code> 在，模型完全可以用 <code>rg</code>/<code>find</code>/<code>ls</code> 命令达到同样目的；这三个只读工具是给"想要一个更受限工具集"的场景准备的（通过 <code>--tools</code> 显式开启）。</p>
+
+<p>看一个具体工具的定义（<code>read.ts</code>，节选）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/read.ts">const readSchema = Type.Object({
+	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+export function createReadToolDefinition(cwd, options?): ToolDefinition&lt;typeof readSchema, ReadToolDetails | undefined&gt; {
+	return {
+		name: "read",
+		label: "read",
+		description: `Read the contents of a file. Supports text files and images ...`,
+		promptSnippet: "Read file contents",
+		promptGuidelines: ["Use read to examine files instead of cat or sed."],
+		parameters: readSchema,
+		async execute(_toolCallId, { path, offset, limit }, signal?, _onUpdate?, ctx?) {
+			// 读文件/图片，截断过长内容
+		},
+		renderCall(args, theme, context) { /* 返回一个 pi-tui Text 组件 */ },
+		renderResult(result, options, theme, context) { /* 语法高亮预览 */ },
+	};
+}
+
+export function createReadTool(cwd, options?): AgentTool&lt;typeof readSchema&gt; {
+	return wrapToolDefinition(createReadToolDefinition(cwd, options));
+}</pre>
+
+<p>这个定义把工具的一切都说清楚了：参数 schema（<code>readSchema</code>）、给模型的描述（<code>description</code>）、提示词里的一行简介（<code>promptSnippet</code>）、激活时的指南（<code>promptGuidelines</code>）、执行逻辑（<code>execute</code>）、以及两个 TUI 渲染器。<code>createReadTool</code> 只是 <code>wrapToolDefinition(createReadToolDefinition(...))</code>——丰富定义投影成精简 <code>AgentTool</code>。</p>
+
+<p>工具还可以有可插拔的 <code>operations</code>（比如 <code>ReadOperations</code>），让文件 IO 可以委托给远程系统（如 SSH）。这是为远程执行场景留的接缝，第 15 章会回到。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的工具系统为"如何设计可扩展的工具/插件机制"提供了四条可迁移的模式。</p>
+
+<p><strong>工具自描述，编排器无知。</strong> 让每个工具声明自己的参数 schema、并发模式、提示词片段、UI 渲染方式；编排器（循环）只读这些声明，不"了解"任何具体工具。它解决的问题是：中央编排器变成上帝对象，每加一个工具都要改它。当工具自描述，新增第 N+1 个工具对现有代码的改动是零。</p>
+
+<p><strong>丰富接口 + 精简接口 + 薄包装。</strong> 核心只需要工具的执行能力，产品还需要提示词和渲染元数据——用两个接口分别表达，用一个薄函数投影。它解决的问题是：核心被迫背上产品层的关注点。当 <code>AgentTool</code> 不知道 <code>renderCall</code> 的存在，核心就能在任何没有 UI 的环境（SDK、浏览器、守护进程）里复用。</p>
+
+<p><strong>预检串行，执行并行。</strong> 把有副作用、需要确定顺序的预检（校验、审批钩子）串行执行，把耗时的真正执行并行。它解决的问题是：要么全串行（慢），要么全并行（预检竞态、转录不确定）。这个拆分同时拿到了并行的速度和确定的顺序。</p>
+
+<p><strong>在正确的层次解决并发。</strong> 循环层允许工具并行以提速，工具层用按路径的 promise 链互斥消除写冲突。它解决的问题是：要么在循环层粗暴地全串行（牺牲并发收益），要么对冲突视而不见（写坏文件）。把互斥下沉到"实际共享资源"的层次，并发与安全才能兼得。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的工具是自描述对象：核心认识精简的 <code>AgentTool</code>，产品使用丰富的 <code>ToolDefinition</code>，两者由 <code>wrapToolDefinition</code> 桥接。每个工具调用经过 prepare（查工具、预处理、校验、<code>beforeToolCall</code>）、execute（执行 + 进度上报 + 异常捕获）、finalize（<code>afterToolCall</code> 事后修改）三个阶段。并发上，预检串行、执行并行，事件按完成序发出而消息按原始序追加；写冲突由按规范化路径的 promise 链互斥消除。</p>
+
+<p>七个内置工具（read/bash/edit/write/grep/find/ls）各自把参数、描述、提示词片段、渲染器说清楚，默认激活前四个。整个系统没有一处"了解所有工具"的中央代码——这正是它能线性扩展的原因。</p>
+
+<p>下一章，我们看工具产生的消息如何被组织进状态——以及 Pi Agent 那个独特的、把转录建模为可分支树的设计。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("two-faces", function (d) {
+  d.box({ id: "at", x: 40, y: 50, w: 270, h: 140, title: "AgentTool（精简）", lines: ["label / prepareArguments / execute", "executionMode / 参数 schema", "核心循环唯一认识的接口"], tone: "teal", titleSize: 13 });
+  d.box({ id: "wrap", x: 345, y: 90, w: 190, h: 70, title: "wrapToolDefinition", lines: ["丰富 → 精简 的投影"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "td", x: 560, y: 50, w: 260, h: 140, title: "ToolDefinition（丰富）", lines: ["+ promptSnippet / promptGuidelines", "+ renderCall / renderResult", "产品层与扩展使用的接口"], tone: "violet", titleSize: 13 });
+
+  d.arrow("td", "wrap", { from: "left", to: "right", label: "投影" });
+  d.arrow("wrap", "at", { from: "left", to: "right", label: "精简接口" });
+
+  d.box({ id: "loop", x: 40, y: 260, w: 270, h: 64, title: "核心循环 (Agent)", lines: ["只消费 AgentTool，照单全收"], tone: "slate", titleSize: 12.5 });
+  d.box({ id: "reg", x: 560, y: 260, w: 260, h: 64, title: "产品层 / 扩展", lines: ["以 ToolDefinition 注册自定义工具"], tone: "slate", titleSize: 12.5 });
+
+  d.arrow("at", "loop", { from: "bottom", to: "top" });
+  d.arrow("td", "reg", { from: "bottom", to: "top" });
+
+  d.text("核心只拿它需要的，产品保留它额外的，两者互不污染", 430, 358, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("pipeline", function (d) {
+  d.box({ id: "call", x: 30, y: 50, w: 150, h: 70, title: "toolCall", lines: ["模型发出的工具调用"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "prepare", x: 230, y: 40, w: 200, h: 110, title: "阶段一 prepare", lines: ["查工具 → 找不到即报错", "prepareArguments 预处理", "validateToolArguments 校验", "beforeToolCall 钩子 (可 block)"], tone: "teal", titleSize: 13 });
+  d.box({ id: "execute", x: 480, y: 40, w: 200, h: 110, title: "阶段二 execute", lines: ["tool.execute(...) 真正执行", "onUpdate → 进度事件", "异常 → isError 结果"], tone: "accent", titleSize: 13 });
+  d.box({ id: "finalize", x: 720, y: 40, w: 160, h: 110, title: "阶段三 finalize", lines: ["afterToolCall 事后修改", "覆盖 content / details", "usage / terminate / isError"], tone: "violet", titleSize: 12.5 });
+
+  d.arrow("call", "prepare", { from: "right", to: "left" });
+  d.arrow("prepare", "execute", { from: "right", to: "left" });
+  d.arrow("execute", "finalize", { from: "right", to: "left" });
+
+  d.box({ id: "msg", x: 350, y: 230, w: 200, h: 64, title: "createToolResultMessage", lines: ["打包成一条 toolResult 消息"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "ctx", x: 350, y: 320, w: 200, h: 60, title: "追加进上下文", lines: ["成为下次模型调用的输入"], tone: "slate", titleSize: 12.5 });
+
+  d.arrow("finalize", "msg", { from: "bottom", to: "top", label: "最终结果" });
+  d.arrow("msg", "ctx", { from: "bottom", to: "top" });
+
+  d.text('失败一律编码进结果（kind: "immediate" / isError: true），而不是抛出', 450, 395, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("parallel", function (d) {
+  d.sequence({
+    x: 10, y: 16, w: 860, rowH: 38, tailPad: 10,
+    participants: [
+      { id: "LOOP", label: "Agent 循环", tone: "gold" },
+      { id: "T1", label: "工具 T1 (edit)", tone: "teal" },
+      { id: "T2", label: "工具 T2 (write)", tone: "accent" },
+      { id: "CTX", label: "上下文 (转录)", tone: "violet" }
+    ],
+    steps: [
+      { kind: "note", label: "助手消息含 T1、T2 两个 toolCall（原始顺序）" },
+      { from: "LOOP", to: "T1", label: "tool_execution_start (T1) ① 预检串行，按原始顺序" },
+      { from: "LOOP", to: "T2", label: "tool_execution_start (T2)" },
+      { from: "LOOP", to: "T1", label: "execute（并行）" },
+      { from: "LOOP", to: "T2", label: "execute（并行）" },
+      { from: "T2", to: "LOOP", kind: "return", label: "tool_execution_end（谁先完成谁先发）" },
+      { from: "T1", to: "LOOP", kind: "return", label: "tool_execution_end" },
+      { from: "LOOP", to: "CTX", label: "toolResult 消息（按原始顺序追加）" },
+      { kind: "note", label: "事件按完成序，消息按原始序：UI 即时反馈，转录保持确定" }
+    ]
+  });
+});
+
+PB.fig("mutex", function (d) {
+  d.group({ x: 20, y: 20, w: 190, h: 240, label: "循环层：并行执行", tone: "gold" });
+  d.box({ id: "t1", x: 35, y: 45, w: 160, h: 52, title: "edit(foo.ts)", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "t2", x: 35, y: 120, w: 160, h: 52, title: "write(foo.ts)", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "t3", x: 35, y: 195, w: 160, h: 52, title: "edit(bar.ts)", tone: "gold", titleSize: 12.5 });
+
+  d.group({ x: 290, y: 36, w: 280, h: 186, label: "工具层：按路径 promise 链互斥", tone: "teal" });
+  d.box({ id: "qfoo", x: 305, y: 60, w: 250, h: 66, title: "foo.ts 队列", lines: ["edit → write 自动排队串行", "key = canonicalPath 规范化路径"], tone: "violet", titleSize: 12.5 });
+  d.box({ id: "qbar", x: 305, y: 150, w: 250, h: 52, title: "bar.ts 队列", lines: ["与 foo.ts 互不干扰"], tone: "violet", titleSize: 12.5 });
+
+  d.group({ x: 620, y: 36, w: 240, h: 186, label: "文件层：写操作不交错", tone: "accent" });
+  d.box({ id: "f1", x: 635, y: 60, w: 210, h: 66, title: "foo.ts", lines: ["edit、write 排成串行落盘"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "f2", x: 635, y: 150, w: 210, h: 52, title: "bar.ts", lines: ["独立执行"], tone: "teal", titleSize: 12.5 });
+
+  d.arrow("t1", "qfoo", { from: "right", to: "left" });
+  d.arrow("t2", "qfoo", { from: "right", to: "left" });
+  d.arrow("t3", "qbar", { from: "right", to: "left" });
+  d.arrow("qfoo", "f1", { from: "right", to: "left", label: "串行落盘" });
+  d.arrow("qbar", "f2", { from: "right", to: "left" });
+
+  d.text("read 不需要互斥（读不冲突）；不同 ExecutionEnv 有各自独立的队列", 440, 320, { size: 12, color: d.theme.muted, halo: true });
+  d.text("WeakMap 以 ExecutionEnv 为键，环境被回收时队列自动清理", 440, 345, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

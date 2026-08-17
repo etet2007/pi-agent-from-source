@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 15 章 · 远程控制：守护进程、RPC 与协议 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch15">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第六部分 · 扩展与连接</p>
+  <h1>第 15 章：远程控制——守护进程、RPC 与协议</h1>
+  <p class="chapter-sub">两套并存的远程设计：一个已实现的守护进程，一个等待服务端的协议</p>
+</header>
+
+<h2 id="hook">走出 localhost</h2>
+
+<p>到目前为止，我们看的都是“一个 pi 进程跑在一台机器的一个终端里”。但生产场景往往不止于此：你想让多个 Agent 在后台长期运行，想从 IDE 里驱动它们，想从另一台机器访问它们。</p>
+
+<p>Pi Agent 的远程控制能力藏在一个关键事实里：<strong>这个代码库里有两套截然不同的远程设计。</strong> 这不是冗余，而是两个不同阶段、不同目标的产物——理解它们的区别，能帮你看清一个系统如何在演进中处理“远程”这个需求。</p>
+
+<p>第一套是 <strong><code>pi-server</code></strong>：一个已完整实现的守护进程，监督多个无头的 <code>pi --mode rpc</code> 子进程，并把它们注册到一个叫 Radius 的远程中继。它用 newline-delimited JSON 通信。</p>
+
+<p>第二套是 <strong><code>pi-protocol</code> + <code>pi-client</code></strong>：一个传输无关的、二进制的（长度前缀 CBOR）协议，配一个运行时无关的客户端 SDK。它设计精良——但在这个代码快照里，<strong>没有任何东西在服务这个协议</strong>。它是一个为未来的远程 UI 准备的客户端，等待它的服务端。</p>
+
+<p>本章分别拆解这两套设计，然后回答：为什么会有两套？</p>
+
+<hr class="sep">
+
+<h2 id="pi-server">第一套：<code>pi-server</code> 守护进程</h2>
+
+<p><code>pi-server</code>（<code>packages/server</code>）的 <code>package.json</code> 诚实地标注为“experimental”。它的本质是一个<strong>监督器</strong>：一个长期运行的守护进程，管理多个 headless 编码 Agent 子进程。</p>
+
+<h3 id="cli">命令行</h3>
+
+<p><code>server</code> 二进制（<code>packages/server/src/cli.ts</code>）提供这些子命令：</p>
+
+<pre class="code" data-lang="text" data-file="packages/server/src/cli.ts">server serve              # 启动守护进程，一直运行
+server list               # 列出实例
+server spawn [--cwd &lt;path&gt;] [--label &lt;label&gt;]  # 启动一个 Agent 实例
+server status &lt;id&gt;        # 查询实例状态
+server stop &lt;id&gt;          # 停止实例
+server rpc &lt;id&gt; &lt;json&gt;    # 向实例发一个 RPC 命令
+server rpc-stream &lt;id&gt;    # 打开持久 RPC 流</pre>
+
+<p>除了 <code>serve</code>，所有命令都是<strong>瘦 IPC 客户端</strong>——它们通过 Unix socket 给守护进程发一个请求、拿一个响应。真正的逻辑都在守护进程里。</p>
+
+<h3 id="supervisor">监督器：<code>ServerSupervisor</code></h3>
+
+<p>核心是 <code>ServerSupervisor</code>（<code>packages/server/src/supervisor.ts</code>），一个导出的单例 <code>supervisor</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/supervisor.ts">export class ServerSupervisor {
+	private readonly liveInstances = new Map&lt;string, LiveInstance&gt;();
+
+	async spawnInstance(options: { cwd: string; label?: string }): Promise&lt;InstanceRecord&gt; { ... } // :270
+	async stopInstance(instanceId: string): Promise&lt;InstanceRecord | undefined&gt; { ... }            // :300
+	async recoverAfterRestart(): Promise&lt;void&gt; { ... }                                             // :244
+	async shutdown(): Promise&lt;void&gt; { ... }
+	listInstances(): InstanceRecord[];
+	listLiveInstances(): InstanceRecord[] { ... }                                                  // :240
+}</pre>
+
+<p>它维护一张 <code>liveInstances</code> 表，每个 <code>LiveInstance</code> 捆绑一个 <code>InstanceRecord</code>（持久化记录）和活资源（RPC 进程、Radius id、session id、事件订阅者）。</p>
+
+<p><code>spawnInstance</code> 的流程：创建一条记录（状态 <code>starting</code>）→ 持久化 → 创建一个 <code>RpcProcessInstance</code>（spawn 子进程）→ 绑定事件/退出/UI 处理器 → 同步会话元数据 → 注册到 Radius → 状态设为 <code>online</code>。失败则清理并设为 <code>stopped</code>。</p>
+
+<p><code>recoverAfterRestart</code> 处理守护进程重启：把任何 <code>online</code>/<code>starting</code> 的实例标记为 <code>stopped</code>（因为它们的子进程随上次进程死掉了），并从 Radius 断开。这是分布式系统里常见的“重启后状态 reconciliation”。</p>
+
+<h3 id="rpc-process">子进程：<code>RpcProcessInstance</code></h3>
+
+<p>每个实例是一个子进程，由 <code>RpcProcessInstance</code>（<code>packages/server/src/rpc-process.ts</code>）包装。spawn 命令是 <code>pi --mode rpc</code>（或等价的 <code>node .../rpc-entry</code>）。</p>
+
+<p>回忆第 11 章：<code>pi --mode rpc</code> 进入一个 JSON-RPC 循环，从 stdin 读命令、往 stdout 写响应。<code>RpcProcessInstance</code> 正是通过<strong>子进程的 stdin/stdout 用 JSON Lines 通信</strong>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/rpc-process.ts">send(command: RpcCommand): Promise&lt;RpcResponse&gt; {
+	// 分配 id，写 JSON.stringify(command) + "\n"，按 id 关联响应
+}</pre>
+
+<p>stdout 的每一行被分派：<code>type: "response"</code> 解决一个挂起的请求，<code>type: "extension_ui_request"</code> 调用 UI 处理器，其余的作为 <code>AgentSessionEvent</code> 广播给事件监听者。</p>
+
+<p>于是链条是：守护进程通过 stdio JSONL 驱动一个 headless 的 pi，复用了第 11 章的整个 RPC 模式。<code>RpcCommand</code>/<code>RpcResponse</code>/<code>AgentSessionEvent</code> 这些类型全部来自 <code>@earendil-works/pi-coding-agent</code>——<code>pi-server</code> 依赖 <code>coding-agent</code>，把它当作一个可 spawn 的 RPC 服务。</p>
+
+<h3 id="ipc">本地控制面：IPC</h3>
+
+<p>守护进程和它的 CLI 客户端之间，是另一层协议——本地 IPC（<code>packages/server/src/ipc/</code>）。它用 newline-delimited JSON over Unix socket：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/ipc/">// 请求：spawn / list / stop / status / rpc / rpc_stream
+// 响应：spawn_result / list_result / stop_result / status_result / rpc_result / rpc_ready / error
+encodeMessage(message): string = JSON.stringify(message) + "\n"</pre>
+
+<p><code>startIpcServer</code> 监听 Unix socket。一次性请求拿到响应后 <code>socket.end()</code>；<code>rpc_stream</code> 请求把 socket 升级成一个持久的双向 JSONL 流。<code>removeStaleSocketIfNeeded</code> + <code>isSocketLive</code> 检测并拒绝覆盖一个正在运行的守护进程（“server is already running”）。</p>
+
+<p>注意：这层 IPC 和子进程的 RPC 都是 JSON Lines，但<strong>词汇不同</strong>——IPC 是“管理守护进程”（spawn/stop/list），RPC 是“驱动一个 Agent”（prompt/steer/set_model）。两层各管一段。</p>
+
+<h3 id="storage-radius">持久化与 Radius</h3>
+
+<p>守护进程的状态存在 <code>~/.pi/server/</code>（<code>packages/server/src/storage.ts</code>）：<code>machine.json</code>（机器记录）和 <code>instances.json</code>（实例记录）。<code>InstanceRecord</code> 有 <code>id, status, cwd, label?, sessionId?, sessionFile?, radiusPiId?</code>，<code>InstanceStatus = starting | online | stopping | stopped | error</code>。</p>
+
+<p>最后是 Radius（<code>packages/server/src/radius.ts</code>）——远程中继。<code>RadiusPresence</code> 把本机的 Agent 注册到一个中心服务 <code>https://radius.pi.dev/</code>，让它们能被远程访问：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/radius.ts">// 注册机器（machines/register）和每个 pi 实例（pis/register）
+// capabilities: { rpc: true, relay: false, iroh: false }
+// 心跳循环：heartbeatMachine / heartbeatPi，指数退避 + 抖动</pre>
+
+<p>它注册机器和每个实例，然后跑心跳循环（带指数退避 + 抖动），连续 404 三次后重新注册。<code>capabilities</code> 里 <code>rpc: true</code> 但 <code>relay: false, iroh: false</code>——暗示 relay 和 iroh 传输是规划中但未实现的。</p>
+
+<h3 id="architecture">完整架构</h3>
+
+<p>把第一套串起来：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="server-chain" data-w="900" data-h="700"></canvas></div>
+  <figcaption>图 1：第一套远程架构的完整链条。CLI 经 Unix socket JSONL 驱动守护进程，监督器经 stdio JSONL 驱动 headless <code>pi --mode rpc</code> 子进程，并经 HTTPS 心跳注册到 Radius 中继，远程客户端经中继访问。</figcaption>
+</figure>
+
+<p>这是一条完整的链：CLI/IPC 客户端 →（Unix socket JSONL）→ 守护进程监督器 →（stdio JSONL）→ headless <code>pi --mode rpc</code> 子进程 →（HTTPS 心跳）→ Radius 远程中继。它复用了第 11 章的 RPC 模式作为最内层，逐层向外延伸。</p>
+
+<hr class="sep">
+
+<h2 id="protocol-client">第二套：<code>pi-protocol</code> + <code>pi-client</code></h2>
+
+<p>现在看第二套，一个气质完全不同的设计。</p>
+
+<h3 id="cbor-protocol"><code>pi-protocol</code>：传输无关的 CBOR 协议</h3>
+
+<p><code>pi-protocol</code>（<code>packages/protocol</code>）的自我描述是“Transport-neutral CBOR protocol for remote pi sessions”。它只有一个运行时依赖（<code>typebox</code>），零 Node 特定导入——它定义的是纯粹的协议：schema、CBOR 编码、字节流帧。</p>
+
+<p><strong>帧格式</strong>（<code>packages/protocol/src/framing.ts</code>）：协议版本 2，每帧是</p>
+
+<pre class="code" data-lang="text" data-file="packages/protocol/src/framing.ts">[4 字节大端无符号长度][一个定长 CBOR 项]</pre>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/framing.ts">export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024; // 16 MiB
+export function encodeFrame(payload: Uint8Array): Uint8Array; // 加长度头
+export class FrameDecoder {
+	push(chunk: Uint8Array): Uint8Array[]; // 增量切分任意字节块
+	end(): void;
+}</pre>
+
+<p><code>FrameDecoder.push</code> 增量地把任意字节流（处理分片/合并）切成完整的 payload。CBOR 用的是一个严格的 RFC 8949 子集（<code>cbor/</code>）：null/布尔、有限安全整数和 float64、UTF-8 字符串、字节串、定长数组、定长 map。默认限制：16 MiB payload、100 万元素、64 层嵌套。</p>
+
+<p><strong>消息词汇</strong>（<code>packages/protocol/src/schemas.ts</code>）。第一帧永远是握手：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const ClientHelloSchema = StrictObject({
+	type: Type.Literal("hello"),
+	version: Type.Integer({ minimum: 0 }),
+	token: Type.String({ minLength: 1 }), // bearer token
+});</pre>
+
+<p>服务器回 <code>hello</code>（带 <code>connectionId</code> 和 <code>snapshot</code>）或 <code>hello_error</code>。之后客户端发 <code>request</code> 信封，包裹一个命令。九种命令：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const CommandSchema = Type.Union([
+	ListCommandSchema,      // list
+	CreateCommandSchema,    // create
+	AttachCommandSchema,    // attach
+	DetachCommandSchema,    // detach
+	PromptCommandSchema,    // prompt
+	SteerCommandSchema,     // steer
+	AbortCommandSchema,     // abort
+	SetModelCommandSchema,  // set_model
+	SetThinkingCommandSchema, // set_thinking
+]);</pre>
+
+<p>服务器消息有 <code>response</code> 信封（按 id 关联，<code>ok: true</code> + result 或 <code>ok: false</code> + error）和 <code>event</code> 信封。事件是四种之一：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const ServerEventSchema = Type.Union([
+	// server_snapshot, session_snapshot, session_progress, session_removed
+]);</pre>
+
+<p>它还定义了一个完整的<strong>转录域模型</strong>：内容部分（text/thinking/image/toolCall）、<code>TranscriptItem</code>（user/assistant/tool，各带 status）、<code>TranscriptProgress</code>（item_started/assistant_delta/item_updated/item_finished）、<code>SessionSummary</code>、<code>SessionSnapshot</code>、<code>ServerSnapshot</code>、<code>ModelMetadata</code>、结构化的 <code>ProtocolError</code>。</p>
+
+<p>一个细节体现了它与核心的对齐：<code>SessionPhase = idle | turn | compaction | branch_summary | retry</code>，注释明说“Matches AgentHarnessPhase so adapters do not need a second phase vocabulary”——协议的 phase 词汇直接复用第 6 章 Harness 的 phase，避免适配器要维护两套词汇。</p>
+
+<p>所有 schema 用 <code>StrictObject</code>（<code>additionalProperties: false</code>）——未知属性被拒绝。这是一个为长期演进而设计的严格协议。</p>
+
+<h3 id="runtime-client"><code>pi-client</code>：运行时无关的客户端</h3>
+
+<p><code>pi-client</code>（<code>packages/client</code>）消费 <code>pi-protocol</code>，它的根包<strong>没有 Node 特定导入</strong>——Node/Bun 的 Unix socket 传输被隔离在 <code>./unix</code> 子路径导出后面。整个包建立在一个极小的传输接缝上（<code>packages/client/src/transport.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/client/src/transport.ts">export interface ByteTransport {
+	send(chunk: Uint8Array): Promise&lt;void&gt;; // 顺序交付，尊重背压
+	close(): void;                          // 幂等
+}
+export interface ByteTransportHandlers {
+	onData(chunk: Uint8Array): void;
+	onClose(): void;
+	onError(error: Error): void;
+}
+export type ByteTransportFactory = (handlers: ByteTransportHandlers) =&gt; ByteTransport | Promise&lt;ByteTransport&gt;;</pre>
+
+<p><code>ByteTransport</code> 只有两个方法：<code>send</code> 和 <code>close</code>。任何有序字节流都行——WebSocket、Unix socket、或别的。工厂必须为每次连接尝试产生一个<strong>全新</strong>的传输。这个接缝让整个客户端运行时无关：换一个 <code>ByteTransportFactory</code>，它就能跑在任何传输上。</p>
+
+<p><code>PiClient</code>（<code>packages/client/src/client.ts</code>）是公共入口：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/client/src/client.ts">connect(): Promise&lt;ServerSnapshot&gt;;
+listSessions(): Promise&lt;readonly SessionSummary[]&gt;;
+createSession(options?): Promise&lt;PiSessionHandle&gt;;
+attachSession(sessionId): Promise&lt;PiSessionHandle&gt;;
+subscribe(listener); onEvent(listener); onConnectionStateChange(listener);</pre>
+
+<p>它没有自动重连——调用方驱动 <code>connect</code>/<code>reconnect</code>/<code>disconnect</code>。<code>PiSessionHandle</code> 是一个会话的稳定客户端引用：<code>prompt(text)</code>、<code>steer(text)</code>、<code>abort()</code>、<code>setModel(model)</code>、<code>setThinking(level)</code>、<code>detach()</code>，每个返回 <code>Promise&lt;SessionSnapshot&gt;</code>。</p>
+
+<p>内部的 <code>Connection</code>（<code>connection.ts</code>）是一个生命周期状态机（<code>disconnected | connecting | connected</code>）：先发自客户端 <code>hello</code>，期望服务器 <code>hello</code> 作为第一个入站消息，用 <code>ServerSnapshot</code> 解决握手，之后的消息路由给 <code>onMessage</code>。它防御“握手前就有数据”和“意外的握手消息”。</p>
+
+<p><code>ClientState</code>（<code>state.ts</code>）持有快照缓存（<code>ServerSnapshot</code> + 每会话 <code>SessionSnapshot</code>）和监听器注册表，<code>applyServerSnapshot</code> 带 revision 守卫（旧的快照不覆盖新的）。订阅者的异常被隔离并通过 <code>onListenerError</code> 上报，“不能影响客户端状态”。</p>
+
+<h3 id="snapshot">快照权威 + 瞬时进度</h3>
+
+<p>这套协议有一个重要的设计哲学，README 反复强调：<strong>快照是权威的，进度事件是瞬时的 UI 提示。</strong></p>
+
+<p><code>session_progress</code> 事件（带 <code>TranscriptProgress</code>：item_started/assistant_delta/item_finished）是流式的增量提示，让 UI 能实时渲染。但如果客户端错过了几个进度事件、或刚连接，它不需要重放——<code>session_snapshot</code> 提供完整的当前状态。客户端可以随时用快照重建一切，进度事件只是“让它看起来流畅”的优化。</p>
+
+<p>这与第 3 章的事件流形成对比：那里事件是唯一的真相来源；这里快照是真相，事件是提示。两种模型各有适用场景——对一个可能断线重连、多客户端 attach 的远程系统，“快照权威”更健壮。</p>
+
+<h3 id="unwired">一个未接线的客户端</h3>
+
+<p>关键事实：在这个代码快照里，<strong>没有任何东西在服务 <code>pi-protocol</code>。</strong> <code>pi-server</code> 不 import <code>pi-protocol</code>——它用的是自己的 JSON IPC。<code>pi-client</code> 是一个设计精良的客户端 SDK，等待一个尚未在这里实现的服务端。</p>
+
+<p>它读起来像是为未来的远程 UI（一个 GUI、一个 Web 界面）准备的：传输无关（可以跑在浏览器的 WebSocket 上）、运行时无关、快照权威（适合多客户端）、严格的版本化协议。它是“下一代”远程方案的设计稿。</p>
+
+<hr class="sep">
+
+<h2 id="why-two">为什么有两套</h2>
+
+<p>把两套放在一起对比：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th><code>pi-server</code>（第一套）</th><th><code>pi-protocol</code>/<code>pi-client</code>（第二套）</th></tr></thead>
+<tbody>
+<tr><td>状态</td><td>已实现，自包含</td><td>客户端已实现，服务端未接线</td></tr>
+<tr><td>传输</td><td>Unix socket + stdio</td><td>传输无关（任意字节流）</td></tr>
+<tr><td>编码</td><td>newline-delimited JSON</td><td>长度前缀 CBOR（二进制）</td></tr>
+<tr><td>运行时</td><td>Node/Bun</td><td>运行时无关（可浏览器）</td></tr>
+<tr><td>拓扑</td><td>守护进程监督子进程</td><td>客户端-服务器，多客户端 attach</td></tr>
+<tr><td>远程</td><td>Radius 中继（HTTPS 心跳）</td><td>协议本身传输无关</td></tr>
+<tr><td>真相模型</td><td>事件流</td><td>快照权威 + 瞬时进度</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>这两套不是重复劳动，而是<strong>演进的两个阶段</strong>。<code>pi-server</code> 是“现在能用的”——它用简单的 JSON-over-socket 解决了“后台跑多个 Agent + 远程访问”的实际需求，复用了现成的 RPC 模式。<code>pi-protocol</code>/<code>pi-client</code> 是“为未来设计的”——一个更通用、更严格、传输无关的协议，为尚未到来的远程 UI 准备。</p>
+
+<p>这揭示了一个务实的工程态度：<strong>先用简单方案解决当下的问题，同时为未来设计更通用的接口，但不强行让两者统一。</strong> <code>pi-server</code> 没有为了“优雅”而硬去用还没成熟的 CBOR 协议；<code>pi-protocol</code> 也没有为了“复用”而迁就 <code>pi-server</code> 的 JSON 设计。两者各自独立演进，等到时机成熟再收敛——或者不收敛。</p>
+
+<p>这也是最小化哲学的另一种体现：远程能力本身是<strong>可选的旁支</strong>（第 1 章的依赖图里，<code>server</code>/<code>protocol</code>/<code>client</code> 都是产品层的下游，产品层不依赖它们）。你安装 <code>pi</code> 命令完全不需要任何远程组件。远程是“如果你需要，它在那里”，而不是“核心强制内置”。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的两套远程设计为“如何为系统添加远程能力”提供了四条可迁移的模式。</p>
+
+<p><strong>用最小的传输接缝实现传输无关。</strong> <code>ByteTransport</code> 只有 <code>send</code>/<code>close</code>，任何有序字节流都能适配。它解决的问题是：客户端绑死在某一种传输（WebSocket/Unix socket）上。当传输是一个两方法的接口，同一个客户端就能跑在任意传输上，包括浏览器。</p>
+
+<p><strong>快照权威，事件瞬时。</strong> 完整状态用快照表达（可随时重建），流式事件只是 UI 提示（丢了不影响正确性）。它解决的问题是：远程客户端断线重连、多客户端 attach 时，纯事件流需要重放、容易状态漂移。当快照是真相，重连就是“拿一个快照”，健壮性大幅提升。</p>
+
+<p><strong>复用现成模式做内层，逐层向外延伸。</strong> <code>pi-server</code> 的最内层直接复用第 11 章的 <code>pi --mode rpc</code>，外面包监督器、IPC、Radius。它解决的问题是：为远程从零写一套 Agent 驱动逻辑。当远程是“在现成 RPC 模式上逐层包装”，每一层都简单，且内层行为与本地完全一致。</p>
+
+<p><strong>允许两套方案在演进中并存。</strong> 当下的简单方案（JSON IPC）和未来的通用设计（CBOR 协议）独立演进，不强行统一。它解决的问题是：要么为了优雅让当下方案背锅，要么为了复用让未来设计妥协。当两者解耦，就能各自按自己的时间表成熟——务实往往比一致更重要。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的远程控制有两套设计。第一套 <code>pi-server</code> 是已实现的守护进程：<code>ServerSupervisor</code> 监督多个 <code>pi --mode rpc</code> 子进程（通过 stdio JSONL，复用第 11 章的 RPC 模式），CLI 通过 Unix socket JSON IPC 管理它，状态持久化在 <code>~/.pi/server/</code>，并通过 Radius 中继注册到 <code>radius.pi.dev</code> 实现远程访问。第二套 <code>pi-protocol</code> + <code>pi-client</code> 是传输无关、运行时无关的 CBOR 协议与客户端：长度前缀帧、hello 握手、九种命令、快照权威 + 瞬时进度、<code>ByteTransport</code> 两方法接缝——但在这个快照里没有服务端在服务它，它是为未来远程 UI 准备的设计稿。</p>
+
+<p>两套并存不是冗余，而是演进的两个阶段：简单的现在，通用的未来。而远程能力整体作为可选旁支，产品核心完全不依赖它——这又一次体现了“最小化核心，把可选能力推到边缘”的哲学。</p>
+
+<p>下一章，我们看一个常被忽视但对 Agent 至关重要的主题：如何用模型驱动的行为评估，验证一个 Agent 真的变好了。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("server-chain", function (d) {
+  d.box({ id: "CLI", x: 350, y: 30, w: 200, h: 58, title: "server CLI", lines: ["spawn / list / rpc …"], tone: "accent", titleSize: 13 });
+  d.box({ id: "IPC", x: 350, y: 140, w: 200, h: 58, title: "IPC 服务器", tone: "accent", titleSize: 13 });
+  d.box({ id: "SUP", x: 330, y: 250, w: 240, h: 70, title: "ServerSupervisor", lines: ["liveInstances"], tone: "gold", titleSize: 13 });
+  d.box({ id: "RPC1", x: 60, y: 400, w: 210, h: 64, title: "pi --mode rpc", lines: ["子进程 1"], tone: "teal", titleSize: 13 });
+  d.box({ id: "RPC2", x: 320, y: 400, w: 210, h: 64, title: "pi --mode rpc", lines: ["子进程 2"], tone: "teal", titleSize: 13 });
+  d.box({ id: "RADIUS", x: 620, y: 400, w: 220, h: 64, title: "Radius 远程中继", lines: ["radius.pi.dev"], tone: "violet", titleSize: 13 });
+  d.box({ id: "STORE", x: 60, y: 560, w: 210, h: 66, title: "~/.pi/server/", lines: ["machine.json", "instances.json"], tone: "slate", titleSize: 13 });
+  d.box({ id: "REMOTE", x: 620, y: 560, w: 220, h: 64, title: "远程客户端", tone: "slate", titleSize: 13 });
+
+  d.arrow("CLI", "IPC", { from: "bottom", to: "top", label: "Unix socket, JSONL" });
+  d.arrow("IPC", "SUP", { from: "bottom", to: "top" });
+
+  d.path([[380, 320], [380, 352], [165, 352], [165, 400]]);
+  d.path([[450, 320], [450, 352], [425, 352], [425, 400]]);
+  d.path([[520, 320], [520, 352], [730, 352], [730, 400]]);
+  d.path([[330, 285], [36, 285], [36, 562], [60, 562]]);
+  d.arrow("RADIUS", "REMOTE", { from: "bottom", to: "top", dashed: true, label: "远程访问" });
+
+  d.text("spawn + stdin/stdout JSONL", 272, 344, { size: 11.5, color: d.theme.muted, halo: true });
+  d.text("HTTPS 心跳", 625, 344, { size: 11.5, color: d.theme.muted, halo: true });
+  d.text("读写", 36, 430, { size: 11.5, color: d.theme.muted, halo: true });
+
+  d.text("CLI/IPC → 守护进程监督器 → headless pi 子进程 → Radius 中继：复用第 11 章的 RPC 模式，逐层向外延伸", 450, 662, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

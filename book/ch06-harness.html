@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 6 章 · AgentHarness：可持久化的编排器 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch06">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第三部分 · 持久化编排</p>
+  <h1>第 6 章：AgentHarness——可持久化的编排器</h1>
+  <p class="chapter-sub">一个可持久化、由 hook 驱动的编排器：IO 依赖倒置、22 种类型化 hook、安全点落盘——以及产品层为什么最终绕开了它</p>
+</header>
+
+<h2 id="hook">核心故意留下的空白</h2>
+
+<p>第 3 章的核心循环是纯净的：它只认识一个 <code>emit</code> 回调和一组"永不抛出"的配置槽位，不碰文件系统，不做持久化，不管压缩。这是刻意的设计——但也是不完整的。一个真实可用的 Agent 需要：把转录存到磁盘、上下文太长时压缩、在工具调用前后插入逻辑、管理 skills 和提示词模板、提供内置的文件/Shell 工具。</p>
+
+<p><code>pi-agent-core</code> 把这些"电池"装在一个独立的层里：Harness（<code>packages/agent/src/harness/**</code>）。它的核心是 <code>AgentHarness</code> 类（<code>packages/agent/src/harness/agent-harness.ts</code>，约 1,186 行），一个<strong>可持久化、由 hook 驱动的编排器</strong>，直接建立在 <code>runAgentLoop</code> 之上。</p>
+
+<p>本章拆解这个层。但更重要的是，我们要回答一个架构问题：<strong>为什么同一个包里既有最小核心、又有这个"电池齐全"的 Harness？</strong> 以及一个更尖锐的问题：<strong>为什么产品层 <code>pi-coding-agent</code> 最终没有用它，而是自建了编排器？</strong> 这两个问题的答案，恰恰是"最小化核心"哲学最精微的体现。</p>
+
+<hr class="sep">
+
+<h2 id="additions">Harness 在核心之上加了什么</h2>
+
+<p>核心 <code>Agent</code> 类（第 5 章）是一个内存里的循环包装器。<code>AgentHarness</code> 在它之上增加了一整套持久化与编排能力：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="harness-layers" data-w="860" data-h="520"></canvas></div>
+  <figcaption>图 1：AgentHarness 把一整套持久化与编排能力加在最小核心之上。核心循环保持纯净，Harness 是核心的消费者而非修改者。</figcaption>
+</figure>
+
+<p>逐项说：</p>
+
+<ul>
+<li><strong>持久会话树</strong>：Harness 持有一个 <code>Session</code>（第 5 章的树），把每一轮的消息持久化进去。</li>
+<li><strong>Hook 系统</strong>：22 种类型化的 hook 事件，让外部代码在循环的关键节点插入逻辑。</li>
+<li><strong>压缩与分支摘要</strong>：上下文太长时自动生成摘要，分支切换时生成分支摘要。</li>
+<li><strong>内置工具</strong>：<code>bash</code>、<code>read</code>、<code>edit</code>、<code>write</code>，建立在 <code>ExecutionEnv</code> 抽象之上。</li>
+<li><strong>Skills 与提示词模板</strong>：加载 <code>SKILL.md</code>、格式化提示词模板。</li>
+<li><strong>phase 状态机</strong>：跟踪 harness 当前在做什么（idle/turn/compaction/...）。</li>
+</ul>
+
+<p>关键在于：这些能力<strong>都不在核心循环里</strong>。核心循环依然纯净——Harness 是通过往核心的配置槽位里塞回调、订阅核心的事件流来实现这一切的。Harness 是核心的<em>消费者</em>，不是核心的<em>修改者</em>。</p>
+
+<hr class="sep">
+
+<h2 id="exec-env"><code>ExecutionEnv</code>：把 IO 倒置出去</h2>
+
+<p>Harness 的内置工具要读写文件、执行命令。但它不直接用 <code>node:fs</code> 和 <code>node:child_process</code>——那会让它绑死在 Node 环境。它定义了一个 IO 抽象 <code>ExecutionEnv</code>（<code>packages/agent/src/harness/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export interface ExecutionEnv extends FileSystem, Shell {}</pre>
+
+<p><code>FileSystem</code> 是一组文件操作，每个都返回 <code>Result</code> 而非抛出：</p>
+
+<pre class="code" data-lang="ts">export interface FileSystem {
+	cwd: string;
+	absolutePath(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	readTextFile(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	readTextLines(path, options?): Promise&lt;Result&lt;string[], FileError&gt;&gt;;
+	readBinaryFile(path, abortSignal?): Promise&lt;Result&lt;Uint8Array, FileError&gt;&gt;;
+	writeFile(path, content, abortSignal?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	appendFile(path, content, abortSignal?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	listDir(path, abortSignal?): Promise&lt;Result&lt;FileInfo[], FileError&gt;&gt;;
+	canonicalPath(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	exists(path, abortSignal?): Promise&lt;Result&lt;boolean, FileError&gt;&gt;;
+	createDir(path, options?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	remove(path, options?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	createTempDir(prefix?, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	cleanup(): Promise&lt;void&gt;; // 必须尽力而为，且不得抛出
+}
+
+export interface Shell {
+	exec(command, options?): Promise&lt;Result&lt;{ stdout: string; stderr: string; exitCode: number }, ExecutionError&gt;&gt;;
+	cleanup(): Promise&lt;void&gt;;
+}</pre>
+
+<p>这里有两个设计决策值得注意。</p>
+
+<p><strong>第一，<code>Result</code> 类型取代异常。</strong> <code>Result&lt;TValue, TError&gt;</code> 是一个简单的可辨识联合：</p>
+
+<pre class="code" data-lang="ts">export type Result&lt;TValue, TError&gt; = { ok: true; value: TValue } | { ok: false; error: TError };</pre>
+
+<p><code>FileSystem</code> 和 <code>Shell</code> 的文档明确要求：<strong>所有失败都编码进返回的 <code>Result</code>，实现必须保持这个不变量，绝不抛出。</strong> 这是第 3 章"失败是数据"契约在 IO 层的延续。工具的执行逻辑因此可以写成直白的 <code>if (result.ok) ... else ...</code>，而不需要 <code>try/catch</code> 包裹每个文件操作。<code>cleanup()</code> 甚至要求"必须尽力而为且不得抛出"——资源释放永远不能炸。</p>
+
+<p><strong>第二，依赖倒置让工具跨环境。</strong> 因为工具依赖的是 <code>ExecutionEnv</code> 接口而非具体实现，同一个 <code>createBashTool</code> 可以跑在不同的环境上。Node 环境用 <code>NodeExecutionEnv</code>（<code>packages/agent/src/harness/env/nodejs.ts</code>，基于 <code>node:fs</code>/<code>node:child_process</code>）；但理论上你可以提供一个把操作转发到远程 SSH、容器、或浏览器的实现。第 4 章提到的工具可插拔 <code>operations</code>（委托文件 IO 给远程系统）正是建立在这个抽象上。</p>
+
+<p><code>withFileMutationQueue</code>（第 4 章的文件互斥）也以 <code>ExecutionEnv</code> 为键——<code>WeakMap&lt;ExecutionEnv, ...&gt;</code>——所以不同执行环境有各自独立的互斥队列。IO 抽象与并发安全在这里自然地咬合。</p>
+
+<hr class="sep">
+
+<h2 id="phase">phase 状态机：harness 现在在做什么</h2>
+
+<p><code>AgentHarness</code> 用一个 phase 字段跟踪自己的宏观状态：</p>
+
+<pre class="code" data-lang="ts">export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";</pre>
+
+<ul>
+<li><code>idle</code>：空闲，可以接受新操作</li>
+<li><code>turn</code>：正在跑一轮对话</li>
+<li><code>compaction</code>：正在压缩上下文</li>
+<li><code>branch_summary</code>：正在生成分支摘要</li>
+<li><code>retry</code>：正在重试</li>
+</ul>
+
+<p>这个状态机的一个实际用途是<strong>互斥保护</strong>。比如 <code>navigateTree</code>（分支导航）开头就检查：</p>
+
+<pre class="code" data-lang="ts">async navigateTree(...): Promise&lt;NavigateTreeResult&gt; {
+	if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
+	// ...
+}</pre>
+
+<p><code>compact()</code> 同样要求空闲。这避免了"一边在跑对话、一边在改会话树"这种危险的并发。phase 不是 UI 状态（那个由事件流驱动），而是 harness 自身的"我在忙什么"的内部账本。</p>
+
+<p>Harness 还用一个 <code>activeTasks: Map&lt;Promise, "operation" | "mutation"&gt;</code> 跟踪所有进行中的异步工作，区分"操作"和"变更"，以便在关闭时能等待它们完成。</p>
+
+<hr class="sep">
+
+<h2 id="turn-state"><code>createTurnState</code>：每轮一个快照</h2>
+
+<p>每一轮对话开始时，Harness 会拍一个快照 <code>createTurnState()</code>（<code>packages/agent/src/harness/agent-harness.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/agent-harness.ts">private async createTurnState() {
+	// 从会话树构建上下文，快照：
+	// messages, resources, toolContext, streamOptions, sessionId,
+	// systemPrompt, model, thinkingLevel, tools, activeTools
+}</pre>
+
+<p>它从 <code>Session</code> 重新构建上下文（<code>buildSessionContext</code>），把当前的模型、thinking 级别、激活工具、系统提示词、资源等全部冻结成一个不可变的轮次状态。这一轮就用这个快照。</p>
+
+<p>为什么要每轮重新快照？因为运行期间状态可能被修改——用户可能在 agent 工作时切换了模型、改了激活工具。如果循环一直用启动时的旧状态，这些修改就不会生效。快照机制让"轮间变更"有了明确的生效时机。</p>
+
+<p>这与第 3 章的 <code>prepareNextTurn</code> 钩子咬合。Harness 的 <code>createLoopConfig</code> 这样实现它：</p>
+
+<pre class="code" data-lang="ts">prepareNextTurn: async () => {
+	await this.flushPendingSessionWrites();      // 先把待写的落盘
+	const nextTurnState = await this.createTurnState(); // 重新从会话树快照
+	setTurnState(nextTurnState);
+	return {
+		context: this.createContext(nextTurnState),
+		model: nextTurnState.model,
+		thinkingLevel: nextTurnState.thinkingLevel,
+	};
+},</pre>
+
+<p>每轮结束、下一轮开始前：先把缓冲的写操作落盘，再重新从会话树构建快照，把新的 context/model/thinkingLevel 返回给循环。于是运行中途的 <code>setModel()</code> 等修改，会在下一个轮次边界生效。这是一个干净的"变更在安全点生效"的模型。</p>
+
+<hr class="sep">
+
+<h2 id="loop-config"><code>createLoopConfig</code>：从核心槽位到 Harness hook</h2>
+
+<p>这是 Harness 最核心的适配工作。核心循环只有少数几个配置槽位（<code>transformContext</code>、<code>beforeToolCall</code>、<code>afterToolCall</code>、<code>prepareNextTurn</code>、<code>getSteeringMessages</code>、<code>getFollowUpMessages</code>），而 Harness 有一个丰富得多的 hook 系统。<code>createLoopConfig</code> 就是把前者映射到后者的适配器：</p>
+
+<pre class="code" data-lang="ts">private createLoopConfig(getTurnState, setTurnState): AgentLoopConfig {
+	const turnState = getTurnState();
+	return {
+		model: turnState.model,
+		reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
+		convertToLlm,
+		// 核心的 transformContext 槽位 → harness 的 "context" hook
+		transformContext: async (messages) => {
+			const result = await this.emitHook({ type: "context", messages: [...messages] });
+			return result?.messages ?? messages;
+		},
+		// 核心的 beforeToolCall 槽位 → harness 的 "tool_call" hook
+		beforeToolCall: async ({ toolCall, args }) => {
+			const result = await this.emitHook({
+				type: "tool_call",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args,
+			});
+			return result ? { block: result.block, reason: result.reason } : undefined;
+		},
+		// 核心的 afterToolCall 槽位 → harness 的 "tool_result" hook
+		afterToolCall: async ({ toolCall, args, result, isError }) => {
+			const patch = await this.emitHook({
+				type: "tool_result",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args,
+				content: result.content,
+				details: result.details,
+				isError,
+				usage: result.usage,
+			});
+			return patch ? { content: patch.content, details: patch.details, isError: patch.isError, usage: patch.usage, terminate: patch.terminate } : undefined;
+		},
+		prepareNextTurn: async () => { /* 如上 */ },
+		getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
+		getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
+	};
+}</pre>
+
+<p>看这个映射：核心的 <code>transformContext</code> 槽位被接到 harness 的 <code>context</code> hook，核心的 <code>beforeToolCall</code> 接到 <code>tool_call</code> hook，核心的 <code>afterToolCall</code> 接到 <code>tool_result</code> hook。核心提供<strong>机制</strong>（"这里有一个可以拦截的槽位"），Harness 提供<strong>策略</strong>（"拦截时具体触发哪些 hook、怎么聚合结果"）。</p>
+
+<p>这个适配方向很重要：是 Harness 适配核心，而不是核心迁就 Harness。核心循环对 hook 系统一无所知——它只是调用 <code>transformContext</code>，至于那个回调内部是不是触发了一个 22 种事件的 hook 系统，它不关心。这就是分层的意义：下层稳定，上层自由演进。</p>
+
+<hr class="sep">
+
+<h2 id="hooks">Hook 系统：22 种类型化事件</h2>
+
+<p>Harness 的 hook 系统由 <code>AgentHarnessEventResultMap</code>（<code>packages/agent/src/harness/types.ts</code>）定义，列出所有 hook 事件及其返回值类型：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export type AgentHarnessEventResultMap = {
+	before_agent_start: BeforeAgentStartResult | undefined;
+	context: ContextResult | undefined;
+	before_provider_request: BeforeProviderRequestResult | undefined;
+	before_provider_payload: BeforeProviderPayloadResult | undefined;
+	after_provider_response: undefined;
+	tool_call: ToolCallResult | undefined;
+	tool_result: ToolResultPatch | undefined;
+	session_before_compact: SessionBeforeCompactResult | undefined;
+	session_compact: undefined;
+	session_before_tree: SessionBeforeTreeResult | undefined;
+	session_tree: undefined;
+	retry_scheduled: undefined;
+	retry_attempt_start: undefined;
+	retry_finished: undefined;
+	model_update: undefined;
+	thinking_level_update: undefined;
+	resources_update: undefined;
+	tools_update: undefined;
+	queue_update: undefined;
+	save_point: undefined;
+	abort: undefined;
+	settled: undefined;
+};</pre>
+
+<p>22 种事件，分两类：</p>
+
+<ul>
+<li><strong>可影响行为的</strong>（返回值非 <code>undefined</code>）：<code>before_agent_start</code>、<code>context</code>、<code>before_provider_request</code>、<code>before_provider_payload</code>、<code>tool_call</code>、<code>tool_result</code>、<code>session_before_compact</code>、<code>session_before_tree</code>。这些 hook 的处理器可以返回一个结果来改变行为——比如 <code>tool_call</code> 返回 <code>{ block: true }</code> 阻止工具，<code>context</code> 返回修改后的消息列表。</li>
+<li><strong>通知性的</strong>（返回值 <code>undefined</code>）：<code>after_provider_response</code>、<code>session_compact</code>、<code>retry_scheduled</code>、<code>model_update</code>、<code>tools_update</code>、<code>abort</code>、<code>settled</code> 等。这些只是告知"某事发生了"，供外部记录或同步状态。</li>
+</ul>
+
+<p><code>emitHook</code> 是触发器：</p>
+
+<pre class="code" data-lang="ts">private async emitHook&lt;TType extends keyof AgentHarnessEventResultMap&gt;(
+	event: { type: TType } &amp; ...,
+): Promise&lt;AgentHarnessEventResultMap[TType]&gt; {
+	// 依次调用注册的处理器，返回最后一个非 undefined 的结果
+}</pre>
+
+<p>它按注册顺序调用处理器，返回<strong>最后一个非 <code>undefined</code> 的结果</strong>。这个"last-wins"语义让多个处理器可以叠加，后面的覆盖前面的。</p>
+
+<p>注意这套 hook 系统是<strong>强类型</strong>的：每个事件的 payload 和返回值类型都由 <code>AgentHarnessEventResultMap</code> 精确约束。注册一个 <code>tool_call</code> 处理器时，你能在编译期得到完整的类型检查。这与"运行时钩子字符串"（<code>hooks.on("PreToolUse", ...)</code>）形成鲜明对比——后者要到运行时才知道事件名拼对了没、payload 长什么样。第 14 章会看到，产品层的扩展系统继承了这个"类型化扩展"的品味。</p>
+
+<hr class="sep">
+
+<h2 id="persistence">持久化：在安全点落盘</h2>
+
+<p>Harness 把消息持久化进会话树，但不是每条消息都立即写盘——它用一个写缓冲 <code>pendingSessionWrites</code>，在安全点统一刷新。</p>
+
+<p><code>handleAgentEvent</code> 是 harness 的事件处理器（对应核心 <code>Agent</code> 的 <code>processEvents</code>）。它在 <code>message_end</code> 时把消息记入缓冲，在 <code>turn_end</code>/<code>agent_end</code> 时刷新：</p>
+
+<pre class="code" data-lang="ts">private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise&lt;void&gt; {
+	// message_end → 记入 pendingSessionWrites
+	// turn_end / agent_end → flushPendingSessionWrites()
+}
+
+private async flushPendingSessionWrites(): Promise&lt;void&gt; {
+	while (this.pendingSessionWrites.length &gt; 0) {
+		const write = this.pendingSessionWrites[0]!;
+		if (write.type === "message") {
+			await this.session.appendMessage(write.message);
+		} else if (write.type === "model_change") {
+			// ...
+		}
+		// 出队，继续
+	}
+}</pre>
+
+<p>为什么缓冲而非立即写？因为运行中途可能发生变更（<code>setModel()</code>、<code>setThinkingLevel()</code>），这些变更如果立即写进会话树，可能与正在进行的消息流交错，产生不一致的中间状态。把它们缓冲到 <code>turn_end</code>/<code>agent_end</code>/<code>prepareNextTurn</code> 这些安全点统一落盘，保证了会话树的写入是有序的、原子的。</p>
+
+<p><code>handleAgentEvent</code> 也处理失败兜底——和核心 <code>Agent</code> 一样，意外错误会被转换成一个正常的失败事件序列（<code>message_start</code> → <code>message_end</code> → <code>turn_end</code> → <code>agent_end</code>），再交给 <code>handleRunFailure</code> 持久化。"失败也是正常事件序列"的契约，从核心一路贯彻到了 Harness。</p>
+
+<hr class="sep">
+
+<h2 id="compaction">压缩与分支导航</h2>
+
+<p>Harness 把第 5 章提到的两个会话树操作暴露为方法：<code>compact()</code> 和 <code>navigateTree()</code>。</p>
+
+<p><code>compact(customInstructions?)</code>（第 7 章详述）触发上下文压缩：生成摘要、追加一个 <code>CompactionEntry</code>、之后上下文构建用"摘要 + 尾部"。它在前后触发 <code>session_before_compact</code> 和 <code>session_compact</code> hook，并把 phase 切到 <code>compaction</code>。</p>
+
+<p><code>navigateTree(...)</code> 在会话树上导航（分支、回溯）：它可能生成一个分支摘要（<code>BranchSummaryEntry</code>），然后 <code>moveTo</code> 到目标节点。它在前后触发 <code>session_before_tree</code> 和 <code>session_tree</code> hook，phase 切到 <code>branch_summary</code>。两者都要求 harness 处于 <code>idle</code>——不能在对话进行中改树。</p>
+
+<p>这两个方法是"会话树"设计的能力出口。因为转录是树而非数组，压缩可逆、分支免费——Harness 只是把这些底层能力包装成两个带 hook、带 phase 保护的高层操作。</p>
+
+<hr class="sep">
+
+<h2 id="why-not">为什么产品层没有用它</h2>
+
+<p>现在回答那个尖锐的问题：既然 <code>AgentHarness</code> 提供了这么完整的持久化编排，为什么 <code>pi-coding-agent</code> 不用它，反而自建了一个 3,333 行的 <code>AgentSession</code>？</p>
+
+<p>答案在于<strong>关注点的错位</strong>。<code>AgentHarness</code> 是一个<em>通用的</em>持久化编排器——它关心会话树、压缩、hook、内置工具、skills。但产品层需要的远不止这些：</p>
+
+<ul>
+<li>三种运行模式（交互 TUI / print / RPC）</li>
+<li>扩展系统（约 40 种事件、注册工具/命令/快捷键/flag）</li>
+<li>项目信任决策</li>
+<li>斜杠命令、模型切换 UI、主题</li>
+<li>设置管理、认证、OAuth</li>
+<li>HTML 导出、会话分享</li>
+</ul>
+
+<p>这些产品级的关注点，与 <code>AgentHarness</code> 的通用编排关注点并不重合。如果产品层硬用 <code>AgentHarness</code>，要么把产品逻辑塞进 harness 的 hook（污染通用层），要么在 harness 外面再包一层（那 harness 就成了多余的中间层）。</p>
+
+<p>于是产品层做了一个清醒的选择：<strong>直接坐在核心 <code>Agent</code> 上，自建编排。</strong> 回忆第 1 章的 <code>sdk.ts:294</code>：<code>agent = new Agent({...})</code>——产品层实例化的是核心 <code>Agent</code>，不是 <code>AgentHarness</code>。它复用核心的循环和事件流，但用自己的 <code>AgentSession</code> 处理产品编排，用自己的 <code>SessionManager</code>（JSONL）处理持久化。</p>
+
+<p>这揭示了 <code>pi-agent-core</code> 内部两层设计的真正意图：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="core-strategies" data-w="780" data-h="320"></canvas></div>
+  <figcaption>图 2：核心提供机制，AgentHarness 与 AgentSession 是两种并行的编排策略，SDK 用户也可以自建自己的策略。</figcaption>
+</figure>
+
+<p>核心提供<strong>机制</strong>（循环、事件流、工具执行、消息桥）。<code>AgentHarness</code> 是官方提供的<strong>一种策略</strong>——"如果你想要一个开箱即用的持久化 Agent"。<code>AgentSession</code> 是产品层的<strong>另一种策略</strong>——"如果你要做一个完整的 CLI 产品"。SDK 用户完全可以写<strong>自己的策略</strong>。</p>
+
+<p>核心不强迫任何人在 <code>AgentHarness</code> 和 <code>AgentSession</code> 之间二选一，因为它根本不知道这两者的存在——它只暴露机制。这才是"最小化核心"的完整含义：<strong>核心小到可以被任何一种编排策略复用，包括官方没想到的策略。</strong></p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p><code>AgentHarness</code> 与核心的关系，为"如何设计可扩展的框架"提供了四条可迁移的模式。</p>
+
+<p><strong>机制与策略分离，且机制不知道策略。</strong> 核心循环提供槽位（机制），Harness 和产品各自往槽位里塞自己的逻辑（策略），核心对策略一无所知。它解决的问题是：框架把某一种使用方式焊死在核心里，导致其他使用方式被迫迁就。当核心只暴露机制，策略就能百花齐放——通用 Harness、产品 Session、自定义 SDK 各得其所。</p>
+
+<p><strong>用依赖倒置把环境隔离出去。</strong> 工具的 IO 依赖 <code>ExecutionEnv</code> 接口而非 <code>node:fs</code>，且所有操作返回 <code>Result</code> 不抛异常。它解决的问题是：业务逻辑绑死在某个运行环境，且 <code>try/catch</code> 散落。当 IO 是接口、失败是 <code>Result</code>，同一套工具就能跑在 Node、远程、容器里，且执行逻辑保持直白。</p>
+
+<p><strong>用适配器连接不同抽象层次。</strong> <code>createLoopConfig</code> 把核心的少数槽位映射到 Harness 的丰富 hook 系统，方向是"上层适配下层"。它解决的问题是：为了上层的需求改动下层接口，破坏下层的稳定。当适配方向正确，下层（核心循环）可以长期稳定，上层（hook 系统）自由演进。</p>
+
+<p><strong>变更在安全点生效。</strong> 运行中途的状态修改被缓冲，在轮次边界（<code>prepareNextTurn</code>）或运行结束（<code>turn_end</code>）统一落盘/生效。它解决的问题是：运行中途的修改与进行中的工作交错，产生不一致的中间状态。当变更有明确的生效时机，状态一致性就有了保障。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p><code>AgentHarness</code> 是 <code>pi-agent-core</code> 在最小核心之上提供的"电池齐全"层：它用 <code>ExecutionEnv</code> 倒置 IO、用 phase 状态机保护并发、用每轮快照承接运行中途的变更、用 <code>createLoopConfig</code> 把核心槽位适配到 22 种类型化 hook、用写缓冲在安全点持久化、用 <code>compact()</code>/<code>navigateTree()</code> 暴露会话树的能力。</p>
+
+<p>但它最深刻的教训不在它自己，而在它<em>没被产品使用</em>这件事。核心提供机制，<code>AgentHarness</code> 是一种策略，产品的 <code>AgentSession</code> 是另一种策略——核心因为小到不偏袒任何策略，才能被所有策略复用。这是"最小化核心"哲学的完整闭环。</p>
+
+<p>下一章，我们深入 Harness 的压缩与分支摘要——看 Pi Agent 如何在不删除历史的前提下，把膨胀的上下文压回模型的窗口之内。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("harness-layers", function (d) {
+  d.group({ x: 40, y: 320, w: 310, h: 140, label: "核心 (agent.ts / agent-loop.ts)", tone: "teal", fill: d.theme.panel });
+  d.box({ id: "LOOP", x: 70, y: 370, w: 250, h: 56, title: "runAgentLoop", lines: ["纯净两层循环"], tone: "teal", titleSize: 13 });
+
+  d.group({ x: 390, y: 60, w: 430, h: 430, label: "Harness (harness/**)", tone: "accent", fill: d.theme.panel });
+  d.box({ id: "HARNESS", x: 405, y: 180, w: 150, h: 170, title: "AgentHarness", lines: ["持久编排器"], tone: "gold", titleSize: 13 });
+  d.box({ id: "SESSION", x: 590, y: 80, w: 200, h: 52, title: "Session 树", lines: ["持久转录"], tone: "violet", titleSize: 13 });
+  d.box({ id: "HOOKS", x: 590, y: 150, w: 200, h: 52, title: "Hook 系统", lines: ["22 种事件"], tone: "violet", titleSize: 13 });
+  d.box({ id: "COMPACT", x: 590, y: 220, w: 200, h: 52, title: "压缩 + 分支摘要", tone: "slate", titleSize: 13 });
+  d.box({ id: "TOOLS", x: 590, y: 290, w: 200, h: 52, title: "内置工具", lines: ["bash/read/edit/write"], tone: "slate", titleSize: 13 });
+  d.box({ id: "ENV", x: 590, y: 360, w: 200, h: 52, title: "ExecutionEnv", lines: ["IO 依赖反转"], tone: "teal", titleSize: 13 });
+  d.box({ id: "SKILLS", x: 590, y: 430, w: 200, h: 52, title: "Skills + 提示词模板", tone: "slate", titleSize: 13 });
+
+  d.arrow("HARNESS", "LOOP", { from: "left", to: "right" });
+  d.arrow("HARNESS", "SESSION", { from: "right", to: "left" });
+  d.arrow("HARNESS", "HOOKS", { from: "right", to: "left" });
+  d.arrow("HARNESS", "COMPACT", { from: "right", to: "left" });
+  d.arrow("HARNESS", "TOOLS", { from: "right", to: "left" });
+  d.arrow("HARNESS", "ENV", { from: "right", to: "left" });
+  d.arrow("HARNESS", "SKILLS", { from: "right", to: "left" });
+  d.arrow("TOOLS", "ENV", { from: "bottom", to: "top" });
+});
+
+PB.fig("core-strategies", function (d) {
+  d.box({ id: "CORE", x: 250, y: 36, w: 280, h: 76, title: "核心 Agent + runAgentLoop", lines: ["机制：循环 + 事件流"], tone: "accent", titleSize: 13.5 });
+  d.box({ id: "HARNESS", x: 30, y: 190, w: 220, h: 86, title: "AgentHarness", lines: ["一种策略：通用持久化编排"], tone: "gold", titleSize: 13 });
+  d.box({ id: "SESSION", x: 280, y: 190, w: 220, h: 86, title: "AgentSession", lines: ["另一种策略：产品级编排"], tone: "teal", titleSize: 13 });
+  d.box({ id: "SDKUSER", x: 530, y: 190, w: 220, h: 86, title: "SDK 用户", lines: ["自己的策略"], tone: "slate", titleSize: 13 });
+
+  d.arrow("CORE", "HARNESS", { from: "bottom", to: "top" });
+  d.arrow("CORE", "SESSION", { from: "bottom", to: "top" });
+  d.arrow("CORE", "SDKUSER", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

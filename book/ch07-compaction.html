@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 7 章 · 上下文压缩与分支摘要 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch07">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第三部分 · 持久化编排</p>
+  <h1>第 7 章：上下文压缩与分支摘要</h1>
+  <p class="chapter-sub">压缩不是删除历史，而是往会话树里插入一个摘要节点——让有限的窗口装得下无限的任务</p>
+</header>
+
+<h2 id="window">有限的窗口，无限的任务</h2>
+
+<p>每个模型都有一个上下文窗口——一次能"看到"的 token 上限。但真实的编码任务往往很长：读几十个文件、跑几十次命令、来回讨论几十轮。转录会膨胀，迟早撞上那堵墙。撞上之后怎么办？</p>
+
+<p>综合体路线的回答是"四层压缩"——snip、microcompact、collapse、autocompact，从轻到重逐级触发，外加 circuit breaker 防止无限重试。那是一个潜艇式的复杂系统。</p>
+
+<p>Pi Agent 的回答简单得多，却有一个独特的 twists：<strong>压缩不删除历史。</strong> 回忆第 5 章：转录是一棵不可变的树。压缩不是从树里删节点，而是往树里<em>插入</em>一个摘要节点（<code>CompactionEntry</code>）。原始历史完好无损地留在树上——压缩只改变"发给模型的上下文视图"。这让压缩成为一个<strong>可逆的视图变换</strong>：用户可以回到压缩点之前，重新展开那段历史。</p>
+
+<p>本章拆解这个机制：何时压缩、在哪里切、摘要怎么写、以及它如何与那棵树咬合。</p>
+
+<hr class="sep">
+
+<h2 id="when">何时压缩：阈值与估算</h2>
+
+<p>压缩的触发判断是一个简单的不等式。<code>shouldCompact</code>（<code>packages/agent/src/harness/compaction/compaction.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens &gt; contextWindow - settings.reserveTokens;
+}</pre>
+
+<p>当估算的上下文 token 数超过"窗口大小减去预留空间"时，就该压缩了。默认设置（<code>DEFAULT_COMPACTION_SETTINGS</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+	enabled: true,
+	reserveTokens: 16384,   // 为摘要提示词和输出预留
+	keepRecentTokens: 20000, // 压缩后大约保留多少近期 token
+};</pre>
+
+<ul>
+<li><code>reserveTokens</code>（16,384）：在窗口顶部预留的空间，给摘要生成那次模型调用用，也作为安全边际。</li>
+<li><code>keepRecentTokens</code>（20,000）：压缩后希望保留的近期上下文量——切点选择围绕这个预算展开。</li>
+</ul>
+
+<h3 id="estimate">token 估算：以权威用量为锚</h3>
+
+<p>判断"现在有多少 token"本身是个难题——你不可能每次都把整个转录发给模型去精确计数。<code>estimateContextTokens</code> 用了一个聪明的混合策略：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);
+	if (!usageInfo) {
+		// 没有任何权威用量：全部用启发式估算
+		let estimated = 0;
+		for (const message of messages) estimated += estimateTokens(message);
+		return { tokens: estimated, usageTokens: 0, trailingTokens: estimated, lastUsageIndex: null };
+	}
+	// 有权威用量：用它做锚，只估算锚点之后的新增消息
+	const usageTokens = calculateContextTokens(usageInfo.usage);
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i &lt; messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+	return { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, lastUsageIndex: usageInfo.index };
+}</pre>
+
+<p>关键洞见：最近一次助手响应的 <code>usage</code> 字段是<strong>权威</strong>的——它是提供商真实报告的、包含那条消息为止整个上下文的 token 数。于是估算变成"权威锚点 + 锚点之后的启发式增量"。误差被限制在"最近一轮新增的内容"，而不是累积整个对话。这比从头估算整个转录精确得多。</p>
+
+<p>锚点不存在时（比如会话刚开始），退回到纯启发式 <code>estimateTokens</code>——一个保守的"字符数 / 4"估算，图片按 <code>ESTIMATED_IMAGE_CHARS = 4800</code> 字符计：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function estimateTokens(message: AgentMessage): number {
+	let chars = 0;
+	switch (message.role) {
+		case "user":
+			chars = estimateTextAndImageContentChars(message.content);
+			return Math.ceil(chars / 4);
+		case "assistant":
+			// 累加 text、thinking、toolCall（名字 + 参数 JSON）的字符
+			return Math.ceil(chars / 4);
+		// ... toolResult, bashExecution, branchSummary, compactionSummary
+	}
+	return 0;
+}</pre>
+
+<p><code>calculateContextTokens(usage)</code> 则从权威用量里取总数：<code>usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite</code>。</p>
+
+<hr class="sep">
+
+<h2 id="cut">在哪里切：切点选择</h2>
+
+<p>决定要压缩之后，下一个问题是：从哪里切开？切点之前进摘要，切点之后保留原文。<code>findCutPoint</code> 做这个决策，目标是<strong>保留大约 <code>keepRecentTokens</code> 的近期上下文</strong>。</p>
+
+<h3 id="valid-cuts">合法的切点</h3>
+
+<p>不是任何位置都能切。<code>findValidCutPoints</code> 筛选出合法的切点：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
+	const cutPoints: number[] = [];
+	for (let i = startIndex; i &lt; endIndex; i++) {
+		const entry = entries[i];
+		switch (entry.type) {
+			case "message": {
+				const role = entry.message.role;
+				switch (role) {
+					case "bashExecution":
+					case "custom":
+					case "branchSummary":
+					case "compactionSummary":
+					case "user":
+					case "assistant":
+						cutPoints.push(i); // 这些消息边界可以切
+						break;
+					case "toolResult":
+						break; // 工具结果不能作为切点
+				}
+				break;
+			}
+			// 配置变更条目（model_change 等）不是切点
+		}
+		if (entry.type === "branch_summary" || entry.type === "custom_message") cutPoints.push(i);
+	}
+	return cutPoints;
+}</pre>
+
+<p>注意 <code>toolResult</code> <strong>不能</strong>作为切点。为什么？因为协议要求每个 <code>tool_use</code> 后面必须跟着对应的 <code>tool_result</code>（第 3 章的"孤立工具结果"问题）。如果在工具调用和它的结果之间切开，保留的后半段就会以一个孤立的 <code>toolResult</code> 开头，提供商会拒绝。把切点限制在 user/assistant 等消息边界，保证了切开后的两半各自都是合法的对话片段。</p>
+
+<h3 id="backward-budget">从尾部倒推预算</h3>
+
+<p><code>findCutPoint</code> 从尾部往前累积 token，直到达到 <code>keepRecentTokens</code> 预算，然后选那个位置之后最近的合法切点：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function findCutPoint(entries, startIndex, endIndex, keepRecentTokens): CutPointResult {
+	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
+	if (cutPoints.length === 0) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+	}
+	let accumulatedTokens = 0;
+	let cutIndex = cutPoints[0];
+
+	// 从尾部往前累积，直到达到 keepRecentTokens
+	for (let i = endIndex - 1; i &gt;= startIndex; i--) {
+		const entry = entries[i];
+		if (entry.type !== "message") continue;
+		accumulatedTokens += estimateTokens(entry.message);
+		if (accumulatedTokens &gt;= keepRecentTokens) {
+			// 找到这个位置之后最近的合法切点
+			for (let c = 0; c &lt; cutPoints.length; c++) {
+				if (cutPoints[c] &gt;= i) { cutIndex = cutPoints[c]; break; }
+			}
+			break;
+		}
+	}
+	// 往前微调，避免切在 compaction 或 message 之前的"空档"
+	while (cutIndex &gt; startIndex) {
+		const prevEntry = entries[cutIndex - 1];
+		if (prevEntry.type === "compaction" || prevEntry.type === "message") break;
+		cutIndex--;
+	}
+	const cutEntry = entries[cutIndex];
+	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+	};
+}</pre>
+
+<p>逻辑是：从最新的消息往前数，数到累计约 20,000 token 为止，然后对齐到最近的合法切点。这样保留的尾部大约是 <code>keepRecentTokens</code> 大小，切点之前的进摘要。</p>
+
+<h3 id="split-turn">split-turn：切在一轮中间</h3>
+
+<p>有一个微妙的情况：切点可能落在<strong>一轮对话的中间</strong>——比如一个用户请求触发了 10 次工具调用，切点恰好切在这 10 次调用的第 5 次之后。这时切点之后的"保留尾部"会以一个没有上下文的工具结果开头，模型会困惑。</p>
+
+<p><code>findCutPoint</code> 通过 <code>isSplitTurn</code> 标志检测这种情况：如果切点不是 user 消息，它会用 <code>findTurnStartIndex</code> 往前找到这一轮的起点（发起这轮的 user 消息）。<code>isSplitTurn: true</code> 意味着"切点把一轮切成了两半"。</p>
+
+<p>这种情况需要特殊处理——保留的尾部（一轮的后半）需要一段"前半发生了什么"的额外说明。我们马上会看到 <code>compact</code> 如何用一个独立的"turn prefix 摘要"来解决它。</p>
+
+<hr class="sep">
+
+<h2 id="prepare">准备：<code>prepareCompaction</code></h2>
+
+<p><code>prepareCompaction</code> 把切点决策转化成一个 <code>CompactionPreparation</code>——压缩所需的一切输入：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function prepareCompaction(pathEntries, settings): Result&lt;CompactionPreparation | undefined, CompactionError&gt; {
+	// 如果路径为空，或最后一个条目已经是 compaction，无需压缩
+	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
+		return ok(undefined);
+	}
+
+	// 找到上一个 compaction（用于迭代更新摘要）
+	let prevCompactionIndex = -1;
+	for (let i = pathEntries.length - 1; i &gt;= 0; i--) {
+		if (pathEntries[i].type === "compaction") { prevCompactionIndex = i; break; }
+	}
+	let previousSummary: string | undefined;
+	let boundaryStart = 0;
+	if (prevCompactionIndex &gt;= 0) {
+		previousSummary = (pathEntries[prevCompactionIndex] as CompactionEntry).summary;
+		// 边界从上次压缩的 firstKeptEntry 开始
+		// ...
+	}
+
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, pathEntries.length, settings.keepRecentTokens);
+	const firstKeptEntryId = pathEntries[cutPoint.firstKeptEntryIndex].id;
+
+	// 三段消息：
+	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
+	const messagesToSummarize = []; // 边界 → historyEnd：进主摘要
+	const turnPrefixMessages = [];  // turnStart → 切点：split-turn 的前半，单独摘要
+	const retainedTail = [];        // 切点 → 末尾：保留原文
+
+	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
+
+	return ok({ firstKeptEntryId, messagesToSummarize, turnPrefixMessages, retainedTail, isSplitTurn, tokensBefore, previousSummary, fileOps, settings });
+}</pre>
+
+<p>它把路径切成三段：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="segments" data-w="1020" data-h="440"></canvas></div>
+  <figcaption>图 1：准备压缩时把路径切成三段——主摘要、split-turn 的前缀摘要与保留原文的尾部。</figcaption>
+</figure>
+
+<ul>
+<li><strong><code>messagesToSummarize</code></strong>：从边界到切点（或 split-turn 的轮次起点）的消息，将被压缩进主摘要。</li>
+<li><strong><code>turnPrefixMessages</code></strong>：仅 split-turn 时有——被切开的那一轮的前半段，需要单独摘要。</li>
+<li><strong><code>retainedTail</code></strong>：切点之后的近期消息，保留原文，直接存在压缩条目上。</li>
+</ul>
+
+<p>注意 <code>previousSummary</code>：如果之前已经压缩过，这次压缩不是从零开始，而是<strong>在上次摘要的基础上增量更新</strong>——这是一个重要的优化，我们下面会看到。</p>
+
+<p><code>fileOps</code> 则提取这段历史里读过的、改过的文件（<code>extractFileOperations</code>），存进压缩条目的 <code>details</code>。于是压缩后的上下文依然"记得"动过哪些文件——<code>CompactionDetails { readFiles, modifiedFiles }</code>。</p>
+
+<hr class="sep">
+
+<h2 id="summarizing">摘要怎么写：结构化提示词</h2>
+
+<p>摘要的质量决定了压缩后 agent 还能不能接着干活。Pi Agent 用一个高度结构化的提示词来约束摘要格式。系统提示词（<code>SUMMARIZATION_SYSTEM_PROMPT</code>）先把模型钉死在"只输出摘要"的角色上：</p>
+
+<blockquote>
+<p>You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.</p>
+<p>Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.</p>
+</blockquote>
+
+<p>然后用户提示词（<code>SUMMARIZATION_PROMPT</code>）规定了精确的输出格式：</p>
+
+<pre class="code" data-lang="text">## Goal
+[What is the user trying to accomplish?]
+
+## Constraints &amp; Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+### In Progress
+- [ ] [Current work]
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.</pre>
+
+<p>这个格式的设计很讲究。它不是"把对话缩写成一段话"，而是把对话<strong>重构成一份交接文档</strong>——目标、约束、进度（已完成/进行中/受阻）、关键决策、下一步、关键上下文。最后一句"Preserve exact file paths, function names, and error messages"尤其关键：摘要可以丢失措辞，但不能丢失精确的标识符，因为接下来的工作要靠它们。</p>
+
+<h3 id="iterative-update">迭代更新：<code>UPDATE_SUMMARIZATION_PROMPT</code></h3>
+
+<p>如果已有 <code>previousSummary</code>（之前压缩过），就用 <code>UPDATE_SUMMARIZATION_PROMPT</code> 代替。它把旧摘要放在 <code>&lt;previous-summary&gt;</code> 标签里，要求模型<strong>增量更新</strong>而非重写：</p>
+
+<blockquote>
+<p>Update the existing structured summary with new information. RULES:</p>
+<p>- PRESERVE all existing information from the previous summary</p>
+<p>- ADD new progress, decisions, and context from the new messages</p>
+<p>- UPDATE the Progress section: move items from "In Progress" to "Done" when completed</p>
+<p>- PRESERVE exact file paths, function names, and error messages</p>
+</blockquote>
+
+<p>这避免了"每次压缩都把整个历史重新摘要一遍"的浪费。第二次压缩时，模型只需要读"上次摘要 + 上次之后新增的消息"，而不是"全部原始历史"。压缩的成本因此不会随会话长度线性增长。</p>
+
+<h3 id="generation">生成：<code>generateSummaryWithUsage</code></h3>
+
+<p>实际的生成调用（<code>generateSummaryWithUsage</code>）有几个细节：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">const maxTokens = Math.min(
+	Math.floor(0.8 * reserveTokens),
+	model.maxTokens &gt; 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+);
+// ...
+const response = await completeSimpleWithRetries(models, model, {
+	systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+	messages: summarizationMessages,
+}, completionOptions, retry, callbacks);</pre>
+
+<ul>
+<li><strong>输出上限</strong>：<code>maxTokens</code> 取 <code>0.8 * reserveTokens</code> 和模型上限的较小值——摘要输出被约束在预留空间内，不会自己撑爆窗口。</li>
+<li><strong>隔离的请求</strong>：<code>completeSimpleWithRetries</code> 给摘要调用一个全新的 <code>sessionId</code> 和 <code>cacheRetention: "none"</code>：</li>
+</ul>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export async function completeSimpleWithRetries(models, model, context, options, retry?, callbacks?) {
+	// 摘要是独立请求：隔离路由，避免写入无法复用的缓存
+	const requestOptions = { ...options, cacheRetention: "none", sessionId: uuidv7() };
+	return retryAssistantCall(() =&gt; models.completeSimple(model, context, requestOptions), retry, requestOptions.signal, callbacks);
+}</pre>
+
+<p>为什么隔离？因为摘要请求的内容（序列化的历史 + 摘要提示词）跟正常对话的 prompt 前缀完全不同，为它写 prompt cache 是浪费——那个缓存永远不会被复用。用 fresh sessionId + no cache，避免污染主对话的缓存统计。它还套了 <code>retryAssistantCall</code>（第 2 章的助手级重试），让摘要生成对临时失败有韧性。</p>
+
+<hr class="sep">
+
+<h2 id="compact">落地：<code>compact</code> 与 split-turn</h2>
+
+<p><code>compact</code> 把准备和生成串起来，产出最终的 <code>CompactionResult</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export async function compact(preparation, models, model, customInstructions?, signal?, thinkingLevel?, retry?, callbacks?): Promise&lt;Result&lt;CompactionResult, CompactionError&gt;&gt; {
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, retainedTail, isSplitTurn, tokensBefore, previousSummary, fileOps, settings } = preparation;
+
+	let summary: string;
+	let summaryUsage: Usage;
+
+	if (isSplitTurn &amp;&amp; turnPrefixMessages.length &gt; 0) {
+		// split-turn：先摘要历史，再单独摘要这一轮的前半
+		let historyText = "No prior history.";
+		if (messagesToSummarize.length &gt; 0) {
+			const historyResult = await generateSummaryWithUsage(messagesToSummarize, ...);
+			if (!historyResult.ok) return err(historyResult.error);
+			historyText = historyResult.value.text;
+		}
+		const turnPrefixResult = await generateTurnPrefixSummary(turnPrefixMessages, ...);
+		if (!turnPrefixResult.ok) return err(turnPrefixResult.error);
+		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value.text}`;
+		summaryUsage = combineUsage(...);
+	} else {
+		// 普通情况：一次摘要
+		const summaryResult = await generateSummaryWithUsage(messagesToSummarize, ...);
+		if (!summaryResult.ok) return err(summaryResult.error);
+		summary = summaryResult.value.text;
+		summaryUsage = summaryResult.value.usage;
+	}
+	// 返回 { summary, firstKeptEntryId, tokensBefore, usage, retainedTail, details: fileOps }
+}</pre>
+
+<p>split-turn 的处理是亮点：当切点把一轮切成两半，<code>compact</code> 会做<strong>两次</strong>摘要——一次是常规的历史摘要（<code>SUMMARIZATION_PROMPT</code>），一次是专门的"轮次前缀摘要"（<code>TURN_PREFIX_SUMMARIZATION_PROMPT</code>），后者用另一个格式：</p>
+
+<blockquote>
+<p>This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.</p>
+<p>## Original Request / ## Early Progress / ## Context for Suffix</p>
+</blockquote>
+
+<p>然后把两段拼起来。这样保留的尾部（一轮的后半）就有了一段"前半发生了什么"的说明，模型不会看到一个没头没尾的工具结果。</p>
+
+<p><code>CompactionResult</code> 携带 <code>summary</code>、<code>firstKeptEntryId</code>（保留历史从哪里开始）、<code>tokensBefore</code>、<code>usage</code>、<code>retainedTail</code>（保留的尾部消息）、<code>details</code>（文件操作）。</p>
+
+<hr class="sep">
+
+<h2 id="tree">与树咬合：压缩如何生效</h2>
+
+<p><code>compact</code> 产出的结果，最终被 <code>AgentHarness</code>（或产品层）写成一个 <code>CompactionEntry</code> 追加进会话树。回忆第 5 章的 <code>defaultContextEntryTransform</code>：之后每次构建上下文时，如果路径里有这个 <code>compaction</code> 条目，上下文就变成"<code>[compaction]</code> + 保留的尾部"。</p>
+
+<p>于是整个压缩流程闭环了：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="pipeline" data-w="780" data-h="950"></canvas></div>
+  <figcaption>图 2：压缩闭环。从估算、选切点到追加 CompactionEntry 进树，之后构建上下文用"摘要 + 尾部"替代压缩点之前。</figcaption>
+</figure>
+
+<p>而原始历史——<code>messagesToSummarize</code> 对应的那些条目——<strong>从未被删除</strong>。它们还在树上。用户 <code>moveTo</code> 回压缩点之前，<code>defaultContextEntryTransform</code> 就看不到那个 <code>compaction</code> 条目（因为它在路径之外），原始历史重新展开。压缩是可逆的。</p>
+
+<p>这是 Pi Agent 与"删除式压缩"的根本区别。删除式压缩（从数组里 splice 掉旧消息）简单但不可逆，且丢失了"回看历史"的能力。Pi Agent 用树结构把"存储"和"视图"分离，代价是多一层抽象，收益是压缩、分支、回溯全都自然且可逆。</p>
+
+<hr class="sep">
+
+<h2 id="branch">分支摘要：换分支时的交接</h2>
+
+<p>除了压缩，还有一种摘要：分支摘要（branch summarization，<code>packages/agent/src/harness/compaction/branch-summarization.ts</code>）。</p>
+
+<p>回忆第 5 章：用户可以在会话树上 <code>moveTo</code> 到另一个分支。当你从分支 A 切到分支 B 时，分支 A 上发生的事对分支 B 的后续工作可能是有用的上下文（"我刚才在另一个分支试过 X 方案，不行"）。<code>generateBranchSummary</code> 在你离开一个分支时，为它生成一段摘要（<code>BranchSummaryEntry</code>），这样切回来或切过去时，那段探索的精华不会丢失。</p>
+
+<p><code>collectEntriesForBranchSummary</code> 收集要摘要的分支条目，<code>generateBranchSummary</code> 用类似的结构化提示词生成摘要。它和压缩摘要共享"把对话重构成结构化交接文档"的理念，只是触发时机不同：压缩是"上下文太满了"，分支摘要是"我要离开这个分支了"。</p>
+
+<p><code>AgentHarness.navigateTree</code>（第 6 章）在分支导航时会触发它，phase 切到 <code>branch_summary</code>，并触发 <code>session_before_tree</code>/<code>session_tree</code> hook。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的压缩为"如何管理 Agent 的有限上下文"提供了四条可迁移的模式。</p>
+
+<p><strong>以权威用量为锚，只估算增量。</strong> 用最近一次提供商报告的真实 token 数做锚点，只对其后新增的消息做启发式估算。它解决的问题是：对整个转录做启发式估算会累积误差，而精确计数又太贵。锚点法把误差限制在"最近一轮"，在成本与精度之间取得平衡。</p>
+
+<p><strong>切点对齐到协议合法的边界。</strong> 切点不能落在工具调用和它的结果之间，否则保留的后半段会以孤立结果开头。它解决的问题是：天真的"按 token 数切"会切出协议非法的片段。把切点约束在合法边界（user/assistant），保证切开后的两半各自合法。</p>
+
+<p><strong>把摘要写成结构化交接文档，而非缩写。</strong> 用固定格式（目标/约束/进度/决策/下一步/关键上下文）约束摘要，并强制保留精确的标识符。它解决的问题是：自由形式的摘要会丢失继续工作所需的关键细节（文件路径、函数名、错误信息）。结构化格式让摘要成为一份可用的交接文档，而不是一段模糊的概括。</p>
+
+<p><strong>压缩是视图变换，不是数据删除。</strong> 把"存储完整历史"和"发给模型什么"分离——压缩插入一个摘要节点，原始历史保留，上下文构建时按需替代。它解决的问题是：删除式压缩不可逆，丢失了回看和回溯的能力。当压缩可逆，用户就能在"省 token"和"看历史"之间自由切换。代价是需要树状的存储模型——又一次，第 5 章的树结构在这里兑现了它的价值。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的压缩是一个围绕"树状转录"设计的机制：<code>shouldCompact</code> 用"权威锚点 + 增量估算"判断时机，<code>findCutPoint</code> 在协议合法的边界上保留约 <code>keepRecentTokens</code> 的近期上下文（并检测 split-turn），<code>prepareCompaction</code> 把路径切成三段，<code>generateSummary</code> 用结构化提示词把历史重构成一份交接文档（支持迭代更新与 split-turn 的双段摘要），最后 <code>compact</code> 产出的 <code>CompactionEntry</code> 被追加进树——原始历史永不删除，压缩只是上下文视图的可逆替换。分支摘要则在切换分支时保存探索的精华。</p>
+
+<p>它比综合体路线的"四层压缩"简单一个数量级，却没有牺牲核心能力——因为复杂性被那棵树吸收了。当你理解了第 5 章的树，这里的压缩几乎是水到渠成的。这正是好的底层抽象的价值：它让上层的功能变得简单。</p>
+
+<p>下一章，我们离开 <code>pi-agent-core</code>，进入产品层 <code>pi-coding-agent</code>——看 <code>pi</code> 命令如何从一行 <code>cli.ts</code> 启动，一路装配出完整的 Agent。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("segments", function (d) {
+  d.box({ id: "A", x: 30, y: 190, w: 180, h: 70, title: "上次压缩点 / 起点", tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 260, y: 190, w: 230, h: 70, title: "messagesToSummarize", lines: ["→ 进主摘要"], tone: "teal", titleSize: 13 });
+  d.box({ id: "C", x: 540, y: 190, w: 160, h: 70, title: "split-turn?", tone: "gold", titleSize: 13 });
+  d.box({ id: "D", x: 760, y: 60, w: 230, h: 70, title: "turnPrefixMessages", lines: ["→ 单独摘要"], tone: "violet", titleSize: 13 });
+  d.box({ id: "E", x: 760, y: 300, w: 230, h: 70, title: "retainedTail", lines: ["→ 保留原文"], tone: "slate", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "right", to: "left" });
+  d.arrow("B", "C", { from: "right", to: "left" });
+  d.arrow("C", "D", { from: "top", to: "left", label: "是" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("C", "E", { from: "bottom", to: "left", label: "否" });
+});
+
+PB.fig("pipeline", function (d) {
+  d.box({ id: "A", x: 140, y: 30, w: 420, h: 84, title: "estimateContextTokens", lines: ["估算当前 token"], tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 140, y: 144, w: 420, h: 84, title: "shouldCompact?", lines: ["超过窗口-预留"], tone: "gold", titleSize: 13 });
+  d.box({ id: "Z", x: 600, y: 144, w: 150, h: 84, title: "不压缩", tone: "slate", titleSize: 13 });
+  d.box({ id: "C", x: 140, y: 258, w: 420, h: 84, title: "findCutPoint", lines: ["选切点（保留 keepRecentTokens）"], tone: "teal", titleSize: 13 });
+  d.box({ id: "D", x: 140, y: 372, w: 420, h: 84, title: "prepareCompaction", lines: ["切三段消息"], tone: "teal", titleSize: 13 });
+  d.box({ id: "E", x: 140, y: 486, w: 420, h: 84, title: "generateSummary", lines: ["结构化摘要（可迭代更新）"], tone: "violet", titleSize: 13 });
+  d.box({ id: "F", x: 140, y: 600, w: 420, h: 84, title: "compact", lines: ["处理 split-turn，产出结果"], tone: "violet", titleSize: 13 });
+  d.box({ id: "G", x: 140, y: 714, w: 420, h: 84, title: "追加 CompactionEntry 进树", tone: "gold", titleSize: 13 });
+  d.box({ id: "H", x: 140, y: 828, w: 420, h: 84, title: "之后 buildSessionContext", lines: ["用 摘要+尾部 替代压缩点之前"], tone: "accent", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top", label: "是" });
+  d.arrow("B", "Z", { from: "right", to: "left", label: "否" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "F", { from: "bottom", to: "top" });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "H", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

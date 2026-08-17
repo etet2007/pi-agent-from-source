@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章 · 启动流水线：从 cli.ts 到模式分发 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch08">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第四部分 · 编码 Agent 产品</p>
+  <h1>第 8 章：启动流水线——从 cli.ts 到模式分发</h1>
+  <p class="chapter-sub">从进程级设置到三种运行形态的完整启动旅程：子命令提前退出、TTY 自动降级，一切为了不加载任何用不到的东西</p>
+</header>
+
+<h2 id="birth">一个命令的诞生</h2>
+
+<p>前面三部分，我们自底向上走完了 <code>pi-ai</code>（模型层）、<code>pi-agent-core</code>（运行时层）。现在进入产品层 <code>pi-coding-agent</code>——<code>pi</code> 命令本身。本章追踪一个最日常的动作：你在终端敲下 <code>pi</code> 回车，到屏幕上出现那个等待输入的提示符之间，发生了什么。</p>
+
+<p>启动流水线看似琐碎，实则暴露了一个产品的核心架构决策。Pi Agent 的启动要在极短时间内回答一连串问题：进哪种模式？用哪个模型？信任这个项目吗？加载哪些扩展？激活哪些工具？而这些决策必须在<strong>不加载任何用不到的东西</strong>的前提下完成——回忆第 2 章的惰性加载，启动速度是 Pi Agent 的执念。</p>
+
+<p>我们会看到，这条流水线如何把"一个 CLI 命令"分流成三种截然不同的运行形态：交互式 TUI、headless print、以及给 IDE 用的 RPC。</p>
+
+<hr class="sep">
+
+<h2 id="shim">入口 shim：cli.ts</h2>
+
+<p>一切从一个极简的入口文件开始（<code>packages/coding-agent/src/cli.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/cli.ts">#!/usr/bin/env node
+import { APP_NAME } from "./config.ts";
+import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { main } from "./main.ts";
+
+process.title = APP_NAME;
+process.env.PI_CODING_AGENT = "true";
+process.emitWarning = (() =&gt; {}) as typeof process.emitWarning;
+
+// 在任何提供商 SDK 发请求之前配置 undici 的全局 dispatcher
+configureHttpDispatcher();
+
+main(process.argv.slice(2));</pre>
+
+<p>这个文件只做四件事，每件都有讲究：</p>
+
+<ul>
+<li><strong><code>process.title = APP_NAME</code></strong>：把进程名设成 <code>pi</code>，这样 <code>ps</code> 里看到的是 <code>pi</code> 而不是 <code>node</code>。</li>
+<li><strong><code>process.env.PI_CODING_AGENT = "true"</code></strong>：打一个环境标记。子进程（比如工具启动的 shell）可以通过它知道自己跑在 pi 里。</li>
+<li><strong><code>process.emitWarning = () =&gt; {}</code></strong>：静默 Node 的警告输出。一个面向用户的 CLI 不应该被 DeprecationWarning 刷屏。</li>
+<li><strong><code>configureHttpDispatcher()</code></strong>：在任何提供商 SDK 发请求<strong>之前</strong>配置 undici（Node 的 HTTP 客户端）的全局 dispatcher——这是设置 HTTP 代理的地方。注释强调了时机：必须赶在第一个请求之前。</li>
+</ul>
+
+<p>然后调用真正的引导函数 <code>main(process.argv.slice(2))</code>。入口 shim 与引导逻辑分离，让 <code>main</code> 可以被程序化调用（SDK 用户、测试、守护进程都可以直接调 <code>main</code> 或更底层的 <code>createAgentSession</code>），而不必经过这个 shim。</p>
+
+<hr class="sep">
+
+<h2 id="bootstrap">main()：引导序列</h2>
+
+<p><code>main()</code>（<code>packages/coding-agent/src/main.ts</code>，约 918 行）是真正的引导。它的签名透露了一个扩展点：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">export interface MainOptions {
+	extensionFactories?: InlineExtension[];
+}
+export async function main(args: string[], options?: MainOptions)</pre>
+
+<p><code>extensionFactories</code> 允许调用方注入内联扩展——内置的 llama.cpp 扩展就是通过这个机制加入的（第 14 章详述）。</p>
+
+<p>引导序列大致是这样的（按顺序）：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="bootflow" data-w="820" data-h="1340"></canvas></div>
+  <figcaption>图 1：启动引导的完整决策链。从 <code>main(args)</code> 到按模式分发，三个决策点（子命令、版本/导出、help/模型列表）各带一条提前退出的旁路。</figcaption>
+</figure>
+
+<p>几个关键节点值得展开。</p>
+
+<p><strong>子命令提前退出。</strong> <code>pi install/remove/update/list</code>（包管理）和 <code>pi auth print-api-key</code>（凭证打印）这些子命令在引导早期就被处理并退出——它们不需要完整的 Agent 会话。这避免了"只想看个版本号却要等整个会话装配"的浪费。</p>
+
+<p><strong><code>createRuntime</code> 工厂闭包。</strong> <code>main</code> 不直接创建会话，而是构建一个<strong>工厂闭包</strong> <code>createRuntime</code>，传给 <code>createAgentSessionRuntime</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">const createRuntime: CreateAgentSessionRuntimeFactory = async ({ ... }) =&gt; {
+	// 在这里解析项目信任、构建 services、创建 AgentSession
+	const trusted = await resolveProjectTrusted({ cwd, trustStore, trustOverride, defaultProjectTrust, extensionsResult, ... });
+	// ...
+};
+const runtime = await createAgentSessionRuntime(createRuntime, { ... });</pre>
+
+<p>为什么是工厂而非直接创建？因为会话可能需要被<strong>重新创建</strong>——<code>/reload</code> 命令、切换会话、fork 都会触发重建。<code>AgentSessionRuntime</code> 这个宿主持有工厂，需要时调用它重新装配一个全新的会话。第 9 章会看到这个 runtime 宿主。</p>
+
+<p><strong>项目信任在引导期决策。</strong> <code>resolveProjectTrusted</code>（第 1 章提到的信任模型）在引导期被调用，决定要不要加载这个项目的扩展/skills/AGENTS.md。这个决策影响后续装配——不信任就跳过项目资源。</p>
+
+<hr class="sep">
+
+<h2 id="appmode">模式解析：resolveAppMode</h2>
+
+<p>引导的核心决策是"进哪种模式"。这个决策出奇地简单（<code>packages/coding-agent/src/main.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}</pre>
+
+<p>四种模式，按优先级：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>模式</th><th>触发条件</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>rpc</code></td><td><code>--mode rpc</code></td><td>JSON-RPC over stdin/stdout，给 IDE/守护进程</td></tr>
+<tr><td><code>json</code></td><td><code>--mode json</code></td><td>headless，把所有事件流式输出为 JSON 行</td></tr>
+<tr><td><code>print</code></td><td><code>--print</code>/<code>-p</code>，或 stdin/stdout 不是 TTY</td><td>headless，只输出最终文本</td></tr>
+<tr><td><code>interactive</code></td><td>默认（两个 TTY 都在）</td><td>完整的 TUI REPL</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>注意第三个分支的精妙：<code>!stdinIsTTY || !stdoutIsTTY</code>。这意味着 <code>echo "fix the bug" | pi</code> 会<strong>自动降级</strong>到 print 模式——因为 stdin 被管道占用，不是交互式终端。同样，<code>pi &gt; out.txt</code> 也会降级。这是 Unix 哲学的体现：程序应该根据自己是否连接到终端来调整行为，让管道组合自然工作。<code>--print</code> 是显式强制，TTY 检测是隐式推断。</p>
+
+<p><code>toPrintOutputMode</code> 把 <code>json</code> 和 <code>print</code> 都归到 print 路径，只是输出格式不同（<code>json</code> vs <code>text</code>）：</p>
+
+<pre class="code" data-lang="ts">function toPrintOutputMode(appMode: AppMode): Exclude&lt;Mode, "rpc"&gt; {
+	return appMode === "json" ? "json" : "text";
+}</pre>
+
+<p>于是 <code>json</code> 和 <code>print</code> 共享 <code>runPrintMode</code> 实现，只是输出模式参数不同。RPC 则走完全独立的 <code>runRpcMode</code>。</p>
+
+<hr class="sep">
+
+<h2 id="parseargs">参数解析：parseArgs</h2>
+
+<p><code>parseArgs</code>（<code>packages/coding-agent/src/cli/args.ts</code>）把命令行参数解析成一个 <code>Args</code> 对象。它的字段覆盖了产品的全部可配置面：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/cli/args.ts">export interface Args {
+	provider?; model?; apiKey?;           // 模型选择
+	systemPrompt?; appendSystemPrompt?;    // 提示词定制
+	thinking?;                             // off|minimal|low|medium|high|xhigh|max
+	continue?; resume?;                    // 会话续接
+	help?; version?; mode?; name?;
+	noSession?; session?; sessionId?; fork?; sessionDir?; // 会话管理
+	models?;                               // Ctrl+P 循环的模型集
+	tools?; excludeTools?; noTools?; noBuiltinTools?; // 工具控制
+	extensions?; noExtensions?;            // 扩展控制
+	print?; export?; noSkills?; skills?;
+	promptTemplates?; themes?; noContextFiles?;
+	listModels?; offline?; alt?; verbose?;
+	projectTrustOverride?;                 // --approve / --no-approve
+	messages: string[];                    // 位置参数（提示词）
+	fileArgs: string[];                    // @file 参数
+	unknownFlags: Map&lt;string, boolean | string&gt;; // 未知 flag，留给扩展
+	diagnostics: ...;
+}</pre>
+
+<p>几个设计值得注意。</p>
+
+<p><strong>工具与扩展的精细控制。</strong> <code>--tools</code>/<code>--exclude-tools</code>/<code>--no-tools</code>/<code>--no-builtin-tools</code> 提供了对工具集的精确控制——这是 Pi Agent "工具允许/拒绝清单取代逐工具审批"安全模型（第 1 章）的 CLI 表面。<code>--extensions</code>/<code>--no-extensions</code> 同理控制扩展加载。</p>
+
+<p><strong><code>@file</code> 参数。</strong> <code>fileArgs</code> 收集 <code>@path/to/file</code> 形式的参数，由 <code>file-processor.ts</code> 处理——把文件内容附加到提示词。这是"把文件喂给 agent"的便捷语法。</p>
+
+<p><strong><code>unknownFlags</code> 留给扩展。</strong> 任何 pi 自己不认识的 <code>--flag</code> 不会被报错，而是收集进 <code>unknownFlags</code>，传给扩展系统。扩展可以注册自己的 CLI flag（第 14 章），然后通过这个机制接收参数。这是核心 CLI 对扩展开放的方式——核心不拒绝未知 flag，而是把它们转交给可能认识它们的人。</p>
+
+<p><code>printHelp</code> 生成的帮助文本会列出内置工具名（<code>read</code>、<code>bash</code>、<code>edit</code>、<code>write</code>、<code>grep</code>、<code>find</code>、<code>ls</code>）和所有 flag，并动态加入扩展注册的 flag。</p>
+
+<hr class="sep">
+
+<h2 id="dispatch">分发：三条路径</h2>
+
+<p>引导的最后一步是按模式分发（<code>packages/coding-agent/src/main.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">if (appMode === "rpc") {
+	printTimings();
+	await runRpcMode(runtime);
+} else if (appMode === "interactive") {
+	const interactiveMode = new InteractiveMode(runtime, {
+		migratedProviders,
+		modelFallbackMessage,
+		autoTrustOnReloadCwd,
+		initialMessage,
+		initialImages,
+		initialMessages: parsed.messages,
+		verbose: parsed.verbose,
+		alt: parsed.alt,
+	});
+	// ... startupBenchmark 特判 ...
+	printTimings();
+	await interactiveMode.run();
+} else {
+	printTimings();
+	const exitCode = await runPrintMode(runtime, {
+		mode: toPrintOutputMode(appMode),
+		messages: parsed.messages,
+		initialMessage,
+		initialImages,
+	});
+	stopThemeWatcher();
+	restoreStdout();
+	if (exitCode !== 0) process.exitCode = exitCode;
+	return;
+}</pre>
+
+<p>三条路径共享同一个 <code>runtime</code>（<code>AgentSessionRuntime</code>），但消费方式完全不同：</p>
+
+<ul>
+<li><strong><code>runRpcMode(runtime)</code></strong>：进入一个 JSON-RPC 循环，从 stdin 读命令、往 stdout 写响应/事件，直到对端关闭。它不渲染任何 UI——它是给机器（IDE、守护进程）用的。</li>
+<li><strong><code>new InteractiveMode(runtime).run()</code></strong>：构建一个 <code>pi-tui</code> 的 TUI，进入交互式 REPL。这是给人用的。</li>
+<li><strong><code>runPrintMode(runtime, ...)</code></strong>：跑一轮（或几轮）对话，把最终文本或 JSON 事件流写到 stdout，然后退出，返回 exit code。这是给脚本和管道用的。</li>
+</ul>
+
+<p>注意 <code>printTimings()</code> 在每条路径前都被调用——如果设置了 <code>PI_STARTUP_BENCHMARK</code>，它会打印启动各阶段的耗时。Pi Agent 对启动速度的重视，体现在这种随时可开的性能 instrumentation 上。</p>
+
+<p>还有一个 <code>startupBenchmark</code> 特判：交互模式下如果设置了启动基准测试，会 <code>init()</code> TUI、等 150ms 让 stdin 处理器消费终端查询的回复（Kitty 键盘协议、设备属性、cell size——第 13 章详述），然后立即 <code>stop()</code> 并退出。这是用来精确测量"从启动到 TUI 就绪"的耗时的。</p>
+
+<hr class="sep">
+
+<h2 id="assembly">装配的枢纽：createAgentSession</h2>
+
+<p>无论哪种模式，最终都需要一个 <code>AgentSession</code>。它的创建在 <code>packages/coding-agent/src/core/sdk.ts</code> 的 <code>createAgentSession</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">export interface CreateAgentSessionOptions {
+	model?; thinkingLevel?; tools?; excludeTools?; noTools?; customTools?;
+	cwd?; agentDir?; resourceLoader?; settingsManager?; sessionManager?; modelRuntime?;
+	// ...
+}
+export interface CreateAgentSessionResult {
+	session: AgentSession;
+	extensionsResult: LoadExtensionsResult;
+	modelFallbackMessage?: string;
+}
+export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise&lt;CreateAgentSessionResult&gt;</pre>
+
+<p>这个函数是三个包相遇的枢纽。它解析 cwd/agentDir，创建 <code>ModelRuntime</code>（来自 <code>pi-ai</code>）、<code>SettingsManager</code>、<code>SessionManager</code>、<code>DefaultResourceLoader</code>，解析初始模型和 thinking 级别，计算激活工具集，然后实例化核心 <code>Agent</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">agent = new Agent({
+	initialState: { systemPrompt: "", model, thinkingLevel, tools: [] },
+	convertToLlm: convertToLlmWithBlockImages,
+	streamFn: async (model, context, options) =&gt; {
+		const providerRetrySettings = settingsManager.getProviderRetrySettings();
+		// ... 解析超时、重试设置 ...
+		return modelRuntime.streamSimple(model, context, {
+			...options,
+			timeoutMs,
+			maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+			maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+			transformHeaders: async (requestHeaders) =&gt; {
+				const headers = mergeProviderAttributionHeaders(model, settingsManager, options?.sessionId, requestHeaders);
+				return headerRunner?.hasHandlers("before_provider_headers")
+					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+					: (headers ?? {});
+			},
+		});
+	},
+	// onPayload / onResponse / transformContext / 扩展 hook ...
+});</pre>
+
+<p>看这个 <code>streamFn</code>：它是一个闭包，把核心 <code>Agent</code> 的 <code>StreamFn</code> 槽位接到 <code>pi-ai</code> 的 <code>modelRuntime.streamSimple</code>。但它不是简单转发——它在中间注入了<strong>设置</strong>（从 <code>SettingsManager</code> 读超时、重试策略）和<strong>扩展 hook</strong>（<code>transformHeaders</code> 触发扩展的 <code>before_provider_headers</code> 事件）。这就是产品层"坐在核心 Agent 上自建编排"（第 6 章）的具体体现：核心只认识一个 <code>streamFn</code>，产品层在这个槽位里塞进了设置管理和扩展系统。</p>
+
+<p><code>convertToLlmWithBlockImages</code> 则是消息桥的产品版——它在 <code>convertToLlm</code> 基础上，根据 <code>settingsManager.getBlockImages()</code> 动态决定是否把图片替换成 "Image reading is disabled." 占位文本。注意注释："Check setting dynamically so mid-session changes take effect"——设置是每次调用动态读的，所以运行中途改设置也能生效。</p>
+
+<p><code>Agent</code> 创建后，被包装进 <code>AgentSession</code>（第 9 章的主角）。<code>createAgentSession</code> 返回 <code>{ session, extensionsResult, modelFallbackMessage }</code>——<code>extensionsResult</code> 是扩展加载的结果，<code>modelFallbackMessage</code> 是"你请求的模型不可用，回退到了另一个"的提示。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的启动流水线为"如何设计一个 CLI 产品的启动"提供了四条可迁移的模式。</p>
+
+<p><strong>入口 shim 与引导逻辑分离。</strong> <code>cli.ts</code> 只做进程级设置（title、env、HTTP dispatcher）然后调 <code>main</code>；引导逻辑在 <code>main</code> 里，可被程序化调用。它解决的问题是：CLI 入口和可复用逻辑耦合，导致 SDK 用户和测试无法绕过 shim。分离后，同一个 <code>main</code>/<code>createAgentSession</code> 能服务 CLI、SDK、守护进程。</p>
+
+<p><strong>用 TTY 检测让模式自动降级。</strong> <code>!stdinIsTTY || !stdoutIsTTY</code> 自动切到 headless 模式，让管道组合自然工作。它解决的问题是：用户必须记住加 <code>--print</code> 才能在脚本里用。当程序根据自己是否连接终端自动调整，<code>echo ... | pi</code> 和 <code>pi | grep ...</code> 就"刚好能用"——这是 Unix 可组合性的精髓。</p>
+
+<p><strong>用工厂闭包延迟并支持重建。</strong> <code>main</code> 不直接建会话，而是传一个 <code>createRuntime</code> 工厂给 runtime 宿主，需要时重建。它解决的问题是：会话需要被重新创建（reload、切换、fork），但创建逻辑散落各处。把创建封装成工厂，重建就成了"再调一次工厂"。</p>
+
+<p><strong>对未知输入开放，转交给能处理的人。</strong> 核心 CLI 不拒绝未知 <code>--flag</code>，而是收集进 <code>unknownFlags</code> 传给扩展。它解决的问题是：核心 CLI 被迫认识所有扩展的参数，或扩展无法拥有自己的参数。当核心把未知输入转交出去，扩展就能拥有自己的 CLI 表面，而核心保持稳定。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p><code>pi</code> 命令的启动是一条精心设计的流水线：<code>cli.ts</code> 做进程级设置后调用 <code>main</code>；<code>main</code> 合并扩展、解析参数、用 <code>resolveAppMode</code>（结合显式 flag 和 TTY 检测）决定进哪种模式、在引导期做项目信任决策、构建 <code>createRuntime</code> 工厂、创建 <code>AgentSessionRuntime</code> 宿主，最后分发到 <code>runRpcMode</code>/<code>InteractiveMode</code>/<code>runPrintMode</code> 三条路径。三条路径共享同一个 runtime，但消费方式各异——给机器、给人、给脚本。而 <code>createAgentSession</code> 是三个包相遇的枢纽，它把核心 <code>Agent</code> 的 <code>streamFn</code> 槽位接到 <code>pi-ai</code>，并在中间注入设置管理与扩展 hook。</p>
+
+<p>启动流水线的所有设计——子命令提前退出、惰性加载、TTY 自动降级、startup benchmark——都指向同一个执念：快，且不加载用不到的东西。</p>
+
+<p>下一章，我们深入三条路径共享的那个枢纽对象 <code>AgentSession</code>——这个 3,333 行的中央编排器如何驱动一轮对话。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("bootflow", function (d) {
+  d.box({ id: "A", x: 180, y: 40, w: 300, h: 50, title: "main(args)", tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 180, y: 116, w: 300, h: 50, title: "合并 builtInExtensions + 内联扩展", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "C", x: 180, y: 192, w: 300, h: 50, title: "检测 offline 模式", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "D", x: 180, y: 268, w: 300, h: 50, title: "创建引导 SettingsManager", lines: ["应用 HTTP 代理"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "E", x: 180, y: 344, w: 300, h: 50, title: "包管理 / auth 子命令?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "E1", x: 560, y: 344, w: 230, h: 50, title: "处理后提前退出", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "F", x: 180, y: 420, w: 300, h: 50, title: "parseArgs(args)", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "G", x: 180, y: 496, w: 300, h: 50, title: "--version / --export?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "G1", x: 560, y: 496, w: 230, h: 50, title: "处理后退出", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "H", x: 180, y: 572, w: 300, h: 50, title: "resolveAppMode", lines: ["决定运行模式"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "I", x: 180, y: 648, w: 300, h: 50, title: "运行迁移", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "J", x: 180, y: 724, w: 300, h: 50, title: "首次设置（仅交互）", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "K", x: 180, y: 800, w: 300, h: 50, title: "createSessionManager", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "L", x: 180, y: 876, w: 300, h: 50, title: "resolveProjectTrusted", lines: ["项目信任决策"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "M", x: 180, y: 952, w: 300, h: 50, title: "构建 createRuntime 工厂闭包", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "N", x: 180, y: 1028, w: 300, h: 50, title: "createAgentSessionRuntime", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "O", x: 180, y: 1104, w: 300, h: 50, title: "--help / --list-models?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "O1", x: 560, y: 1104, w: 230, h: 50, title: "打印后退出", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "P", x: 180, y: 1180, w: 300, h: 50, title: "读取管道 stdin", lines: ["准备初始消息 / initTheme"], tone: "violet", titleSize: 12.5 });
+  d.box({ id: "Q", x: 180, y: 1256, w: 300, h: 50, title: "按模式分发", tone: "accent", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "E1", { from: "right", to: "left", label: "是" });
+  d.arrow("E", "F", { from: "bottom", to: "top", label: "否", labelDy: 0 });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "G1", { from: "right", to: "left", label: "是" });
+  d.arrow("G", "H", { from: "bottom", to: "top", label: "否", labelDy: 0 });
+  d.arrow("H", "I", { from: "bottom", to: "top" });
+  d.arrow("I", "J", { from: "bottom", to: "top" });
+  d.arrow("J", "K", { from: "bottom", to: "top" });
+  d.arrow("K", "L", { from: "bottom", to: "top" });
+  d.arrow("L", "M", { from: "bottom", to: "top" });
+  d.arrow("M", "N", { from: "bottom", to: "top" });
+  d.arrow("N", "O", { from: "bottom", to: "top" });
+  d.arrow("O", "O1", { from: "right", to: "left", label: "是" });
+  d.arrow("O", "P", { from: "bottom", to: "top", label: "否", labelDy: 0 });
+  d.arrow("P", "Q", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

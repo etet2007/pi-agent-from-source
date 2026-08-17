@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 5 章 · 状态、消息与会话树 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch05">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第二部分 · Agent 核心</p>
+  <h1>第 5 章：状态、消息与会话树</h1>
+  <p class="chapter-sub">内存里的防御性复制、消息层的那座桥、不可变的会话树，与可插拔的存储后端——Pi Agent 把"记忆"分成了四层</p>
+</header>
+
+<h2 id="memory">Agent 需要记住什么</h2>
+
+<p>前几章我们看的是"动作"：模型如何被调用、工具如何被执行。但 Agent 不只是动作，它还有记忆——它得记住对话进行到哪了、用过哪些工具、当前用什么模型。没有状态的 Agent 会永远重蹈覆辙。</p>
+
+<p>Pi Agent 的状态分两个层次，对应两种截然不同的需求：</p>
+
+<ul>
+<li><strong>内存状态</strong>：核心 <code>Agent</code> 类持有的当前转录与运行时标志。它生命周期短（一次运行）、读写频繁、不需要持久。</li>
+<li><strong>持久状态</strong>：会话树。它生命周期长（跨运行、跨重启）、需要可分支可压缩、要能落到磁盘。</li>
+</ul>
+
+<p>这两层之间的关系，以及 Pi Agent 把持久转录建模为<strong>一棵树</strong>而非一个数组的独特选择，是本章的主题。后者是 Pi Agent 区别于绝大多数 Agent 的设计——它让"fork 一个会话""回到三步之前换个思路""压缩但不丢失历史"都成为一等公民。</p>
+
+<hr class="sep">
+
+<h2 id="memory-state">第一层：内存状态</h2>
+
+<p>核心 <code>Agent</code> 类（<code>packages/agent/src/agent.ts</code>）是一个"有状态的循环包装器"。它的文档写得很直白：</p>
+
+<blockquote>
+<p>Stateful wrapper around the low-level agent loop. <code>Agent</code> owns the current transcript, emits lifecycle events, executes tools, and exposes queueing APIs for steering and follow-up messages.</p>
+</blockquote>
+
+<h3>用访问器属性复制数组</h3>
+
+<p><code>Agent</code> 的状态由 <code>createMutableAgentState</code> 创建。这个函数有一个值得注意的细节——<code>tools</code> 和 <code>messages</code> 不是普通字段，而是 getter/setter 访问器属性，且 setter 会<strong>复制传入的数组</strong>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">function createMutableAgentState(initialState?) {
+	let tools = initialState?.tools?.slice() ?? [];
+	let messages = initialState?.messages?.slice() ?? [];
+	return {
+		systemPrompt: initialState?.systemPrompt ?? "",
+		model: initialState?.model ?? DEFAULT_MODEL,
+		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		get tools() {
+			return tools;
+		},
+		set tools(nextTools: AgentTool&lt;any&gt;[]) {
+			tools = nextTools.slice(); // 复制顶层数组
+		},
+		get messages() {
+			return messages;
+		},
+		set messages(nextMessages: AgentMessage[]) {
+			messages = nextMessages.slice(); // 复制顶层数组
+		},
+		isStreaming: false,
+		streamingMessage: undefined,
+		pendingToolCalls: new Set&lt;string&gt;(),
+		errorMessage: undefined,
+	};
+}</pre>
+
+<p>状态字段分两类。一类是<strong>配置性</strong>的（<code>systemPrompt</code>、<code>model</code>、<code>thinkingLevel</code>、<code>tools</code>、<code>messages</code>），由调用方设置；另一类是<strong>运行时</strong>的（<code>isStreaming</code>、<code>streamingMessage</code>、<code>pendingToolCalls</code>、<code>errorMessage</code>），由 <code>Agent</code> 自己在运行期间维护，对外只读。</p>
+
+<p>为什么 setter 要 <code>slice()</code> 复制？这是一种轻量的防御性不可变：调用方 <code>agent.state.messages = someArray</code> 之后，再修改 <code>someArray</code> 不会影响 <code>Agent</code> 内部持有的副本。它只复制顶层数组（不深拷贝消息对象），所以在"防止外部数组被意外改动"和"拷贝成本"之间取了平衡。注意循环内部对消息的<em>追加</em>（<code>context.messages.push(...)</code>）操作的是 <code>createContextSnapshot()</code> 复制出来的快照，而不是这个状态数组本身——第 3 章见过，循环拿到的是 <code>messages.slice()</code>。</p>
+
+<h3><code>processEvents</code>：事件归约器</h3>
+
+<p>第 3 章说循环通过 <code>emit</code> 发出 <code>AgentEvent</code>。<code>Agent</code> 类把这些事件<strong>归约</strong>进自己的状态。<code>processEvents</code> 就是这个归约器：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">private async processEvents(event: AgentEvent): Promise&lt;void&gt; {
+	switch (event.type) {
+		case "message_start":
+			this._state.streamingMessage = event.message;
+			break;
+		case "message_update":
+			this._state.streamingMessage = event.message;
+			break;
+		case "message_end":
+			this._state.streamingMessage = undefined;
+			this._state.messages.push(event.message);
+			break;
+		case "tool_execution_start": {
+			const pendingToolCalls = new Set(this._state.pendingToolCalls);
+			pendingToolCalls.add(event.toolCallId);
+			this._state.pendingToolCalls = pendingToolCalls;
+			break;
+		}
+		case "tool_execution_end": {
+			const pendingToolCalls = new Set(this._state.pendingToolCalls);
+			pendingToolCalls.delete(event.toolCallId);
+			this._state.pendingToolCalls = pendingToolCalls;
+			break;
+		}
+		case "turn_end":
+			if (event.message.role === "assistant" &amp;&amp; event.message.errorMessage) {
+				this._state.errorMessage = event.message.errorMessage;
+			}
+			break;
+		case "agent_end":
+			this._state.streamingMessage = undefined;
+			break;
+	}
+
+	const signal = this.activeRun?.abortController.signal;
+	for (const listener of this.listeners) {
+		await listener(event, signal);
+	}
+}</pre>
+
+<p>注意两件事。其一，<code>message_end</code> 才把消息正式推进 <code>messages</code> 数组——<code>message_start</code>/<code>message_update</code> 期间，消息只存在于 <code>streamingMessage</code> 这个"正在生成"的临时字段里。这样 <code>state.messages</code> 始终是"已完成的消息"，而 <code>streamingMessage</code> 是"进行中的那一条"，UI 可以分别渲染。其二，<code>pendingToolCalls</code> 的更新是<strong>复制整个 Set 再赋值</strong>（<code>new Set(...)</code> 然后 <code>add</code>/<code>delete</code>），而不是原地修改——这让任何监听 <code>pendingToolCalls</code> 变化的逻辑都能通过引用比较检测到更新。</p>
+
+<p>归约完状态，<code>processEvents</code> 按订阅顺序 <code>await</code> 每个监听器。监听器是产品层（<code>AgentSession</code>）接入的地方——它把 <code>AgentEvent</code> 翻译成更高层的 <code>AgentSessionEvent</code>。第 9 章详述。</p>
+
+<h3>失败也是正常的事件序列</h3>
+
+<p><code>Agent.prompt()</code> 启动一次运行时，会用 <code>runWithLifecycle</code> 包裹。如果执行器意外抛出（注意：正常情况下循环不会抛，因为所有协作者都承诺"永不抛出"——这里是兜底），<code>handleRunFailure</code> 会把它<strong>转换成一个正常的事件序列</strong>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">private async handleRunFailure(error: unknown, aborted: boolean): Promise&lt;void&gt; {
+	const failureMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: this._state.model.api,
+		provider: this._state.model.provider,
+		model: this._state.model.id,
+		usage: EMPTY_USAGE,
+		stopReason: aborted ? "aborted" : "error",
+		errorMessage: error instanceof Error ? error.message : String(error),
+		timestamp: Date.now(),
+	} satisfies AgentMessage;
+	await this.processEvents({ type: "message_start", message: failureMessage });
+	await this.processEvents({ type: "message_end", message: failureMessage });
+	await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
+	await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+}</pre>
+
+<p>即使发生了意料之外的异常，监听器看到的依然是一条完整的、合法的事件序列（<code>message_start</code> → <code>message_end</code> → <code>turn_end</code> → <code>agent_end</code>），而不是一个半途中断、状态不一致的烂摊子。这是对"事件流契约"的最后一道守护：消费者永远能收到 <code>agent_end</code>，永远能把状态归约到一个一致的点。</p>
+
+<h3>重入保护与两个队列</h3>
+
+<p><code>Agent.prompt()</code> 开头有一道重入保护：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">async prompt(input, images?) {
+	if (this.activeRun) {
+		throw new Error(
+			"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+		);
+	}
+	// ...
+}</pre>
+
+<p>一次只能有一个活跃运行。想在运行期间塞消息？用 <code>steer()</code> 或 <code>followUp()</code>，它们把消息放进两个 <code>PendingMessageQueue</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">class PendingMessageQueue {
+	private messages: AgentMessage[] = [];
+	public mode: QueueMode; // "all" | "one-at-a-time"
+
+	drain(): AgentMessage[] {
+		if (this.mode === "all") {
+			const drained = this.messages.slice();
+			this.messages = [];
+			return drained;
+		}
+		const first = this.messages[0];
+		if (!first) return [];
+		this.messages = this.messages.slice(1);
+		return [first];
+	}
+}</pre>
+
+<p><code>QueueMode</code> 控制 <code>drain()</code> 的行为：<code>"all"</code> 一次取光所有排队消息，<code>"one-at-a-time"</code> 每次只取一条（默认）。回忆第 3 章：<code>createLoopConfig</code> 把 <code>steeringQueue.drain</code> 接到 <code>getSteeringMessages</code>，把 <code>followUpQueue.drain</code> 接到 <code>getFollowUpMessages</code>。于是"用户在 agent 工作时插话"和"排队下一个任务"这两种体验，就通过这两个队列 + 两个回调槽位实现了。<code>one-at-a-time</code> 模式让每条插话都得到一轮独立的处理，而不是堆在一起。</p>
+
+<hr class="sep">
+
+<h2 id="messages">第二层：消息与那座桥</h2>
+
+<h3>可扩展的消息联合</h3>
+
+<p>循环内部流转的消息类型是 <code>AgentMessage</code>（<code>packages/agent/src/types.ts</code>），它是一个<strong>可通过声明合并扩展</strong>的联合类型：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface CustomAgentMessages {} // 通过声明合并扩展
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];</pre>
+
+<p><code>Message</code>（来自 <code>pi-ai</code>）覆盖标准的 <code>user | assistant | toolResult</code>。但产品可以往 <code>CustomAgentMessages</code> 接口里塞入自己的消息类型——Harness 层就扩展了它，加入 <code>bashExecution</code>、<code>custom</code>、<code>branchSummary</code>、<code>compactionSummary</code> 等类型。这些自定义消息对 UI 和持久化有意义（比如要在终端里显示一段压缩摘要），但模型并不需要、也不理解它们。</p>
+
+<h3><code>convertToLlm</code>：内部表示 ≠ 线上表示</h3>
+
+<p>这就引出了第 3 章提到的那座桥。默认的转换器只做一件事——过滤：</p>
+
+<pre class="code" data-lang="ts">function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
+	return messages.filter(
+		(message) =&gt; message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+	);
+}</pre>
+
+<p>它把自定义消息（<code>role</code> 不是这三种的）全部过滤掉，只留下提供商能理解的。产品层用的是 <code>convertToLlmWithBlockImages</code> 变体（在 <code>packages/coding-agent/src/core/messages.ts</code>），额外处理图片屏蔽。</p>
+
+<p>这个设计的精妙在于：<strong>转录里可以有任何类型的消息，但发给模型的永远是干净的子集。</strong> UI 消息、压缩摘要、分支摘要、bash 执行记录——它们都活在转录里，被持久化、被渲染，但在每次模型调用前被 <code>convertToLlm</code> 这座桥过滤或转换掉。内部表示和线上表示的分离，让 Pi Agent 能自由扩展消息类型而不污染提供商协议。<code>AgentLoopConfig</code> 的文档甚至给了一个例子：把 <code>custom</code> 消息转成 <code>user</code> 消息、把 <code>notification</code> 消息过滤掉。</p>
+
+<p><code>convertToLlm</code> 也有"must not throw"契约——它必须返回安全兜底值，因为抛异常会"中断底层循环而不产生正常的事件序列"。又一次，契约纪律守护着循环的简洁。</p>
+
+<hr class="sep">
+
+<h2 id="session-tree">第三层：会话树</h2>
+
+<p>现在到本章的重头戏。内存状态解决"这一次运行"，但 Agent 还需要"跨运行"的记忆——会话持久化。绝大多数 Agent 把转录存成一个扁平的消息数组。Pi Agent 不这样。它把转录建模为<strong>一棵可追加、可分支的不可变条目树</strong>。</p>
+
+<h3>为什么不是数组</h3>
+
+<p>考虑几个真实需求：</p>
+
+<ul>
+<li>用户想"回到三步之前，换个思路重新问"——数组做不到，除非复制整个数组。</li>
+<li>用户想"fork 这个会话，让两个分支各自探索"——数组需要整体拷贝。</li>
+<li>上下文太长了要压缩，但"压缩"不应该真的删除历史（用户可能想回看）——数组里删除就是删除。</li>
+</ul>
+
+<p>树结构让这些都变得自然：历史是不可变的节点，"当前位置"只是一个指向某个节点的指针（<code>leaf</code>）。回到过去 = 移动指针；fork = 从某个节点长出新的分支；压缩 = 插入一个摘要节点，而不是删除旧节点。</p>
+
+<h3>条目：树的节点</h3>
+
+<p>会话树的节点是 <code>SessionTreeEntry</code>（<code>packages/agent/src/harness/types.ts</code>），一个 11 种类型的联合：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export type SessionTreeEntry =
+	| MessageEntry            // 一条消息（user/assistant/toolResult/自定义）
+	| ThinkingLevelChangeEntry // thinking 级别变更
+	| ModelChangeEntry         // 模型变更
+	| ActiveToolsChangeEntry   // 激活工具集变更
+	| CompactionEntry          // 压缩摘要
+	| BranchSummaryEntry       // 分支摘要
+	| CustomEntry              // 自定义条目
+	| CustomMessageEntry       // 自定义消息条目
+	| LabelEntry               // 标签
+	| SessionInfoEntry         // 会话信息（如名称）
+	| LeafEntry;               // 叶指针：记录当前活跃叶</pre>
+
+<p>每个条目都有 <code>id</code>、<code>parentId</code>（树的边）、<code>timestamp</code>、<code>type</code>。注意这里不只存消息——模型切换、thinking 级别变更、工具集变更都是条目。这意味着"会话的完整历史"包括<em>配置的变化</em>，而不仅仅是对话内容。回看一个会话时，你能看到"用户在第 5 轮切换到了更强的模型"这样的信息。</p>
+
+<p><code>LeafEntry</code> 尤其特别：它不携带内容，只是一个<strong>导航标记</strong>，记录"当前活跃叶是哪个条目"。会话的"当前位置"就是 leaf 指向的地方。</p>
+
+<h3>分支：移动 leaf</h3>
+
+<p><code>Session</code> 类（<code>packages/agent/src/harness/session/session.ts</code>）封装了对存储的操作。<code>appendMessage</code> 追加一个消息条目（返回新条目 id）；<code>moveTo(entryId, summary?)</code> 则重新指向 leaf：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">async moveTo(entryId, summary?): Promise&lt;...&gt; {
+	// 把 leaf 重新指向 entryId，实现分支/回溯
+}</pre>
+
+<p><code>moveTo</code> 不删除任何东西——它只是把 leaf 指针移到另一个条目。如果那个条目是某个旧分支上的节点，那么后续的 <code>appendMessage</code> 就会从那里长出新的分支。这就是"回到三步之前换个思路"的实现：<code>moveTo</code> 到三步之前的节点，然后继续追加。旧的分支依然存在于树里，随时可以 <code>moveTo</code> 回去。</p>
+
+<p><code>getBranch(fromId?)</code> 返回从 leaf（或指定节点）到根的路径——也就是"当前这条分支"上的所有条目：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">async getBranch(fromId?: string): Promise&lt;SessionTreeEntry[]&gt; {
+	// 返回 getPathToRootOrCompaction(leafId)
+}</pre>
+
+<h3>从树到上下文：<code>buildSessionContext</code></h3>
+
+<p>模型需要的不是树，而是一条线性的消息序列。<code>buildSessionContext</code> 负责把"当前分支的路径"折叠成 <code>SessionContext</code>：</p>
+
+<pre class="code" data-lang="ts">export interface SessionContext {
+	messages: AgentMessage[];
+	thinkingLevel: string;
+	model: { provider: string; modelId: string } | null;
+	activeToolNames: string[] | null;
+}</pre>
+
+<p>折叠过程做两件事：其一，从路径里的 <code>ModelChangeEntry</code>/<code>ThinkingLevelChangeEntry</code>/<code>ActiveToolsChangeEntry</code> 推导出当前的模型、thinking 级别、激活工具（配置是"沿路径累积"的）；其二，把 <code>MessageEntry</code> 等投影成 <code>AgentMessage[]</code>。</p>
+
+<h3>压缩在上下文构建期生效</h3>
+
+<p>最关键的是压缩如何处理。回忆第 1 章：Pi Agent 的压缩不删除历史。那么压缩如何减少发给模型的 token？答案在 <code>defaultContextEntryTransform</code>（<code>packages/agent/src/harness/session/session.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">export function defaultContextEntryTransform(pathEntries: readonly SessionTreeEntry[]): SessionTreeEntry[] {
+	// 找到路径里最后一个 compaction 条目
+	let compaction: CompactionEntry | null = null;
+	for (const entry of pathEntries) {
+		if (entry.type === "compaction") compaction = entry;
+	}
+	if (!compaction) return [...pathEntries]; // 没有压缩，原样返回
+
+	// 有压缩：上下文 = [压缩摘要] + 保留的尾部
+	const entries: SessionTreeEntry[] = [compaction];
+	const compactionIdx = pathEntries.findIndex((e) =&gt; e.type === "compaction" &amp;&amp; e.id === compaction.id);
+	if (compaction.retainedTail) {
+		for (let i = compactionIdx + 1; i &lt; pathEntries.length; i++) entries.push(pathEntries[i]!);
+		return entries;
+	}
+	if (compaction.firstKeptEntryId) {
+		// 从 firstKeptEntryId 开始保留压缩点之前的部分
+		// ...
+	}
+	for (let i = compactionIdx + 1; i &lt; pathEntries.length; i++) entries.push(pathEntries[i]!);
+	return entries;
+}</pre>
+
+<p>逻辑是：如果路径里存在一个 <code>compaction</code> 条目，那么发给模型的上下文就变成"<strong>压缩摘要 + 压缩点之后保留的尾部</strong>"。压缩点之前的原始历史并没有被删除——它们还在树里——只是在构建上下文时被摘要替代了。</p>
+
+<p>这是一个优雅的分离：<strong>存储层保留完整历史，上下文构建层决定发给模型什么。</strong> 压缩是"上下文视图"的属性，不是"存储"的属性。于是用户可以 <code>moveTo</code> 回压缩点之前，重新展开那段历史——压缩是可逆的视图变换，而非不可逆的数据删除。第 7 章会详述压缩摘要如何生成。</p>
+
+<h3>存储接口：<code>SessionStorage</code></h3>
+
+<p>会话树的持久化由 <code>SessionStorage</code> 接口抽象（<code>packages/agent/src/harness/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export interface SessionStorage&lt;TMetadata extends SessionMetadata = SessionMetadata&gt; {
+	getMetadata(): Promise&lt;TMetadata&gt;;
+	getLeafId(): Promise&lt;string | null&gt;;
+	setLeafId(leafId: string | null): Promise&lt;LeafEntry&gt;;
+	createEntryId(): Promise&lt;string&gt;;
+	appendEntry(entry: SessionTreeEntry): Promise&lt;void&gt;;
+	getEntry(id: string): Promise&lt;SessionTreeEntry | undefined&gt;;
+	findEntries&lt;TType extends SessionTreeEntry["type"]&gt;(type: TType): Promise&lt;Array&lt;Extract&lt;SessionTreeEntry, { type: TType }&gt;&gt;&gt;;
+	getLabel(id: string): Promise&lt;string | undefined&gt;;
+	getSessionName(): Promise&lt;string | undefined&gt;;
+	getSessionStats(): Promise&lt;SessionStats&gt;;
+	getPathToRootOrCompaction(leafId: string | null): Promise&lt;SessionTreeEntry[]&gt;;
+	getEntries(options?: SessionEntryCursorOptions): Promise&lt;SessionTreeEntry[]&gt;;
+}</pre>
+
+<p>核心操作是 <code>appendEntry</code>（追加不可变条目）、<code>setLeafId</code>（移动 leaf，即分支）、<code>getPathToRootOrCompaction</code>（取当前分支路径，遇到压缩点或根停止）。这个接口是存储后端可插拔的关键——核心定义了"会话树需要什么操作"，具体怎么存是后端的事。</p>
+
+<hr class="sep">
+
+<h2 id="storage">第四层：存储后端</h2>
+
+<p><code>SessionStorage</code> 有三个实现，体现了"从简单到强大"的渐进。</p>
+
+<h3>JSONL：默认的轻量后端</h3>
+
+<p>默认后端是 JSONL（每行一个 JSON 对象）。<code>pi-agent-core</code> 的 Harness 层提供了 <code>JsonlSessionStorage</code>（<code>packages/agent/src/harness/session/jsonl-storage.ts</code>），产品层 <code>pi-coding-agent</code> 也有自己的 <code>SessionManager</code>（<code>packages/coding-agent/src/core/session-manager.ts</code>）基于 JSONL：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/session-manager.ts">export class SessionManager {
+	static create(cwd, sessionDir?, options?);
+	static forkFrom(sourcePath, cwd, sessionDir?, options?);
+	appendMessage(message): string;
+	appendModelChange(provider, modelId);
+	appendThinkingLevelChange(level);
+	getBranch(fromId?): SessionEntry[];
+	buildSessionContext(): SessionContext;
+	// ...
+}</pre>
+
+<p>一个会话就是一个 JSONL 文件：一个 <code>SessionHeader</code> 加一串类型化的条目。追加操作就是 append 一行——简单、可追加、人类可读、易于备份和版本控制。fork 一个会话（<code>forkFrom</code>）就是复制文件并设置 <code>parentSessionPath</code>。对于单用户本地 CLI，JSONL 是恰到好处的选择——没有数据库依赖，没有迁移负担。</p>
+
+<h3>SQLite：可选的强大后端</h3>
+
+<p>当会话变多、需要全文搜索、需要快速打开时，JSONL 的"每次打开都要重放整个文件"就成了瓶颈。<code>pi-storage-sqlite-node</code>（<code>packages/storage/sqlite-node</code>）提供了一个 SQLite 后端 <code>SqliteSessionStorage</code>，实现同一个 <code>SessionStorage</code> 接口。</p>
+
+<p>它的数据库 schema（<code>packages/storage/sqlite-node/src/sqlite/migrations/001_initial.sql</code>）把会话树存成关系表：</p>
+
+<ul>
+<li><code>sessions</code>：会话元数据 + <code>active_leaf_id</code></li>
+<li><code>session_entries</code>：<code>(session_id, id)</code> 主键，<code>entry_seq</code>（单调递增）、<code>parent_id</code>（树的边）、<code>type</code>、<code>payload</code>（JSON）</li>
+<li><code>branch_entries</code>：物化的分支成员关系</li>
+<li><code>session_materialized</code> / <code>entry_materialized</code>：预计算的聚合状态</li>
+</ul>
+
+<p>两个优化值得注意。其一，<strong>物化聚合</strong>：<code>SessionMaterializedState</code> 缓存了 <code>messageCount</code>、token 数、成本总和、当前模型等。每次 <code>appendEntry</code> 时增量更新这些聚合（<code>applyEntryToMaterializedState</code>），于是打开一个会话不需要重放所有条目——直接读物化状态。其二，<strong>FTS5 全文搜索</strong>：<code>createSqliteSessionSearch</code> 用 SQLite 的 FTS5（trigram 分词）建立搜索索引，<code>search()</code> 跑 <code>MATCH</code> 查询并按 <code>bm25()</code> 排序。这让"在我所有会话里搜'那个 auth bug'"成为可能。</p>
+
+<p>关键在于：SQLite 后端和 JSONL 后端实现的是<strong>同一个接口</strong>。核心代码（<code>Session</code> 类、<code>buildSessionContext</code>）完全不知道底层是文件还是数据库。这就是接口抽象的价值——存储后端是真正的可插拔。</p>
+
+<h3>InMemory：测试与临时用途</h3>
+
+<p>还有 <code>InMemorySessionStorage</code>（<code>packages/agent/src/harness/session/memory-storage.ts</code>），把条目存在内存里。它服务于测试（evals 就用 <code>SettingsManager.inMemory()</code> 和临时会话）和不需要持久化的临时场景。</p>
+
+<hr class="sep">
+
+<h2 id="walkthrough">实例演练：一个会话的生命周期</h2>
+
+<p>把这几层串起来。你运行 <code>pi</code>，输入几个提示词，中途切换了一次模型，然后 fork 了会话。</p>
+
+<ol>
+<li><strong>启动</strong>：<code>SessionManager.create(cwd)</code> 创建一个 JSONL 文件，写入 <code>SessionHeader</code>。leaf 为空。</li>
+<li><strong>第一条消息</strong>：<code>appendMessage(userMessage)</code> 追加一个 <code>MessageEntry</code>（parentId 指向根），leaf 移到它。</li>
+<li><strong>助手回复 + 工具</strong>：循环产生的 assistant 消息、toolResult 消息依次 <code>appendMessage</code>，每个条目 parentId 指向前一个，形成一条链。</li>
+<li><strong>切换模型</strong>：你 <code>/model</code> 切到更强的模型。<code>appendModelChange(provider, modelId)</code> 追加一个 <code>ModelChangeEntry</code>。之后的 <code>buildSessionContext</code> 会从它推导出"当前模型已变更"。</li>
+<li><strong>压缩</strong>：上下文快满了。压缩逻辑生成摘要，<code>appendCompaction(...)</code> 追加一个 <code>CompactionEntry</code>。历史没删——但从今往后 <code>defaultContextEntryTransform</code> 会用"摘要 + 尾部"替代压缩点之前的内容。</li>
+<li><strong>fork</strong>：你想换个思路。<code>moveTo(三步之前的entryId)</code> 把 leaf 移回去（追加一个 <code>LeafEntry</code> 记录新位置），然后 <code>appendMessage(新的用户消息)</code> 从那里长出新分支。旧的分支完好无损，<code>/tree</code> 命令能看到整棵树。</li>
+</ol>
+
+<p>整个过程中，内存层的 <code>Agent.state.messages</code> 持有"当前运行的线性转录"，持久层的会话树持有"完整的、可分支的历史"。两者通过 <code>buildSessionContext</code>（树 → 线性上下文）和 <code>appendMessage</code>（线性消息 → 树条目）相互投影。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的状态设计为"如何管理 Agent 的状态与历史"提供了四条可迁移的模式。</p>
+
+<p><strong>区分内存状态与持久状态。</strong> 内存状态（当前转录、运行时标志）用可变对象 + 访问器属性，追求读写轻量和防御性复制；持久状态（会话历史）用不可变条目树，追求可分支可压缩。它解决的问题是：用一套机制同时服务两种访问模式，结果两边都不舒服。两层状态对应两种生命周期和两种需求。</p>
+
+<p><strong>事件归约，而非直接改状态。</strong> 循环发事件，<code>Agent</code> 把事件归约进状态，监听器再消费事件。它解决的问题是：状态修改散落在各处、UI 与逻辑耦合。当所有状态变更都流经同一条事件流，你就能免费获得"任何消费者都能重建状态"的能力——TUI、print、RPC 都是同一个归约的不同投影。</p>
+
+<p><strong>内部表示 ≠ 线上表示，用桥连接。</strong> 转录里可以有任意自定义消息类型，但发给模型的永远是过滤/转换后的干净子集。它解决的问题是：为了 UI 或持久化往消息里塞东西，结果污染了提供商协议。当 <code>convertToLlm</code> 是唯一出口，内部就能自由扩展而不影响外部。</p>
+
+<p><strong>把历史建模为不可变树，把"当前位置"建模为指针。</strong> 回溯 = 移动指针，fork = 长新分支，压缩 = 插入摘要节点而非删除。它解决的问题是：扁平数组下"回到过去""分支探索""可逆压缩"都需要整体拷贝或不可逆删除。当历史不可变、位置是指针，这些操作都退化成指针操作。代价是存储和上下文构建稍微复杂——但对一个"用户会不断试错、回溯、fork"的交互式 Agent，这份代价物有所值。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的状态分四层：内存里，<code>Agent</code> 用带防御性复制的访问器属性持有当前转录，用 <code>processEvents</code> 把 <code>AgentEvent</code> 归约进状态，连失败都转成正常的事件序列；消息层，可扩展的 <code>AgentMessage</code> 联合让转录容纳任意自定义类型，<code>convertToLlm</code> 在模型边界过滤出干净子集；持久层，会话被建模为 11 种不可变条目的可追加分支树，leaf 指针标记当前位置，压缩在上下文构建期生效而非删除历史；存储层，<code>SessionStorage</code> 接口让 JSONL、SQLite、InMemory 三个后端可插拔。</p>
+
+<p>最深刻的洞见是那个树结构。它不是"另一种存消息的方式"，而是对"会话是什么"的重新定义：会话不是一条线，而是一棵探索的树，用户可以在任意节点分叉、回溯、压缩。理解了这一点，你就理解了 Pi Agent 为什么能优雅地支持 fork、<code>/tree</code>、可逆压缩这些在扁平数组模型里极其别扭的功能。</p>
+
+<p>下一章，我们离开核心运行时，进入 <code>pi-agent-core</code> 的 Harness 层——看它如何在最小核心之上，搭建一个开箱即用的持久化编排器。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>

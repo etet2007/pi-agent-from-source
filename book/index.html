@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>序言 · Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-page="index">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">PI AGENT FROM SOURCE</p>
+  <h1>Pi Agent 源码解析</h1>
+  <p class="chapter-sub">一个最小化 AI 编程 Agent 的架构、模式与内部机制</p>
+</header>
+
+<div class="epigraph">
+  <p>本书是一份教育性的源码研究笔记。它分析的对象 <a href="https://pi.dev">Pi Agent</a>（<code>@earendil-works/pi-coding-agent</code> 及其同族包）是一个 MIT 许可的开源项目，因此书中所有代码片段均直接取自真实源码，文件路径与函数名皆可逐一核对。本书与 Pi Agent 的维护者无关，未获其背书或赞助。</p>
+  <p>分析基于的版本为 monorepo 各包 <code>v0.83.0</code>。</p>
+</div>
+
+<h2 id="q1">这本书想回答什么问题</h2>
+
+<p>市面上大多数生产级 AI 编程 Agent 都是庞然大物。以 Claude Code 为例，它是一个包含近两千个 TypeScript 文件的单体应用：内置七种权限模式、四十多个工具、分叉自研的终端渲染器、四层上下文压缩、二十七种生命周期钩子。它的复杂性是一艘潜艇式的复杂性——每一个 <code>if</code> 分支背后都站着一个曾经在生产环境里造成过事故的故障模式。</p>
+
+<p>Pi Agent 选择了相反的方向。它的 <code>CONTRIBUTING.md</code> 开篇第一句话就是：</p>
+
+<blockquote><p><strong>pi's core is minimal.</strong> If your feature does not belong in the core, it should be an extension.</p></blockquote>
+
+<p>这不是营销话术，而是贯穿整个代码库的组织原则。Pi Agent 没有内置的逐工具权限审批系统——它把隔离交给容器；它没有 MCP，也没有 Claude Code 式的生命周期钩子——它把扩展性交给一个 TypeScript 扩展系统；它的核心 Agent 循环不是上千行的"潜艇"，而是一个干净的两层嵌套状态机。整个产品被拆成九个职责单一、可独立复用的 npm 包，从最底层的统一 LLM API（<code>pi-ai</code>），到 Agent 运行时（<code>pi-agent-core</code>），到终端 UI 库（<code>pi-tui</code>），再到组装一切的 CLI（<code>pi-coding-agent</code>）。</p>
+
+<p>这本书要回答的核心问题是：</p>
+
+<div class="epigraph">
+  <p><strong>一个刻意保持最小化的 Agent，如何在不牺牲生产级能力的前提下，把复杂性挡在核心之外？</strong></p>
+</div>
+
+<p>我们会沿着依赖栈自底向上拆解这个系统。每一章都聚焦一个抽象，讲清楚它<em>是什么</em>、<em>为什么这样设计</em>，以及<em>如果换一种设计会失去什么</em>。</p>
+
+<h2 id="contrast">与 Claude Code 的对照</h2>
+
+<p>本书的写作参考了《Claude Code 源码解析》一书的结构与叙事方法，但二者分析的对象在设计哲学上几乎是对立面，因此章节结构也做了相应调整。下表是两条路线的粗略对照，可以作为阅读本书时的心智锚点：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>维度</th><th>Claude Code（综合体路线）</th><th>Pi Agent（最小化路线）</th></tr></thead>
+<tbody>
+<tr><td>代码组织</td><td>近两千文件的单体</td><td>九个职责单一的包</td></tr>
+<tr><td>Agent 循环</td><td><code>query.ts</code>，约 1,730 行的单一 <code>while(true)</code></td><td><code>agent-loop.ts</code>，干净的两层嵌套循环</td></tr>
+<tr><td>权限</td><td>七种内置权限模式 + 逐工具审批</td><td>无内置审批；项目信任 + 容器化隔离</td></tr>
+<tr><td>扩展性</td><td>生命周期钩子（27 事件）+ MCP</td><td>TypeScript 扩展系统 + skills + 模板</td></tr>
+<tr><td>终端 UI</td><td>分叉的 Ink/React 渲染器</td><td>完全自研的字符串差分渲染器</td></tr>
+<tr><td>会话存储</td><td>消息数组 + 压缩</td><td>可追加、可分支的<strong>会话树</strong></td></tr>
+<tr><td>多提供商</td><td>四种基础设施路径，同一 SDK</td><td><code>Api</code>（协议）/<code>Provider</code>（端点）二层抽象，约 38 个提供商</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>需要强调：最小化不等于简陋。Pi Agent 把"综合性"从核心挪到了<strong>边缘</strong>——挪进扩展、挪进容器、挪进可选的守护进程。核心因此保持小而干净，而系统整体的能力边界并未收缩。理解这种"复杂性守恒"是如何做到的，是本书的主线。</p>
+
+<h2 id="packages">九个包，一张依赖图</h2>
+
+<p>Pi Agent 是一个 monorepo。理解这九个包各自的职责与依赖方向，是理解整个系统的前提。全书的章节基本沿着这张图自底向上展开：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="packages" data-w="880" data-h="520"></canvas></div>
+  <figcaption>图 1：九个包的依赖栈。上三层构成「模型层 → 运行时层 → 产品层」的单向依赖链，持久化与连接、质量是独立的旁支。</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>包</th><th>npm 名</th><th>一句话职责</th><th>对应章节</th></tr></thead>
+<tbody>
+<tr><td><code>packages/ai</code></td><td><code>@earendil-works/pi-ai</code></td><td>把约 38 个 LLM 提供商统一到一套流式 API 之后</td><td>第 2 章</td></tr>
+<tr><td><code>packages/agent</code></td><td><code>@earendil-works/pi-agent-core</code></td><td>Agent 循环、工具执行、状态、可选的持久化 Harness</td><td>第 3–7 章</td></tr>
+<tr><td><code>packages/tui</code></td><td><code>@earendil-works/pi-tui</code></td><td>完全自研的终端 UI 库，差分渲染</td><td>第 12–13 章</td></tr>
+<tr><td><code>packages/coding-agent</code></td><td><code>@earendil-works/pi-coding-agent</code></td><td><code>pi</code> 命令本体，组装一切的 CLI 产品</td><td>第 8–11、14 章</td></tr>
+<tr><td><code>packages/protocol</code></td><td><code>@earendil-works/pi-protocol</code></td><td>传输无关的 CBOR 远程会话协议</td><td>第 15 章</td></tr>
+<tr><td><code>packages/client</code></td><td><code>@earendil-works/pi-client</code></td><td>运行时无关的远程会话客户端</td><td>第 15 章</td></tr>
+<tr><td><code>packages/server</code></td><td><code>@earendil-works/pi-server</code></td><td>监督多个无头 Agent 子进程的守护进程</td><td>第 15 章</td></tr>
+<tr><td><code>packages/storage/sqlite-node</code></td><td><code>@earendil-works/pi-storage-sqlite-node</code></td><td>会话树的 SQLite 存储后端 + 全文搜索</td><td>第 5 章</td></tr>
+<tr><td><code>packages/evals</code></td><td><code>@earendil-works/pi-evals</code></td><td>模型驱动的行为评估框架</td><td>第 16 章</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="golden">黄金路径：从一次按键到一次输出</h2>
+
+<p>和参考书一样，我们先建立一条贯穿全书的"黄金路径"。当你在终端里敲下 <code>pi</code> 并输入"修复 auth.ts 里的空指针 bug"，请求会这样流过整个系统：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="golden" data-w="920" data-h="720"></canvas></div>
+  <figcaption>图 2：一次 prompt 的黄金路径。模型调用永不抛出、循环是事件流、工具执行与模型边界正交——这三条性质决定了整条路径的形状。</figcaption>
+</figure>
+
+<p>这条路径上的每一段都对应后续某一章的放大：</p>
+
+<ul>
+<li><code>pi</code> 命令如何启动、如何决定进入哪种模式 → <a href="ch08-bootstrap.html">第 8 章</a></li>
+<li><code>AgentSession</code> 如何编排一轮对话、如何展开 skill 与模板 → <a href="ch09-agent-session.html">第 9 章</a>、<a href="ch10-system-prompt.html">第 10 章</a></li>
+<li><code>Agent</code> 核心循环如何流式调用模型、执行工具、决定停止 → <a href="ch03-agent-loop.html">第 3 章</a>、<a href="ch04-tools.html">第 4 章</a></li>
+<li><code>pi-ai</code> 如何把请求送到正确的提供商并解析流式响应 → <a href="ch02-ai-layer.html">第 2 章</a></li>
+<li><code>InteractiveMode</code> 如何把事件流渲染成终端画面 → <a href="ch11-modes.html">第 11 章</a>、<a href="ch12-tui-rendering.html">第 12 章</a></li>
+<li>这一轮对话如何被持久化进会话树 → <a href="ch05-state-and-session-tree.html">第 5 章</a></li>
+</ul>
+
+<p>一旦你把这条路径内化，后续每一章都只是对其中某一段的深入放大。</p>
+
+<h2 id="structure">全书结构</h2>
+
+<p>全书七个部分。第一部分建立全景；第二部分是系统的心跳——核心循环、工具与状态；第三部分讲可选的持久化编排与压缩；第四部分讲 <code>pi</code> 命令这个产品如何组装一切；第五部分讲终端界面；第六部分讲扩展与连接；第七部分是质量与结语。</p>
+
+<div class="toc-part">
+<h3>第一部分 · 基础</h3>
+<p class="toc-part-sub">在 Agent 能够思考之前，必须先有一个能跟模型对话的层。</p>
+<ol class="toc-list">
+<li><a href="ch01-architecture.html"><span class="toc-no">01</span><span class="toc-title">架构总览：最小化 Agent 的设计哲学</span><span class="toc-brief">九个包的依赖栈、核心/Harness 二分、项目信任、与单体路线的对照</span></a></li>
+<li><a href="ch02-ai-layer.html"><span class="toc-no">02</span><span class="toc-title">与模型对话：pi-ai 统一 LLM 层</span><span class="toc-brief">Api/Provider 二层抽象、统一消息格式、EventStream、SSE 解析、惰性加载、模型元数据生成、双层重试、成本核算</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第二部分 · Agent 核心</h3>
+<p class="toc-part-sub">系统的心跳：流式输出、执行工具、观察结果、重复。</p>
+<ol class="toc-list">
+<li><a href="ch03-agent-loop.html"><span class="toc-no">03</span><span class="toc-title">Agent Loop：两层嵌套循环</span><span class="toc-brief">runLoop 状态机、StreamFn 边界、AgentEvent 事件流、续接/停止决策、截断保护</span></a></li>
+<li><a href="ch04-tools.html"><span class="toc-no">04</span><span class="toc-title">工具系统：从定义到执行</span><span class="toc-brief">AgentTool 接口、prepare/execute/finalize 三阶段、sequential vs parallel、文件互斥队列、七个内置工具</span></a></li>
+<li><a href="ch05-state-and-session-tree.html"><span class="toc-no">05</span><span class="toc-title">状态、消息与会话树</span><span class="toc-brief">可变 AgentState、AgentMessage 与声明合并、convertToLlm、可追加可分支的会话树、JSONL/SQLite 存储后端</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第三部分 · 持久化编排</h3>
+<p class="toc-part-sub">让 Agent 拥有跨轮次、跨会话的记忆与结构。</p>
+<ol class="toc-list">
+<li><a href="ch06-harness.html"><span class="toc-no">06</span><span class="toc-title">AgentHarness：可持久化的编排器</span><span class="toc-brief">核心/Harness 分层、phase 状态机、turn 快照、hook 系统、写缓冲、ExecutionEnv 依赖反转</span></a></li>
+<li><a href="ch07-compaction.html"><span class="toc-no">07</span><span class="toc-title">上下文压缩与分支摘要</span><span class="toc-brief">shouldCompact、切点选择、摘要生成、分支摘要、token 估算</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第四部分 · 编码 Agent 产品</h3>
+<p class="toc-part-sub"><code>pi</code> 命令如何把上述一切组装成一个可用的产品。</p>
+<ol class="toc-list">
+<li><a href="ch08-bootstrap.html"><span class="toc-no">08</span><span class="toc-title">启动流水线：从 cli.ts 到模式分发</span><span class="toc-brief">入口 shim、main() 引导序列、resolveAppMode、参数解析、三种运行模式</span></a></li>
+<li><a href="ch09-agent-session.html"><span class="toc-no">09</span><span class="toc-title">AgentSession：中央编排器</span><span class="toc-brief">createAgentSession 的装配点、事件系统、prompt() 生命周期、steering/follow-up 队列</span></a></li>
+<li><a href="ch10-system-prompt.html"><span class="toc-no">10</span><span class="toc-title">系统提示词与资源装配</span><span class="toc-brief">buildSystemPrompt、skills、prompt 模板、项目上下文文件、斜杠命令</span></a></li>
+<li><a href="ch11-modes.html"><span class="toc-no">11</span><span class="toc-title">三种运行模式</span><span class="toc-brief">交互式 TUI REPL、print/headless 模式、RPC 模式如何消费同一条事件流</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第五部分 · 终端界面</h3>
+<p class="toc-part-sub">用户看到的一切都经过这一层——而这一层是从零写的。</p>
+<ol class="toc-list">
+<li><a href="ch12-tui-rendering.html"><span class="toc-no">12</span><span class="toc-title">pi-tui：自研渲染器</span><span class="toc-brief">组件即 render(width) =&gt; string[]、逐行差分、主屏/备屏双渲染器、帧调度、同步输出</span></a></li>
+<li><a href="ch13-input-and-editor.html"><span class="toc-no">13</span><span class="toc-title">输入、按键与编辑器</span><span class="toc-brief">Kitty 键盘协议协商、StdinBuffer 序列重组、按键解析、快捷键、Editor 组件</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第六部分 · 扩展与连接</h3>
+<p class="toc-part-sub">最小化核心如何向外延伸，而不被复杂性淹没。</p>
+<ol class="toc-list">
+<li><a href="ch14-extensions.html"><span class="toc-no">14</span><span class="toc-title">扩展系统：最小化核心的延伸</span><span class="toc-brief">ExtensionAPI、注册工具/命令/快捷键/flag、skills/模板/主题、为什么没有 MCP 与钩子</span></a></li>
+<li><a href="ch15-remote.html"><span class="toc-no">15</span><span class="toc-title">远程控制：守护进程、RPC 与协议</span><span class="toc-brief">pi-server 监督器、无头 RPC 子进程、Radius 中继、pi-protocol/pi-client 的 CBOR 通道</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>第七部分 · 质量与结语</h3>
+<p class="toc-part-sub">如何验证一个 Agent 真的变好了，以及我们从中学到了什么。</p>
+<ol class="toc-list">
+<li><a href="ch16-evals.html"><span class="toc-no">16</span><span class="toc-title">行为评估：pi-evals</span><span class="toc-brief">模型驱动的端到端评估、harness 对照表、pass-rate lift、token/延迟/成本配对差</span></a></li>
+<li><a href="ch17-epilogue.html"><span class="toc-no">17</span><span class="toc-title">结语：最小化的赌注</span><span class="toc-brief">六个架构赌注、可迁移的经验、最小化与综合性的权衡</span></a></li>
+</ol>
+</div>
+
+<h2 id="patterns">贯穿全书的十个模式</h2>
+
+<p>如果你只读这些：</p>
+
+<ol>
+<li><strong>分层即防火墙</strong> —— 把系统拆成 <code>ai → agent → coding-agent</code> 的依赖栈，每一层只依赖下一层的抽象，复杂性被层与层之间的接口挡住。</li>
+<li><strong><code>Api</code> 与 <code>Provider</code> 分离</strong> —— 用约 10 种"线缆协议"适配器统一约 38 个提供商；协议是少的，端点是多的。</li>
+<li><strong>流即契约</strong> —— <code>EventStream</code> 异步可迭代原语贯穿全栈；失败不抛出，而是编码进流的终止事件。</li>
+<li><strong>两层嵌套循环</strong> —— 内层处理工具调用与 steering，外层处理 follow-up；续接与停止的每个决策都显式可见。</li>
+<li><strong>工具是自描述对象</strong> —— 并发模式、参数 schema、UI 渲染都内聚在工具定义里，循环本身对工具一无所知。</li>
+<li><strong>会话是一棵树</strong> —— 转录不是扁平数组，而是可追加、可分支、可压缩的不可变条目树，<code>leaf</code> 标记当前位置。</li>
+<li><strong>核心与 Harness 二分</strong> —— 同一个包里既有纯净的最小循环，也有可选的持久化编排器；产品可以二选一。</li>
+<li><strong>项目信任取代逐工具审批</strong> —— 不在每个工具调用前弹窗，而是问一次"你信任这个项目里的资源吗"，把隔离交给容器。</li>
+<li><strong>渲染即字符串差分</strong> —— 组件输出 <code>string[]</code>，渲染器只做逐行相等扫描 + 同步输出，没有虚拟 DOM。</li>
+<li><strong>扩展是类型化的</strong> —— 扩展性不靠运行时钩子字符串，而靠一个约 40 种事件、强类型的 <code>ExtensionAPI</code>。</li>
+</ol>
+
+<h2 id="conventions">代码引用约定</h2>
+
+<ul>
+<li>书中所有文件路径均<strong>相对于 <code>pi-agent-src/</code> 目录</strong>（即 Pi Agent 仓库的根）。例如 <code>packages/agent/src/agent-loop.ts</code> 指 <code>pi-agent-src/packages/agent/src/agent-loop.ts</code>。</li>
+<li>代码片段为便于讲解可能省略了部分类型标注或分支，但函数名、类型名、字段名与文件位置均与源码一致，可直接检索核对。</li>
+<li>分析基于的版本为 monorepo 各包 <code>v0.83.0</code>。</li>
+</ul>
+
+<h2 id="audience">适用人群</h2>
+
+<ul>
+<li><strong>构建 Agentic 系统的工程师</strong> —— 想看看"最小化"路线如何落地，借鉴可迁移的模式。</li>
+<li><strong>评估架构的技术负责人</strong> —— 在"综合体"与"最小化核心 + 扩展"两条路线之间做权衡。</li>
+<li><strong>对生产级 AI 工具底层运作感兴趣的任何人</strong> —— 尤其是想理解一个开源 Agent 如何组织其代码与边界。</li>
+</ul>
+
+<h2 id="disclaimer">免责声明</h2>
+
+<p>本书为独立的技术分析，纯属教育目的。Pi Agent 是其各自维护者的产品，本书与其无关，未获背书或赞助。书中观点为作者基于源码的解读，如有错漏，以源码为准。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("packages", function (d) {
+  d.stack({
+    x: 60, y: 20, w: 760, gap: 16,
+    layers: [
+      { label: "产品层 · packages/coding-agent", sub: "pi 命令本体", tone: "gold", perRow: 3,
+        items: ["AgentSession 编排", "内置工具与扩展", "三种运行模式", "系统提示词与资源", "项目信任", "启动与 CLI"] },
+      { label: "运行时层 · packages/agent + packages/tui", sub: "核心循环 / 差分渲染", tone: "teal", perRow: 3,
+        items: ["agent-loop 两层循环", "工具执行内核", "可选的 Harness 持久化"] },
+      { label: "基础层 · packages/ai", sub: "统一 LLM API", tone: "accent", perRow: 3,
+        items: ["Api / Provider 二层抽象", "流式事件流", "模型元数据与重试"] },
+      { label: "持久化与连接", sub: "storage · protocol · client · server", tone: "violet", perRow: 4,
+        items: ["SQLite 会话存储 + FTS", "CBOR 远程协议", "传输无关客户端", "守护进程 / 监督器"] },
+      { label: "质量 · packages/evals", sub: "行为评估", tone: "slate", perRow: 3,
+        items: ["模型驱动的端到端评估"] }
+    ]
+  });
+});
+
+PB.fig("golden", function (d) {
+  d.sequence({
+    x: 30, y: 16, w: 860, rowH: 38, tailPad: 8,
+    participants: [
+      { id: "U", label: "用户 / TUI", tone: "accent" },
+      { id: "IM", label: "InteractiveMode", tone: "slate" },
+      { id: "AS", label: "AgentSession", tone: "teal" },
+      { id: "A", label: "Agent (runLoop)", tone: "gold" },
+      { id: "AI", label: "pi-ai", tone: "violet" },
+      { id: "T", label: "工具系统", tone: "slate" }
+    ],
+    steps: [
+      { from: "U", to: "IM", label: "输入提示词，回车" },
+      { from: "IM", to: "AS", label: "prompt(text)" },
+      { from: "AS", to: "AS", kind: "self", label: "展开 skill / 模板，检查是否需压缩" },
+      { from: "AS", to: "A", label: "agent.prompt(messages)" },
+      { from: "A", to: "A", kind: "self", label: "convertToLlm: AgentMessage[] → Message[]" },
+      { from: "A", to: "AI", label: "streamFn(model, context)" },
+      { from: "AI", to: "A", kind: "return", label: "流式 AssistantMessageEvent" },
+      { from: "A", to: "AS", kind: "return", label: "AgentEvent (message_update…)" },
+      { from: "AS", to: "IM", kind: "return", label: "转发事件" },
+      { from: "IM", to: "U", kind: "return", label: "增量渲染文本" },
+      { from: "A", to: "T", label: "执行工具 (read / edit / bash)" },
+      { from: "T", to: "A", kind: "return", label: "ToolResultMessage" },
+      { from: "A", to: "AI", label: "带工具结果再次流式请求" },
+      { from: "A", to: "AS", kind: "return", label: "agent_end" },
+      { from: "AS", to: "AS", kind: "self", label: "持久化到会话树 (JSONL)" },
+      { from: "IM", to: "U", kind: "return", label: "渲染最终结果" }
+    ]
+  });
+});
+</script>
+</body>
+</html>

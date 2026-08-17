@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 2 章 · 与模型对话：pi-ai 统一 LLM 层 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch02">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第一部分 · 基础</p>
+  <h1>第 2 章：与模型对话——pi-ai 统一 LLM 层</h1>
+  <p class="chapter-sub">如何让约 38 个 LLM 提供商看起来像一个：协议是少的，端点是多的</p>
+</header>
+
+<h2 id="hook">一个被低估的难题</h2>
+
+<p>表面上，"调用一个大模型"很简单：发一个 HTTP 请求，读一段流式响应。但当你需要同时支持 OpenAI、Anthropic、Google、AWS Bedrock、Google Vertex、OpenRouter、Groq、xAI、DeepSeek……约 38 个提供商时，简单的事就变得棘手。每个提供商都有自己的：</p>
+
+<ul>
+<li>请求格式（消息怎么表示、工具怎么声明、thinking 怎么开关）</li>
+<li>流式协议（SSE 事件名、增量结构、终止信号）</li>
+<li>认证方式（API key、OAuth、AWS 凭证、ADC 文件、环境变量）</li>
+<li>用量与计费口径（缓存读/写、reasoning token、分层定价）</li>
+<li>错误语义（哪些该重试、哪些是永久失败）</li>
+</ul>
+
+<p>如果为每个提供商写一套端到端适配，你会得到 38 份彼此微妙不同的代码，每新增一个厂商都是一次复制粘贴的灾难。<code>pi-ai</code>（<code>packages/ai</code>）的存在就是为了消灭这种重复。它的 <code>package.json</code> 自我描述是：</p>
+
+<blockquote>
+<p>Unified LLM API with automatic model discovery and provider configuration.</p>
+</blockquote>
+
+<p>本章拆解它如何做到这一点。核心是一个二分：<strong>协议是少的，端点是多的。</strong></p>
+
+<hr class="sep">
+
+<h2 id="duality">核心二分：<code>Api</code> 与 <code>Provider</code></h2>
+
+<p><code>pi-ai</code> 把"跟模型对话"拆成两个正交的概念。这是理解整个包的组织原则。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="api-provider" data-w="940" data-h="620"></canvas></div>
+  <figcaption>图 1：Api 与 Provider 的映射。左侧约 10 种线缆协议，右侧约 38 个 Provider 复用它们——箭头表示 Provider 绑定到它所说的协议方言。</figcaption>
+</figure>
+
+<p><strong><code>Api</code>（线缆协议）</strong> 回答"如何与<em>一族</em>服务器对话"。它实现于 <code>packages/ai/src/api/*.ts</code>，约 10 种：<code>openai-completions</code>、<code>openai-responses</code>、<code>openai-codex-responses</code>、<code>azure-openai-responses</code>、<code>anthropic-messages</code>、<code>bedrock-converse-stream</code>、<code>google-generative-ai</code>、<code>google-vertex</code>、<code>mistral-conversations</code>、<code>pi-messages</code>。</p>
+
+<p><strong><code>Provider</code>（配置好的端点）</strong> 回答"具体连到哪个服务"。它实现于 <code>packages/ai/src/providers/*.ts</code>，约 38 个。一个 Provider 携带 <code>id</code>、<code>baseUrl</code>、认证配置、一份模型目录，以及到一个或多个 <code>Api</code> 的绑定。</p>
+
+<p>关键的复用在于：<strong>许多 Provider 说同一种方言。</strong> OpenRouter、Groq、Together 都说 <code>openai-completions</code>/<code>openai-responses</code>。于是约 10 个协议适配器就统一了约 38 个厂商。新增一个"说 OpenAI 方言"的提供商，你几乎不用碰任何协议代码——只需要写一个工厂函数和一个模型目录。</p>
+
+<h3>统一的请求输入：<code>Context</code></h3>
+
+<p>无论哪个提供商，循环喂给 <code>pi-ai</code> 的都是同一个 <code>Context</code>（<code>packages/ai/src/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface Context {
+	systemPrompt?: string;
+	messages: Message[];
+	tools?: Tool[];
+}</pre>
+
+<p><code>Message</code> 是一个联合类型（<code>UserMessage | AssistantMessage | ToolResultMessage</code>），其内容块（content block）被规范化为 <code>TextContent</code>、<code>ThinkingContent</code>、<code>ImageContent</code>、<code>ToolCall</code> 几种。每个提供商的 <code>Api</code> 适配器负责把这个统一表示翻译成自己的线上格式——第 2 章后半部分会看到翻译的细节。</p>
+
+<h3>统一的输出：<code>AssistantMessage</code> 与 <code>Usage</code></h3>
+
+<p>每个提供商的响应都被折叠成同一个 <code>AssistantMessage</code>，它携带规范化的用量与成本（<code>packages/ai/src/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number; // 仅 Anthropic 报告 1h 缓存写入的细分
+	reasoning?: number; // reasoning/thinking token，是 output 的子集
+	totalTokens: number;
+	cost: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+}
+
+export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";</pre>
+
+<p>注意 <code>Usage</code> 把"缓存读/写""reasoning token""成本"都纳入了统一口径。这意味着上层（Agent 循环、产品 UI、evals）拿到的用量数字是跨提供商可比的——你不需要知道这次调用走的是 Anthropic 还是 Groq，就能正确显示 token 数和花费。<code>calculateCost(model, usage)</code>（<code>packages/ai/src/models.ts</code>）根据模型的费率（$/百万 token）和分层定价计算成本，并对 Anthropic 的 1h 缓存写入做了 2 倍计价的特判。</p>
+
+<p><code>StopReason</code> 的规范化同样关键。Anthropic 的 <code>end_turn</code>、OpenAI 的 <code>stop</code>、各家不同的"达到上限""触发工具"信号，都被映射到这六个值之一。回忆第 1 章：核心循环只检查 <code>stopReason === "error" | "aborted"</code> 来处理失败，检查 <code>toolUse</code> 来决定是否继续——它能这么简洁，正是因为 <code>pi-ai</code> 已经把各家方言翻译成了这套统一词汇。</p>
+
+<hr class="sep">
+
+<h2 id="factories"><code>Provider</code> 与 <code>Models</code>：两个工厂</h2>
+
+<h3><code>Provider</code> 接口</h3>
+
+<p>一个 Provider 的形状（<code>packages/ai/src/models.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/models.ts">export interface Provider&lt;TApi extends Api = Api&gt; {
+	readonly id: string;
+	readonly name: string;
+	readonly baseUrl?: string;
+	readonly headers?: ProviderHeaders;
+	readonly auth: ProviderAuth;
+	getModels(): readonly Model&lt;TApi&gt;[];
+	refreshModels?(context: RefreshModelsContext): Promise&lt;void&gt;;
+	filterModels?(models, credential): readonly Model&lt;TApi&gt;[];
+	stream&lt;T extends TApi&gt;(model, context, options?): AssistantMessageEventStream;
+	streamSimple(model, context, options?): AssistantMessageEventStream;
+}</pre>
+
+<p>Provider 由工厂函数 <code>createProvider(input)</code> 构建。这个工厂的核心职责是 <strong>API 分派</strong>：<code>api</code> 参数可以是单个 <code>ProviderStreams</code>，也可以是一个按 <code>model.api</code> 索引的映射（当一个提供商说多种方言时）；<code>apiFor(model)</code> 选出正确的实现，若某个模型的 <code>api</code> 没有对应条目，<code>dispatch(...)</code> 会产生一个流式错误。</p>
+
+<h3><code>ProviderStreams</code>：每个协议模块的統一形状</h3>
+
+<p>每个 <code>src/api/*.ts</code> 模块都满足同一个接口（<code>packages/ai/src/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface ProviderStreams {
+	stream(model: Model&lt;Api&gt;, context: Context, options?: StreamOptions): AssistantMessageEventStream;
+	streamSimple(model: Model&lt;Api&gt;, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+}</pre>
+
+<p><code>stream</code> 是全功能版（暴露提供商特有的选项），<code>streamSimple</code> 是精简版（Agent 循环用的就是它）。模块本身就是这个接口的实现——<code>anthropic-messages.ts</code> 导出 <code>stream</code> 和 <code>streamSimple</code> 两个函数，它们直接满足 <code>ProviderStreams</code>。这种"模块即接口"的约定让协议适配器可以被当作值传递、惰性包装。</p>
+
+<h3><code>Models</code>：提供商的集合</h3>
+
+<p><code>Models</code>（由 <code>createModels()</code> 构建，<code>packages/ai/src/models.ts</code>）持有一个 <code>Map</code> 的提供商集合，负责认证解析与分派。<code>Models.stream()</code> 查找拥有该模型的提供商，应用认证/请求头/环境变量，然后调用 <code>provider.stream(...)</code>。<code>complete()</code> 只是 <code>stream(...).result()</code> 的便捷封装。<code>builtinModels()</code>（<code>packages/ai/src/providers/all.ts</code>）注册所有内置提供商。</p>
+
+<hr class="sep">
+
+<h2 id="eventstream"><code>EventStream</code>：贯穿全栈的流原语</h2>
+
+<p><code>pi-ai</code> 的流式响应不是回调，也不是 RxJS 式的 Observable，而是一个极简的异步可迭代原语 <code>EventStream</code>（<code>packages/ai/src/utils/event-stream.ts</code>）。它是整个系统流式处理的基石，值得完整看一眼：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/event-stream.ts">export class EventStream&lt;T, R = T&gt; implements AsyncIterable&lt;T&gt; {
+	private queue: T[] = [];
+	private waiting: ((value: IteratorResult&lt;T&gt;) =&gt; void)[] = [];
+	private done = false;
+	private finalResultPromise: Promise&lt;R&gt;;
+	private resolveFinalResult!: (result: R) =&gt; void;
+	private isComplete: (event: T) =&gt; boolean;
+	private extractResult: (event: T) =&gt; R;
+
+	constructor(isComplete: (event: T) =&gt; boolean, extractResult: (event: T) =&gt; R) {
+		this.isComplete = isComplete;
+		this.extractResult = extractResult;
+		this.finalResultPromise = new Promise((resolve) =&gt; {
+			this.resolveFinalResult = resolve;
+		});
+	}
+
+	push(event: T): void {
+		if (this.done) return;
+		if (this.isComplete(event)) {
+			this.done = true;
+			this.resolveFinalResult(this.extractResult(event));
+		}
+		const waiter = this.waiting.shift();
+		if (waiter) waiter({ value: event, done: false });
+		else this.queue.push(event);
+	}
+
+	async *[Symbol.asyncIterator](): AsyncIterator&lt;T&gt; {
+		while (true) {
+			if (this.queue.length &gt; 0) yield this.queue.shift()!;
+			else if (this.done) return;
+			else {
+				const result = await new Promise&lt;IteratorResult&lt;T&gt;&gt;((resolve) =&gt; this.waiting.push(resolve));
+				if (result.done) return;
+				yield result.value;
+			}
+		}
+	}
+
+	result(): Promise&lt;R&gt; {
+		return this.finalResultPromise;
+	}
+}</pre>
+
+<p>这个类只做一件事：把"生产者推事件"和"消费者拉事件"解耦。它内部是一个队列加一个等待者列表——如果消费者正在等，<code>push</code> 直接交付；否则入队。它同时提供两种消费方式：</p>
+
+<ul>
+<li><code>for await (const event of stream)</code> —— 逐个处理增量事件（TUI 增量渲染用这个）</li>
+<li><code>await stream.result()</code> —— 直接拿最终结果（<code>complete()</code> 和循环的最终消息用这个）</li>
+</ul>
+
+<p><code>AssistantMessageEventStream</code> 是它的特化：完成条件是事件类型为 <code>done</code> 或 <code>error</code>，结果提取器从 <code>done</code> 取出 <code>AssistantMessage</code>、从 <code>error</code> 取出携带错误的 <code>AssistantMessage</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/event-stream.ts">export class AssistantMessageEventStream extends EventStream&lt;AssistantMessageEvent, AssistantMessage&gt; {
+	constructor() {
+		super(
+			(event) =&gt; event.type === "done" || event.type === "error",
+			(event) =&gt; {
+				if (event.type === "done") return event.message;
+				else if (event.type === "error") return event.error;
+				throw new Error("Unexpected event type for final result");
+			},
+		);
+	}
+}</pre>
+
+<p>这里藏着第 1 章提到的"失败编码进流"约定的实现细节：<code>error</code> 事件不是异常，而是流的一个合法终止事件，它的 payload 就是一个 <code>stopReason: "error"</code> 的 <code>AssistantMessage</code>。<code>result()</code> 在出错时依然正常 resolve（resolve 成那个错误消息），而不是 reject。这就是为什么上层永远不需要 <code>try/catch</code> 模型调用。</p>
+
+<p>事件协议本身是一个可辨识联合 <code>AssistantMessageEvent</code>：<code>start</code>、<code>text_start/delta/end</code>、<code>thinking_start/delta/end</code>、<code>toolcall_start/delta/end</code>、<code>done</code>、<code>error</code>。每个提供商的适配器把自己原生的流式事件翻译成这套统一的事件词汇。</p>
+
+<hr class="sep">
+
+<h2 id="streaming">流式解析：手写 SSE 与 SDK 迭代器</h2>
+
+<p>把统一的事件协议确立之后，每个 <code>Api</code> 适配器要做的就是把提供商的原生流翻译成它。这里有两种风格，对比起来很有意思。</p>
+
+<h3>手写 SSE：Anthropic</h3>
+
+<p>Anthropic 适配器（<code>packages/ai/src/api/anthropic-messages.ts</code>）是手撕 SSE 的典范。它不依赖 SDK 的流式封装，而是直接拿到原始 <code>Response</code> 的 <code>ReadableStream</code>，自己解析 server-sent events：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/anthropic-messages.ts">async function* iterateSseMessages(
+	body: ReadableStream&lt;Uint8Array&gt;,
+	signal?: AbortSignal,
+): AsyncGenerator&lt;ServerSentEvent&gt;
+
+function decodeSseLine(line: string, state: SseDecoderState): ServerSentEvent | null
+
+async function* iterateAnthropicEvents(
+	response: Response,
+	signal?: AbortSignal,
+): AsyncGenerator&lt;RawMessageStreamEvent&gt;</pre>
+
+<p><code>iterateSseMessages</code> 用 <code>body.getReader()</code> 读块，用 <code>TextDecoder({ stream: true })</code> 解码（正确处理跨块的多字节字符），按行切分（<code>consumeLine</code>/<code>nextLineBreakIndex</code> 处理 <code>\r</code>、<code>\n</code>、<code>\r\n</code> 三种换行），重组出 SSE 的 <code>event:</code>/<code>data:</code> 帧。<code>iterateAnthropicEvents</code> 过滤出 Anthropic 的事件类型，用 <code>parseJsonWithRepair</code> 解析每个 <code>data</code>，遇到 <code>event: error</code> 抛错，并校验 <code>message_start</code> 必有配对的 <code>message_stop</code>。</p>
+
+<p>然后主 <code>stream</code> 函数把这些原始事件折叠进统一的 <code>AssistantMessage</code>：<code>message_start</code> 种下 <code>usage</code>；<code>content_block_start/delta/stop</code> 构建 <code>text</code>/<code>thinking</code>/<code>toolCall</code> 块（工具参数作为 <code>partialJson</code> 累积，用 <code>parseStreamingJson</code> 增量解析）；<code>message_delta</code> 更新 <code>stopReason</code>（经 <code>mapStopReason</code>）和最终用量。</p>
+
+<p>值得注意的是，请求本身仍走官方 SDK，但被强制返回原始 <code>Response</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/anthropic-messages.ts">client.messages.create({ ...params, stream: true }, { maxRetries: 0 }).asResponse()</pre>
+
+<p><code>maxRetries: 0</code> 是故意的——重试由 <code>pi-ai</code> 自己的 <code>retryProviderRequest(...)</code> 统一接管（见后文），因为官方 SDK 的重试不响应 <code>AbortSignal</code>。</p>
+
+<h3>SDK 迭代器：OpenAI 家族</h3>
+
+<p>OpenAI 家族的适配器（<code>packages/ai/src/api/openai-completions.ts</code>）走了另一条路——直接用官方 SDK 的异步迭代器：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/openai-completions.ts">const response = await retryProviderRequest(
+	() =&gt; client.chat.completions.create(params, requestOptions).withResponse(),
+	...,
+);
+// ...
+for await (const chunk of openaiStream) {
+	// 把每个 chunk 翻译成统一的 AssistantMessageEvent
+}</pre>
+
+<p>Google、Mistral、Bedrock、OpenAI Responses 都遵循同样的模块模式（<code>stream</code> + <code>streamSimple</code>），各自把原生事件映射到共享的 <code>AssistantMessageEvent</code> 协议。</p>
+
+<p>两种风格各有取舍：手写 SSE 给你完全的控制（比如增量 JSON 修复、精确的终止校验），但要自己处理协议细节；SDK 迭代器省事，但你被 SDK 的行为约束。<code>pi-ai</code> 允许每个协议按自身情况选择——这本身就是一种务实的最小化：不强制统一实现手段，只统一对外契约。</p>
+
+<h3>惰性加载：把重 SDK 挡在启动之外</h3>
+
+<p>每个 <code>src/api/*.ts</code> 都有一个配套的 <code>*.lazy.ts</code>。<code>lazyApi(load)</code>（<code>packages/ai/src/api/lazy.ts</code>）把一个动态 <code>import()</code> 的协议模块包装成 <code>ProviderStreams</code>，让沉重的 SDK（比如 <code>@anthropic-ai/sdk</code>）只在第一次真正用到时才加载：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/lazy.ts">export function lazyApi(load: () =&gt; Promise&lt;ProviderStreams&gt;): ProviderStreams</pre>
+
+<p><code>lazyStream(model, setup)</code> 则同步返回一个 <code>AssistantMessageEventStream</code>，同时在它背后异步执行 setup（认证、动态 import），通过 <code>forwardStream</code> 转发内部事件，并把 setup 失败转换成一个 <code>error</code> 事件。这又一次体现了"失败编码进流"——连"加载协议模块失败"都不是异常，而是一个流事件。</p>
+
+<p>惰性加载对启动速度至关重要。<code>pi</code> 命令启动时不需要加载全部 10 个协议的 SDK，只需要加载你实际使用的那一个。第 8 章会看到启动流水线如何受益于这种设计。</p>
+
+<hr class="sep">
+
+<h2 id="new-provider">新增一个提供商：三个文件</h2>
+
+<p>抽象好不好，看新增一个提供商要写多少代码。答案是：一个工厂文件 + 一个模型目录文件 + 在注册表里加一行。</p>
+
+<p><strong>工厂</strong>（<code>packages/ai/src/providers/anthropic.ts</code> 是最小模板）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/providers/anthropic.ts">export function anthropicProvider(): Provider&lt;"anthropic-messages"&gt; {
+	return createProvider({
+		id: "anthropic",
+		name: "Anthropic",
+		baseUrl: "https://api.anthropic.com",
+		auth: {
+			apiKey: anthropicApiKeyAuth(),
+			oauth: lazyOAuth({ name: "Anthropic (Claude Pro/Max)", load: loadAnthropicOAuth }),
+		},
+		models: Object.values(ANTHROPIC_MODELS),
+		api: anthropicMessagesApi(), // 来自 ../api/anthropic-messages.lazy.ts
+	});
+}</pre>
+
+<p><code>auth.apiKey.resolve()</code> 回调是把环境变量/凭证翻译成 <code>{ apiKey }</code> 或 <code>{ headers }</code> 的地方。说多种方言的提供商则传一个按 <code>model.api</code> 索引的 <code>api</code> 映射。</p>
+
+<p><strong>模型目录</strong>（<code>packages/ai/src/providers/anthropic.models.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/providers/anthropic.models.ts">import values from "./data/anthropic.json" with { type: "json" };
+import { flattenModelCatalog, type ModelCatalog } from "../model-catalog.ts";
+
+export const ANTHROPIC_MODELS: ModelCatalog&lt;typeof values, "anthropic"&gt; =
+	flattenModelCatalog("anthropic", values);</pre>
+
+<p><code>flattenModelCatalog</code>（<code>packages/ai/src/model-catalog.ts</code>）把按 API 分组的 JSON 合并成一个扁平的 <code>{ [modelId]: Model }</code> 映射，并保留强类型。</p>
+
+<p><strong>注册</strong>（<code>packages/ai/src/providers/all.ts</code>）：<code>builtinProviders()</code> 实例化工厂，<code>builtinModels()</code> 注册进 <code>Models</code>。</p>
+
+<p>这就是全部。如果你要加的提供商说已有的方言（比如又一个 OpenAI 兼容服务），你甚至不用写任何协议代码。</p>
+
+<hr class="sep">
+
+<h2 id="models-dev">模型元数据：从 models.dev 生成</h2>
+
+<p>每个模型的元数据（context window、max tokens、价格、reasoning 能力、输入模态）不是手写的，而是<strong>生成</strong>的。<code>packages/ai/src/models.generated.ts</code> 文件头写着：</p>
+
+<blockquote>
+<p>Do not edit manually - run 'npm run generate-models'.</p>
+</blockquote>
+
+<p>生成器 <code>packages/ai/scripts/generate-models.ts</code> 的主数据源是 <a href="https://models.dev">models.dev</a> 的 API：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/scripts/generate-models.ts">await fetch("https://models.dev/api.json")</pre>
+
+<p>它还会补充查询活的提供商端点（NVIDIA、OpenRouter、AI-Gateway 的 models 接口），把 <code>ModelsDevModel</code>（成本、限制、模态、<code>reasoning_options</code>）映射成内部的 <code>Model</code> 形状，应用大量逐提供商的人工修正（源码里大段注释记录了 models.dev 数据与实际不符的地方），最后写出每个提供商的 <code>data/&lt;id&gt;.json</code> 和总的 <code>models.generated.ts</code>。</p>
+
+<p><code>Model</code> 记录（<code>packages/ai/src/types.ts</code>）是统一的模型元数据：<code>id, name, api, provider, baseUrl, reasoning, thinkingLevelMap?, input: ("text"|"image")[], cost: ModelCost, contextWindow, maxTokens, headers?, compat?</code>。其中 <code>compat</code> 字段是一个条件类型，按 <code>api</code> 选出 <code>OpenAICompletionsCompat</code> / <code>AnthropicMessagesCompat</code> / <code>BedrockCompat</code> 等——这些标志位是单个 <code>Api</code> 适配器吸收厂商怪癖的地方（比如 <code>thinkingFormat</code>、<code>supportsStrictMode</code>、<code>cacheControlFormat</code>）。</p>
+
+<p>这套机制的价值在于：模型目录是<strong>数据</strong>，不是代码。当某个提供商发布了新模型或调整了价格，更新来自数据刷新，而不是改代码、过 review、发版。<code>AGENTS.md</code> 甚至专门规定：永远不要手改 <code>models.generated.ts</code>，要改 <code>generate-models.ts</code> 然后重新生成。</p>
+
+<hr class="sep">
+
+<h2 id="tool-normalization">工具调用的跨提供商规范化</h2>
+
+<p>工具是 Agent 的核心，而每个提供商声明工具、返回工具调用的格式都不同。<code>pi-ai</code> 在两个方向上做规范化。</p>
+
+<p><strong>统一的工具输入</strong>是 <code>Tool { name; description; parameters: TSchema; constrainedSampling? }</code>（TypeBox schema），统一的工具调用是 <code>ToolCall</code>，结果是 <code>ToolResultMessage</code>。每个 <code>Api</code> 适配器双向转换：</p>
+
+<ul>
+<li><strong>Anthropic</strong>：<code>convertTools(...)</code> 构建 <code>input_schema</code>（<code>{ type: "object", properties, required }</code>），按 compat 标志加上 <code>strict</code>/<code>eager_input_streaming</code>/<code>cache_control</code>；<code>convertMessages(...)</code> 处理 thinking 块、<code>tool_use</code>，并把连续的 <code>toolResult</code> 合并进一个带 <code>tool_result</code> 块的 <code>user</code> 轮次；<code>normalizeToolCallId(id)</code> 把 id 清洗成 Anthropic 允许的字符集（<code>id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64)</code>）。</li>
+<li><strong>OpenAI</strong>：<code>convertTools(...)</code> 输出 <code>{ type: "function", function: {...} }</code>；<code>convertMessages(...)</code> 处理 OpenAI 的消息/工具调用/工具结果形状。</li>
+</ul>
+
+<p><strong>共享的规范化</strong>在 <code>packages/ai/src/api/transform-messages.ts</code>：<code>transformMessages(messages, model, normalizeToolCallId)</code> 在提供商特定转换之前调用，包含 <code>downgradeUnsupportedImages</code>（当模型 <code>input</code> 不含 <code>"image"</code> 时把图片替换成占位文本）和工具调用 id 规范化。<code>constrained-sampling.ts</code> 把统一的 <code>constrainedSampling</code> 配置映射到提供商的 <code>strict</code>/grammar 行为。</p>
+
+<p>一个有趣的细节：Anthropic 适配器里有 <code>toClaudeCodeName</code>/<code>fromClaudeCodeName</code>，在使用 OAuth token 时把工具名重映射成 Claude Code 的规范大小写。这是为了兼容 Anthropic 服务端对特定工具名的预期——一个真实的、来自生产环境的怪癖。</p>
+
+<hr class="sep">
+
+<h2 id="retries">错误处理：两层重试</h2>
+
+<p><code>pi-ai</code> 的重试分两层，各管一段。</p>
+
+<p><strong>第一层：传输/SDK 重试</strong>（<code>packages/ai/src/utils/provider-retry.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/provider-retry.ts">export async function retryProviderRequest&lt;T&gt;(
+	request: () =&gt; Promise&lt;T&gt;,
+	options: ProviderRetryOptions = {},
+): Promise&lt;T&gt;</pre>
+
+<p>它复刻了 OpenAI/Anthropic SDK 的退避逻辑，但让 sleep 可被 <code>AbortSignal</code> 中断（官方 SDK 会忽略 signal，所以适配器都用 <code>maxRetries: 0</code> 调用 SDK，再包这一层）。<code>isRetryableProviderError</code> 尊重 <code>x-should-retry</code> 头，重试 408/409/429/5xx；<code>getRetryDelayMs</code> 先读 <code>retry-after-ms</code>/<code>retry-after</code>，再退回到带抖动的指数退避；超过 <code>maxRetryDelayMs</code>（默认 60s）的延迟直接快速失败。</p>
+
+<p><strong>第二层：助手级重试</strong>（<code>packages/ai/src/utils/retry.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/retry.ts">export async function retryAssistantCall(
+	produce: () =&gt; Promise&lt;AssistantMessage&gt;,
+	policy: RetryPolicy | undefined,
+	signal: AbortSignal | undefined,
+	callbacks?: RetryCallbacks,
+): Promise&lt;AssistantMessage&gt;
+
+export function isRetryableAssistantError(message: AssistantMessage): boolean</pre>
+
+<p>这一层工作在 <code>AssistantMessage</code> 层面。<code>isRetryableAssistantError</code> 用两组正则分类：<code>RETRYABLE_PROVIDER_ERROR_PATTERN</code>（overloaded、限流、429/5xx、网络/socket/超时、流提前结束、gRPC <code>ResourceExhausted</code> 等）减去 <code>NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN</code>（配额/账单/预算耗尽，如 <code>insufficient_quota</code>）。这个减法很关键：配额耗尽不该重试（重试只会白白浪费时间），而临时过载应该重试。</p>
+
+<p>两层重试的分工：传输层管"HTTP 请求本身失败了"，助手层管"请求成功了但模型返回了一个表示临时问题的响应"。而所有最终没能恢复的失败，都按契约编码进流的 <code>error</code> 事件——上层永远只看到一个 <code>stopReason: "error"</code> 的消息。</p>
+
+<h3>token 估算</h3>
+
+<p><code>packages/ai/src/utils/estimate.ts</code> 提供启发式 token 估算（<code>CHARS_PER_TOKEN = 4</code>，<code>ESTIMATED_IMAGE_CHARS = 4800</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/estimate.ts">export function estimateContextTokens(context: Context | readonly Message[]): ContextUsageEstimate</pre>
+
+<p>它的聪明之处在于：优先以最近一次助手响应里 API 报告的权威 <code>usage</code> 作为锚点，只估算锚点之后新增的消息（<code>getLastAssistantUsageInfo</code>）。这样估算误差被限制在"最近一轮新增的内容"，而不是累积整个对话。真实的 token 数来自提供商 <code>usage</code>，估算只在没有权威数字时兜底。第 7 章的上下文压缩会大量使用这个函数。</p>
+
+<hr class="sep">
+
+<h2 id="entry">公共入口的克制</h2>
+
+<p><code>pi-ai</code> 的主入口 <code>packages/ai/src/index.ts</code> 刻意保持最小、无副作用——它只重新导出类型和核心辅助函数，<strong>不</strong>导出提供商工厂和生成的模型目录。那些东西藏在子路径导出后面：<code>@earendil-works/pi-ai/providers/*</code>、<code>/api/*</code>、<code>/compat</code>。</p>
+
+<p>这意味着仅仅 <code>import { ... } from "@earendil-works/pi-ai"</code> 不会触发任何提供商 SDK 的加载。结合惰性加载，<code>pi-ai</code> 把"按需付费"贯彻到了模块系统层面：你用到什么，才加载什么。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p><code>pi-ai</code> 为"如何统一多个外部服务"提供了四条可迁移的模式，这些模式适用于任何需要适配多个第三方 API 的系统。</p>
+
+<p><strong>分离"协议"与"端点"。</strong> 识别出你的服务商共享的少数几种"方言"（协议），为每种方言写一个适配器；把每个具体服务商建模为"端点 = 配置 + 协议绑定"。它解决的问题是：N 个服务商 × M 种能力 = N×M 份适配代码。当协议是少的、端点是多的，适配代码量从乘法降成加法。</p>
+
+<p><strong>统一用量与终止词汇。</strong> 把各家不同的 token 口径、缓存语义、停止原因，规范化成一套统一的 <code>Usage</code> 和 <code>StopReason</code>。它解决的问题是：上层逻辑被迫了解每个提供商的怪癖。当 <code>StopReason</code> 只有六个值，循环的停止判断就能退化成一次字段比较。</p>
+
+<p><strong>失败是数据，不是异常。</strong> 用 <code>EventStream</code> 把错误编码成流的一个终止事件，让 <code>result()</code> 在出错时也正常 resolve。它解决的问题是：异步流式管道里 <code>try/catch</code> 散落、消费者不知道何时断开。当失败是 payload，错误处理就统一成了"检查终止事件的类型"。</p>
+
+<p><strong>目录是数据，不是代码。</strong> 把频繁变动、来自外部的信息（模型列表、价格）做成生成物，从权威数据源刷新，而不是手写进代码。它解决的问题是：外部世界的变化被迫走代码发布流程。当模型目录是 <code>generate-models.ts</code> 的产物，更新价格就是一次数据刷新，而非一次代码评审。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p><code>pi-ai</code> 是整个系统的地基，它回答了一个问题：如何让约 38 个 LLM 提供商看起来像一个？答案是引入 <code>Api</code>/<code>Provider</code> 二层抽象——约 10 个协议适配器统一了说几种方言的约 38 个端点。统一的 <code>Context</code> 进，统一的 <code>AssistantMessage</code>（带规范化 <code>Usage</code> 和 <code>StopReason</code>）出，中间用 <code>EventStream</code> 这个异步可迭代原语承载流式与失败。</p>
+
+<p>它还示范了一种克制的工程品味：惰性加载把重 SDK 挡在启动之外，模型目录是生成物而非手写代码，重试分两层各管一段，公共入口不引入任何副作用。这些选择共同服务一个目标——让上层（Agent 循环）面对一个简单、统一、永不抛出的模型接口。</p>
+
+<p>下一章，我们站上这个地基，看 Agent 循环如何消费 <code>StreamFn</code>、发出 <code>AgentEvent</code>、执行工具，并决定何时停止。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("api-provider", function (d) {
+  d.group({ x: 40, y: 70, w: 340, h: 530, label: "Api（线缆协议，约 10 种）", tone: "accent", fill: d.theme.panel });
+  d.group({ x: 480, y: 70, w: 420, h: 530, label: "Provider（配置好的端点，约 38 个）", tone: "gold", fill: d.theme.panel });
+
+  d.box({ id: "A1", x: 60, y: 115, w: 300, h: 50, title: "openai-completions", tone: "accent", titleSize: 13 });
+  d.box({ id: "A2", x: 60, y: 185, w: 300, h: 50, title: "openai-responses", tone: "accent", titleSize: 13 });
+  d.box({ id: "A3", x: 60, y: 255, w: 300, h: 50, title: "anthropic-messages", tone: "accent", titleSize: 13 });
+  d.box({ id: "A4", x: 60, y: 325, w: 300, h: 50, title: "google-generative-ai", tone: "accent", titleSize: 13 });
+  d.box({ id: "A5", x: 60, y: 395, w: 300, h: 50, title: "bedrock-converse-stream", tone: "accent", titleSize: 13 });
+  d.box({ id: "A6", x: 60, y: 465, w: 300, h: 50, title: "mistral-conversations", tone: "accent", titleSize: 13 });
+  d.box({ id: "A7", x: 60, y: 535, w: 300, h: 50, title: "...", tone: "accent", titleSize: 13 });
+
+  d.box({ id: "P1", x: 500, y: 115, w: 380, h: 50, title: "openai", tone: "gold", titleSize: 13 });
+  d.box({ id: "P2", x: 500, y: 185, w: 380, h: 50, title: "openrouter", tone: "gold", titleSize: 13 });
+  d.box({ id: "P3", x: 500, y: 255, w: 380, h: 50, title: "groq", tone: "gold", titleSize: 13 });
+  d.box({ id: "P4", x: 500, y: 325, w: 380, h: 50, title: "together", tone: "gold", titleSize: 13 });
+  d.box({ id: "P5", x: 500, y: 395, w: 380, h: 50, title: "xai", tone: "gold", titleSize: 13 });
+  d.box({ id: "P6", x: 500, y: 465, w: 380, h: 50, title: "anthropic", tone: "gold", titleSize: 13 });
+  d.box({ id: "P7", x: 500, y: 535, w: 380, h: 50, title: "...", tone: "gold", titleSize: 13 });
+
+  d.arrow("P1", "A1", { from: "left", to: "right" });
+  d.arrow("P1", [360, 204], { from: "left", to: "center" });
+  d.arrow("P2", [360, 124], { from: "left", to: "center" });
+  d.arrow("P3", [360, 148], { from: "left", to: "center" });
+  d.arrow("P4", [360, 156], { from: "left", to: "center" });
+  d.arrow("P5", [360, 216], { from: "left", to: "center" });
+  d.arrow("P6", "A3", { from: "left", to: "right" });
+});
+</script>
+</body>
+</html>

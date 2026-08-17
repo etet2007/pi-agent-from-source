@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 11 章 · 三种运行模式 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch11">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第四部分 · 编码 Agent 产品</p>
+  <h1>第 11 章：三种运行模式</h1>
+  <p class="chapter-sub">同一套 Agent 实现的三种投影：交互式 TUI、headless print 与 RPC，各自消费同一条 AgentSessionEvent 流</p>
+</header>
+
+<h2 id="hook">同一条流，三种呈现</h2>
+
+<p>第 8 章我们看到，<code>resolveAppMode</code> 把 <code>pi</code> 命令分流成三种模式：交互式 TUI、headless print、RPC。第 9 章我们看到，三种模式共享同一个 <code>AgentSession</code>，订阅同一条 <code>AgentSessionEvent</code> 流。</p>
+
+<p>本章的主题是这条分流的终点：三种模式各自如何消费那条事件流。它们的核心逻辑几乎完全相同——都是"订阅事件、驱动 <code>prompt()</code>、处理结果"——但呈现方式截然不同：一个渲染成彩色终端界面给人看，一个输出纯文本或 JSON 给脚本用，一个序列化成 JSON-RPC 给 IDE 和守护进程用。</p>
+
+<p>这是"事件流即契约"设计的 payoff。因为 <code>AgentSession</code> 把所有进展都表达成事件，新增一种"消费方式"就不需要碰任何 Agent 逻辑——只需要写一个新的事件订阅者。Pi Agent 的三种模式，就是这个原则的三次实例化。</p>
+
+<hr class="sep">
+
+<h2 id="base">共享的底座</h2>
+
+<p>三种模式都从同一个起点开始：<code>AgentSessionRuntime</code>（第 8 章的 runtime 宿主）。它持有一个 <code>AgentSession</code>，并支持重建（reload、切换会话）。模式拿到 runtime，从中取出 <code>AgentSession</code>，然后：</p>
+
+<ol>
+<li>订阅 <code>session.subscribe(listener)</code>——listener 收到 <code>AgentSessionEvent</code></li>
+<li>驱动 <code>session.prompt(text)</code>（或 steer/followUp）</li>
+<li>在 listener 里处理事件——这是三种模式唯一的分歧点</li>
+</ol>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="modes" data-w="880" data-h="560"></canvas></div>
+  <figcaption>图 1：同一条 AgentSessionEvent 流的三种消费方式——渲染成 TUI 给人、写成 stdout 给脚本、序列化成 JSON-RPC 给 IDE 与守护进程。</figcaption>
+</figure>
+
+<p>让我们逐个看。</p>
+
+<hr class="sep">
+
+<h2 id="interactive">交互式模式：<code>InteractiveMode</code></h2>
+
+<p>交互式模式是给人用的完整 TUI REPL，实现在 <code>packages/coding-agent/src/modes/interactive/interactive-mode.ts</code>（约 6,100 行，是产品层最大的文件）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/interactive/interactive-mode.ts">export function createInteractiveTui(options: InteractiveTuiOptions): TUI { ... } // :339
+
+export class InteractiveMode {
+	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {})
+	async init(): Promise&lt;void&gt;;
+	async run(): Promise&lt;void&gt;;          // :886 REPL 主循环
+	renderInitialMessages(): void;
+	async getUserInput(): Promise&lt;string&gt;; // :3575
+	stop(): void;
+	private async handleEvent(event: AgentSessionEvent): Promise&lt;void&gt;; // :2910
+	// 大量斜杠命令处理器：handleModelCommand, handleCompactCommand, ...
+}</pre>
+
+<p><code>run()</code> 是 REPL 主循环，它的形状大致是：</p>
+
+<pre class="code" data-lang="text">订阅 session 事件 → handleEvent
+渲染初始消息（续接的会话）
+while (true) {
+	const input = await getUserInput()   // 等用户输入
+	if (是斜杠命令) 处理命令
+	else session.prompt(input)           // 驱动对话
+	await session.waitForIdle()          // 等这一轮结束
+}</pre>
+
+<p>关键是 <code>handleEvent</code>（<code>:2910</code>）——它把每个 <code>AgentSessionEvent</code> 翻译成 TUI 组件。这是交互式模式的核心工作：</p>
+
+<ul>
+<li><code>message_start</code>/<code>message_update</code>（助手消息）→ 增量渲染助手文本（Markdown 高亮）</li>
+<li><code>tool_execution_start</code>/<code>update</code>/<code>end</code> → 渲染工具调用（用第 4 章工具的 <code>renderCall</code>/<code>renderResult</code>，比如 edit 的彩色 diff）</li>
+<li><code>compaction_start</code>/<code>end</code> → 显示压缩进度</li>
+<li><code>auto_retry_start</code> → 显示"重试中"</li>
+<li><code>queue_update</code> → 显示排队的消息</li>
+<li><code>thinking_level_changed</code>/模型变更 → 更新 footer</li>
+</ul>
+
+<p><code>createInteractiveTui</code> 构建底层的 <code>pi-tui</code> <code>TUI</code>（第 12 章），<code>InteractiveMode</code> 往里面添加约 45 个组件（<code>src/modes/interactive/components/</code>）：<code>assistant-message</code>、<code>tool-execution</code>、<code>bash-execution</code>、<code>diff</code>、<code>footer</code>、<code>model-selector</code>、<code>session-selector</code>、<code>trust-selector</code>、<code>compaction-summary-message</code> 等。</p>
+
+<p>斜杠命令在这里处理。<code>getUserInput</code> 拿到输入后，如果是 <code>/model</code>、<code>/compact</code>、<code>/export</code> 等命令，调对应的 <code>handleXxxCommand</code>；否则交给 <code>session.prompt()</code>（第 9 章的漏斗会进一步处理扩展命令、skill、模板）。</p>
+
+<p>交互式模式还管理大量交互细节：Ctrl+P 循环模型（<code>session.cycleModel</code>）、Ctrl+C 中止（<code>session.abort()</code>）、图片粘贴、外部编辑器（<code>external-editor.ts</code>）、模型搜索（<code>model-search.ts</code>）、主题（<code>theme/</code>）。这些都是"给人用"才需要的——它们构成了产品的大部分代码，但没有一行触及核心 Agent 逻辑。</p>
+
+<hr class="sep">
+
+<h2 id="print">print 模式：<code>runPrintMode</code></h2>
+
+<p>print 模式是 headless 的，给脚本和管道用。实现在 <code>packages/coding-agent/src/modes/print-mode.ts</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/print-mode.ts">export interface PrintModeOptions {
+	/** Output mode: "text" for final response only, "json" for all events */
+	mode: "text" | "json";
+	messages: string[];
+	initialMessage?;
+	initialImages?;
+}
+export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise&lt;number&gt;</pre>
+
+<p>它返回一个 exit code（<code>Promise&lt;number&gt;</code>）——这是给 shell 用的，<code>pi -p "..." &amp;&amp; echo success</code> 依赖它。</p>
+
+<p>两种输出模式：</p>
+
+<ul>
+<li><strong><code>text</code></strong>：跑完对话，只输出最终的助手文本（用 <code>session.getLastAssistantText()</code>）。这是 <code>pi -p "fix the bug"</code> 的默认行为——干净地输出结果，适合 <code>$(pi -p "...")</code> 这样的命令替换。</li>
+<li><strong><code>json</code></strong>：把<strong>所有</strong> <code>AgentSessionEvent</code> 流式输出为 JSON 行（JSON Lines）。这是 <code>--mode json</code> 的行为——每个事件一行 JSON，机器可以实时解析整个对话过程。</li>
+</ul>
+
+<p><code>json</code> 模式特别有用：它把交互式模式里"渲染成画面"的事件流，原样序列化成结构化数据。外部程序可以实时跟踪工具调用、token 用量、压缩事件，而不需要解析终端 ANSI 序列。</p>
+
+<p>print 模式的事件消费比交互式简单得多——它订阅事件，<code>text</code> 模式下只关心最终的助手消息，<code>json</code> 模式下把每个事件 <code>JSON.stringify</code> 后写到 stdout。没有 TUI，没有组件，没有快捷键。它证明了事件流的另一个好处：<strong>消费者可以只关心自己需要的事件</strong>，忽略其余。</p>
+
+<hr class="sep">
+
+<h2 id="rpc">RPC 模式：<code>runRpcMode</code></h2>
+
+<p>RPC 模式是给机器用的——IDE 集成、守护进程（第 15 章的 <code>pi-server</code> 就 spawn <code>pi --mode rpc</code> 子进程）。实现在 <code>packages/coding-agent/src/modes/rpc/rpc-mode.ts</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/rpc/rpc-mode.ts">export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise&lt;never&gt;</pre>
+
+<p>注意返回类型 <code>Promise&lt;never&gt;</code>——它永不返回。RPC 模式进入一个无限循环，从 stdin 读命令、往 stdout 写响应和事件，直到对端关闭连接。</p>
+
+<p>通信协议是 <strong>JSON Lines over stdin/stdout</strong>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/rpc/rpc-mode.ts">const handleCommand = async (command: RpcCommand): Promise&lt;RpcResponse | undefined&gt; =&gt; { ... }; // :385
+// 读循环：
+parsed = JSON.parse(line);   // :750 每行一个 JSON 命令
+const command = parsed as RpcCommand;</pre>
+
+<p><code>RpcCommand</code>（<code>packages/coding-agent/src/modes/rpc/rpc-types.ts</code>）是命令词汇表：</p>
+
+<pre class="code" data-lang="text" data-file="packages/coding-agent/src/modes/rpc/rpc-types.ts">prompt, steer, follow_up, abort,
+new_session, get_state, set_model, cycle_model, set_thinking_level,
+compact, bash, switch_session, fork, clone, get_tree, get_messages, set_session_name, ...</pre>
+
+<p>每个命令对应 <code>AgentSession</code> 的一个方法。<code>handleCommand</code> 是一个大分派器：收到 <code>prompt</code> 命令就调 <code>session.prompt()</code>，收到 <code>set_model</code> 就调 <code>session.setModel()</code>，收到 <code>compact</code> 就调 <code>session.compact()</code>。响应（<code>RpcResponse</code>）和事件（<code>AgentSessionEvent</code>）都以 JSON 行写回 stdout。</p>
+
+<p>RPC 模式还有一个 <code>extension_ui_request</code>/<code>extension_ui_response</code> 机制——扩展可能需要在 IDE 里弹一个选择框或输入框（第 14 章）。这些 UI 请求通过 RPC 发给对端（IDE），对端渲染并把用户选择发回来。于是扩展的 UI 也能跨越进程边界。</p>
+
+<p>RPC 模式是"事件流即契约"的极致体现：它把整个 <code>AgentSession</code> 的能力暴露成一组 JSON 命令，让任何能 spawn 进程、读写 stdin/stdout 的程序都能驱动一个完整的 pi Agent。第 15 章的守护进程正是这样做的。</p>
+
+<hr class="sep">
+
+<h2 id="compare">三种模式的对照</h2>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>交互式</th><th>print</th><th>RPC</th></tr></thead>
+<tbody>
+<tr><td>入口</td><td><code>InteractiveMode.run()</code></td><td><code>runPrintMode()</code></td><td><code>runRpcMode()</code></td></tr>
+<tr><td>服务对象</td><td>人</td><td>脚本 / 管道</td><td>IDE / 守护进程</td></tr>
+<tr><td>触发条件</td><td>默认（双 TTY）</td><td><code>-p</code> 或非 TTY</td><td><code>--mode rpc</code></td></tr>
+<tr><td>输入来源</td><td>TUI 编辑器</td><td>CLI 参数 / stdin</td><td>stdin JSON 命令</td></tr>
+<tr><td>输出去向</td><td>终端（TUI 渲染）</td><td>stdout（text/json）</td><td>stdout JSON 行</td></tr>
+<tr><td>事件消费</td><td>渲染成 ~45 个组件</td><td>text 取最终文本 / json 全量序列化</td><td>序列化成 RPC 事件</td></tr>
+<tr><td>生命周期</td><td>直到 <code>/quit</code></td><td>跑完退出（返回 exit code）</td><td>永不返回（<code>Promise&lt;never&gt;</code>）</td></tr>
+<tr><td>斜杠命令</td><td>交互式处理</td><td>不适用</td><td>通过 RPC 命令</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>三者的代码量差异巨大——交互式 6,100 行，print 几百行，RPC 一千多行。但它们的<strong>核心逻辑</strong>（订阅事件、驱动 prompt）几乎相同。代码量的差异全部来自"如何呈现"：交互式要渲染丰富的 UI、处理键盘交互；print 只要写文本；RPC 只要序列化 JSON。</p>
+
+<p>这个分布本身就是架构健康的标志：<strong>复杂性集中在"与人交互"，而非"与 Agent 交互"。</strong> 因为 Agent 交互被 <code>AgentSession</code> 和事件流彻底封装了，每种模式只需要处理自己的呈现层。</p>
+
+<hr class="sep">
+
+<h2 id="why">为什么这很重要</h2>
+
+<p>让我们退一步看这个设计的价值。</p>
+
+<p>假设 Pi Agent 当初把 UI 逻辑和 Agent 逻辑缠在一起——就像很多 Agent 那样，REPL 循环里直接调用模型、直接打印输出。那么：</p>
+
+<ul>
+<li>想要 headless 模式？得把 UI 代码从 REPL 里剥离出来。</li>
+<li>想要 IDE 集成？得重写一个不带 UI 的驱动循环。</li>
+<li>想要守护进程？又得重写一遍。</li>
+</ul>
+
+<p>每一次都要重新处理"调用模型、执行工具、管理状态"的逻辑，每一处都可能引入与主循环微妙不同的行为。</p>
+
+<p>Pi Agent 的做法把这一切避免了。<code>AgentSession</code> 是唯一的 Agent 逻辑所在；它把进展表达成 <code>AgentSessionEvent</code>；模式只是事件的消费者。于是：</p>
+
+<ul>
+<li>新增 headless 模式 = 写一个只输出文本的订阅者（<code>runPrintMode</code>）</li>
+<li>新增 IDE 集成 = 写一个把事件序列化成 JSON-RPC 的订阅者（<code>runRpcMode</code>）</li>
+<li>新增守护进程 = spawn 一个 RPC 子进程（第 15 章）</li>
+</ul>
+
+<p>三种模式不是"三套 Agent 实现"，而是"一套 Agent 实现的三种投影"。这就是第 3 章"循环发事件、上层归约"架构在产品层的最终兑现。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的三种模式为"如何让一个系统服务多种使用方式"提供了四条可迁移的模式。</p>
+
+<p><strong>事件流即契约，模式即投影。</strong> 把系统的所有进展表达成一条事件流，每种使用方式只是流的一个消费者/投影。它解决的问题是：每新增一种使用方式都要重写核心逻辑，导致多套实现彼此漂移。当核心只发事件，新增模式就只是新增一个订阅者，核心逻辑永远只有一份。</p>
+
+<p><strong>让消费者只关心自己需要的事件。</strong> print 的 text 模式只取最终助手文本，忽略中间事件；交互式渲染所有事件。它解决的问题是：消费者被迫处理它不关心的事件。当事件流是细粒度的，消费者可以各取所需。</p>
+
+<p><strong>用返回类型表达生命周期语义。</strong> print 返回 <code>Promise&lt;number&gt;</code>（exit code），RPC 返回 <code>Promise&lt;never&gt;</code>（永不退出）。它解决的问题是：调用方不清楚模式的生命周期。当返回类型本身就说明"我会退出并给你 exit code"或"我永不返回"，误用就更难发生。</p>
+
+<p><strong>把复杂性集中在真正复杂的地方。</strong> 三种模式的代码量差异全部来自"与人交互"（UI），而非"与 Agent 交互"。它解决的问题是：核心逻辑被 UI 复杂性淹没，难以测试和复用。当 Agent 交互被彻底封装，复杂性就只集中在它该在的地方——呈现层。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的三种运行模式——交互式 TUI、headless print、RPC——共享同一个 <code>AgentSession</code> 和同一条 <code>AgentSessionEvent</code> 流，区别仅在于如何消费这条流。交互式模式（6,100 行）把事件渲染成约 45 个 TUI 组件给人看；print 模式把事件输出为纯文本或 JSON 行给脚本用，并返回 exit code；RPC 模式把 <code>AgentSession</code> 的能力暴露成 JSON 命令词汇，序列化事件给 IDE 和守护进程，永不返回。</p>
+
+<p>三者的核心逻辑几乎相同，代码量差异全部来自呈现层。这是"事件流即契约"设计的最终兑现：三种模式不是三套 Agent 实现，而是一套实现的三种投影。新增一种使用方式，只需要新增一个事件订阅者。</p>
+
+<p>到这里，第四部分结束。我们已经走完了产品层的全貌：从 <code>cli.ts</code> 启动（第 8 章），到 <code>AgentSession</code> 编排（第 9 章），到系统提示词装配（第 10 章），到三种模式消费（第 11 章）。下一部分，我们深入那个被反复提到的 <code>pi-tui</code>——完全自研的终端渲染器，看交互式模式那些组件底下，是一个怎样的渲染引擎。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("modes", function (d) {
+  d.box({ id: "rt", x: 330, y: 36, w: 220, h: 52, title: "AgentSessionRuntime", tone: "accent", titleSize: 13 });
+  d.box({ id: "as", x: 330, y: 136, w: 220, h: 62, title: "AgentSession", lines: ["session.subscribe(...)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "im", x: 40, y: 268, w: 240, h: 68, title: "InteractiveMode", lines: ["渲染成 TUI"], tone: "teal", titleSize: 13 });
+  d.box({ id: "pm", x: 320, y: 268, w: 240, h: 68, title: "runPrintMode", lines: ["写 stdout（text/json）"], tone: "violet", titleSize: 13 });
+  d.box({ id: "rm", x: 600, y: 268, w: 240, h: 68, title: "runRpcMode", lines: ["序列化 JSON-RPC"], tone: "violet", titleSize: 13 });
+  d.box({ id: "u1", x: 40, y: 410, w: 240, h: 52, title: "人", tone: "accent", titleSize: 13 });
+  d.box({ id: "u2", x: 320, y: 410, w: 240, h: 52, title: "脚本 / 管道", tone: "slate", titleSize: 13 });
+  d.box({ id: "u3", x: 600, y: 410, w: 240, h: 52, title: "IDE / 守护进程", tone: "slate", titleSize: 13 });
+
+  d.arrow("rt", "as", { from: "bottom", to: "top" });
+  d.arrow("as", "im", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("as", "pm", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("as", "rm", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("im", "u1", { from: "bottom", to: "top" });
+  d.arrow("pm", "u2", { from: "bottom", to: "top" });
+  d.arrow("rm", "u3", { from: "bottom", to: "top" });
+
+  d.text("三种模式共享同一条事件流，区别只在如何呈现", 440, 520, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

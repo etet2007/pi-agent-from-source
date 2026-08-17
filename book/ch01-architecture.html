@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 章 · 架构总览：最小化 Agent 的设计哲学 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch01">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第一部分 · 基础</p>
+  <h1>第 1 章：架构总览——最小化 Agent 的设计哲学</h1>
+  <p class="chapter-sub">九个单向依赖的包、一个纯净的两层循环，以及把复杂性挡在核心之外的组织哲学</p>
+</header>
+
+<h2 id="hook">你正在面对的是什么</h2>
+
+<p>传统 CLI 是一个函数：接收参数，执行任务，退出。<code>grep</code> 不会自作主张地再去跑 <code>sed</code>。契约简单而确定——一条命令，一个动作。</p>
+
+<p>Agent 化的 CLI 打破了这份契约。它接收自然语言提示词，自主决定调用哪些工具，以任意顺序执行它们，评估结果，然后不断循环，直到任务完成或用户终止。"程序"不再是一组固定指令，而是一个围绕语言模型的循环——模型在运行时动态生成自己的指令序列。工具调用是副作用，模型的推理是控制流。</p>
+
+<p>面对这个本质上的复杂性，业界有两种典型回答。</p>
+
+<p>一种是<strong>综合体路线</strong>：把所有可能需要的能力都内置进来。权限系统、几十个工具、上下文压缩、生命周期钩子、自研渲染器……全部装进一个庞大的单体。Claude Code 是这条路线的代表——近两千个文件，每一个 <code>if</code> 分支背后都站着一个真实发生过的故障。这种复杂性是"潜艇式"的：你不能删掉任何一个舱室，因为海水曾经从那里渗进来过。</p>
+
+<p>Pi Agent 给出了另一种回答。它的 <code>CONTRIBUTING.md</code> 开篇即宣言：</p>
+
+<blockquote>
+<p><strong>pi's core is minimal.</strong> If your feature does not belong in the core, it should be an extension.</p>
+<p>Pi's core exists to be minimal and to be extensible so that it can be influenced and manipulated by extensions.</p>
+</blockquote>
+
+<p>这不是文档里的客套话，而是贯穿整个代码库的组织原则。本章的任务，就是让你看清这条原则如何塑造了系统的每一个层次——从包的划分，到循环的形状，到安全模型，到扩展机制。</p>
+
+<hr class="sep">
+
+<h2 id="conservation">复杂性守恒定律</h2>
+
+<p>在深入细节之前，先建立一个贯穿全书的核心观察。</p>
+
+<p>一个生产级 Agent 必须处理的复杂性是<strong>守恒</strong>的：多提供商适配、流式解析、工具执行、并发安全、上下文膨胀、持久化、错误恢复、终端渲染、可扩展性——这些难题不会因为你不写它们就消失。综合体路线把它们全部吸进核心；最小化路线则试图把它们<strong>推到边缘</strong>——推到扩展里、推到容器里、推到可选的守护进程里、推到调用方的责任里。</p>
+
+<p>Pi Agent 的几次关键"外推"：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>复杂性</th><th>综合体路线的做法</th><th>Pi Agent 外推到何处</th></tr></thead>
+<tbody>
+<tr><td>权限与安全</td><td>内置七种权限模式 + 逐工具审批弹窗</td><td><strong>容器/沙箱</strong> + 一次性的"项目信任"决策</td></tr>
+<tr><td>工具生态</td><td>内置 40+ 工具</td><td>7 个内置工具 + <strong>扩展注册自定义工具</strong></td></tr>
+<tr><td>生命周期拦截</td><td>27 种运行时钩子事件</td><td>强类型 <code>ExtensionAPI</code>（33 种事件）</td></tr>
+<tr><td>外部工具协议</td><td>内置 MCP（8 种传输）</td><td><strong>不提供</strong>；由扩展自行集成</td></tr>
+<tr><td>远程控制</td><td>内置 bridge / 云端执行</td><td>独立的可选包 <code>pi-server</code> / <code>pi-protocol</code></td></tr>
+<tr><td>会话存储后端</td><td>内置</td><td>抽象接口 + 可插拔后端（JSONL / SQLite）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>每一次外推都让核心变小一点，同时把"是否承担这份复杂性"的选择权交给使用者。理解这一点，你就能解释 Pi Agent 几乎所有看似"缺失"的功能——它们不是没做，而是被刻意放在了核心之外。</p>
+
+<hr class="sep">
+
+<h2 id="packages">九个包：依赖栈即架构</h2>
+
+<p>Pi Agent 不是一个文件树，而是一个 monorepo。它的架构首先体现在<strong>包的划分</strong>上。理解这九个包各自的职责与依赖方向，等于理解了系统的一半。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="packages" data-w="900" data-h="620"></canvas></div>
+  <figcaption>图 1：九个包的依赖关系。依赖严格单向：模型层 → 运行时层 → 产品层，持久化与连接、质量是独立的旁支。</figcaption>
+</figure>
+
+<p>这张图有几个值得注意的特征。</p>
+
+<p><strong>依赖是严格单向的。</strong> <code>pi-ai</code> 不依赖任何兄弟包；<code>pi-agent-core</code> 只依赖 <code>pi-ai</code>；<code>pi-coding-agent</code> 依赖 <code>pi-agent-core</code>、<code>pi-ai</code>、<code>pi-tui</code>。没有任何循环依赖。这意味着每一层都可以被单独拿出来复用——你完全可以用 <code>pi-ai</code> 写一个跟 Agent 无关的 LLM 应用，或者用 <code>pi-tui</code> 写一个跟 LLM 无关的终端工具。</p>
+
+<p><strong><code>pi-tui</code> 与 LLM 完全无关。</strong> 终端 UI 库不依赖 <code>pi-ai</code>，也不依赖 <code>pi-agent-core</code>。它是一个独立的、通用的差分渲染库。把 UI 从 Agent 逻辑中彻底剥离，是 Pi Agent 与那些"UI 和逻辑缠在一起"的 Agent 的关键区别之一。第 12 章会看到，这个库甚至不是基于 React/Ink 的——它完全自研。</p>
+
+<p><strong>远程能力是独立的旁支。</strong> <code>pi-protocol</code> 和 <code>pi-client</code> 构成一条独立的远程会话通道，<code>pi-server</code> 则是一个监督无头 Agent 子进程的守护进程。它们都依赖产品层，但产品层不依赖它们——你安装 <code>pi</code> 命令本身并不需要任何远程组件。第 15 章会看到，这里其实藏着<strong>两套</strong>互不相同的远程控制设计。</p>
+
+<p><strong>存储是可插拔的。</strong> <code>pi-storage-sqlite-node</code> 实现了 <code>pi-agent-core</code> 定义的存储接口，但核心并不依赖它。默认的会话存储是简单的 JSONL 文件（在产品层实现），SQLite 是一个可选的、带全文搜索的后端。</p>
+
+<p>这种划分本身就是"最小化"的第一层体现：<strong>核心之所以小，是因为它把大量职责切出去成了独立的包。</strong></p>
+
+<hr class="sep">
+
+<h2 id="abstracts">六个核心抽象</h2>
+
+<p>如果说综合体路线由六个内置子系统定义，那么 Pi Agent 由六个<strong>接口抽象</strong>定义。其他一切——九个包、几十个文件——都是为了实现或消费这六个抽象。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="abstracts" data-w="860" data-h="540"></canvas></div>
+  <figcaption>图 2：六个核心抽象围绕 Agent 循环组织。循环只认识接口，不认识任何具体实现。</figcaption>
+</figure>
+
+<p><strong>1. <code>StreamFn</code>——LLM 边界</strong>（<code>packages/agent/src/types.ts</code>）。这是核心循环与模型世界之间唯一的接缝：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export type StreamFn = (
+	model: Model&lt;Api&gt;,
+	context: Context,
+	options?: SimpleStreamOptions,
+) =&gt; AssistantMessageEventStream | Promise&lt;AssistantMessageEventStream&gt;;</pre>
+
+<p>它返回的 <code>AssistantMessageEventStream</code> 是一个事件流，其末尾必然以 <code>done</code> 或 <code>error</code> 收尾，而这两种终止事件携带的都是同一个 <code>AssistantMessage</code>（<code>packages/ai/src/types.ts</code>，节选）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
+
+export interface AssistantMessage {
+	role: "assistant";
+	content: (TextContent | ThinkingContent | ToolCall)[];
+	// ... api / provider / model / usage 等元数据字段
+	stopReason: StopReason;
+	errorMessage?: string;
+	// ...
+}
+
+export type AssistantMessageEvent =
+	// ... 中间的 text_delta / thinking_delta 等增量事件
+	| { type: "done"; reason: Extract&lt;StopReason, "stop" | "length" | "toolUse"&gt;; message: AssistantMessage }
+	| { type: "error"; reason: Extract&lt;StopReason, "aborted" | "error"&gt;; error: AssistantMessage };</pre>
+
+<p><code>StreamFn</code> 的契约里有一条至关重要的约定：<strong>永不抛出</strong>。请求失败、模型错误、网络中断，统统不能以异常形式出现，而必须编码进流末尾那个 <code>error</code> 事件——它携带的 <code>AssistantMessage</code> 以 <code>stopReason: "error" | "aborted"</code> 标记失败，细节放在 <code>errorMessage</code> 里。这一条约定让循环的错误处理逻辑变得极其简单——它永远不需要 <code>try/catch</code> 模型调用，只需要检查流的结果。<code>pi-ai</code> 的 <code>Models.streamSimple</code> 满足这个形状；第 2 章会看到整个 <code>pi-ai</code> 包如何围绕"把失败编码进流"这一原则组织。</p>
+
+<p><strong>2. <code>AgentEvent</code>——循环的输出</strong>（<code>packages/agent/src/types.ts</code>）。循环不返回一个大对象，而是发出一串生命周期事件：</p>
+
+<pre class="code" data-lang="text">agent_start | agent_end
+turn_start  | turn_end
+message_start | message_update | message_end
+tool_execution_start | tool_execution_update | tool_execution_end</pre>
+
+<p>一个"turn"（轮次）= 一次助手响应 + 它的工具调用与结果。任何消费者——TUI REPL、headless print 模式、RPC 模式——都通过订阅这条事件流来工作。第 11 章会看到，三种运行模式的本质区别仅仅是"如何渲染同一条事件流"。</p>
+
+<p><strong>3. <code>AgentTool</code>——自描述工具</strong>（<code>packages/agent/src/types.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface AgentTool&lt;TParameters extends TSchema = TSchema, TDetails = any&gt;
+	extends Tool&lt;TParameters&gt; {
+	label: string;
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParameters&gt;;
+	execute: (
+		toolCallId: string,
+		params: Static&lt;TParameters&gt;,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback&lt;TDetails&gt;,
+	) =&gt; Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	executionMode?: ToolExecutionMode; // "sequential" | "parallel"
+}</pre>
+
+<p>工具不只是函数。它自带参数 schema（TypeBox）、执行逻辑、并发声明（<code>executionMode</code>）、进度上报回调（<code>onUpdate</code>）。循环对工具的内部一无所知——它只知道"按 schema 校验、调用 execute、收集结果"。新增第 N+1 个工具不需要改动循环的任何一行代码。第 4 章详述。</p>
+
+<p><strong>4. <code>AgentMessage</code> 与 <code>convertToLlm</code>——消息桥</strong>（<code>packages/agent/src/types.ts</code>、<code>agent-loop.ts</code>）。循环内部使用一个可扩展的消息联合类型：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface CustomAgentMessages {} // 通过声明合并扩展
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];</pre>
+
+<p><code>Message</code>（来自 <code>pi-ai</code>）覆盖 <code>user | assistant | toolResult</code>。但产品可以往转录里塞入自定义消息类型——压缩摘要、分支摘要、bash 执行记录——它们对 UI 有意义，却不应发给模型。<code>convertToLlm</code> 就是那座桥：它在每次调用模型前，把内部的 <code>AgentMessage[]</code> 过滤、转换成提供商能理解的 <code>Message[]</code>。这个"内部表示 ≠ 线上表示"的分离，是 Pi Agent 容纳自定义消息类型而不污染协议的关键。</p>
+
+<p><strong>5. Session 树——持久转录</strong>（<code>packages/agent/src/harness/session/session.ts</code>）。转录不是一个扁平数组，而是一棵<strong>可追加、可分支的不可变条目树</strong>。每个条目有 <code>id</code>、<code>parentId</code>、<code>timestamp</code>；一个 <code>leaf</code> 标记指向"当前位置"。<code>moveTo(entryId)</code> 可以重新指向 leaf，从而实现分支与回溯；压缩不是删除历史，而是插入一个 <code>compaction</code> 条目。这个设计让"fork 一个会话""回到三步之前换个思路"成为一等公民。第 5 章详述。</p>
+
+<p><strong>6. <code>ExtensionAPI</code>——类型化扩展面</strong>（<code>packages/coding-agent/src/core/extensions/types.ts</code>）。这是最小化哲学最直接的产物。Pi Agent 没有运行时钩子字符串，也没有 MCP；它把扩展性集中到一个强类型接口上：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export type ExtensionFactory = (pi: ExtensionAPI) =&gt; void | Promise&lt;void&gt;;</pre>
+
+<p>扩展拿到一个 <code>pi</code> 对象，可以 <code>on(event, handler)</code> 订阅 33 种事件、<code>registerTool(...)</code> 注册工具、<code>registerCommand(...)</code> 注册斜杠命令、<code>registerShortcut(...)</code> 注册快捷键、<code>registerFlag(...)</code> 注册 CLI flag。因为一切都是 TypeScript 类型，扩展能在编译期得到完整的类型检查与自动补全。第 14 章详述。</p>
+
+<hr class="sep">
+
+<h2 id="core-harness">核心与 Harness：一个包里的两层</h2>
+
+<p><code>pi-agent-core</code> 这个包内部，还藏着理解 Pi Agent 设计哲学的关键一刀。它实际上包含<strong>两个层次</strong>：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="core-harness" data-w="820" data-h="430"></canvas></div>
+  <figcaption>图 3：<code>pi-agent-core</code> 包内的核心/Harness 二分。产品层绕过了 Harness，直接在最小核心之上自建编排。</figcaption>
+</figure>
+
+<p><strong>核心运行时</strong>（<code>src/agent.ts</code>、<code>src/agent-loop.ts</code>、<code>src/types.ts</code>）是一个有状态的 <code>Agent</code> 类，包裹着一个纯净的、发事件的循环。它只维护内存中的转录，不碰文件系统，不做持久化。这是"最小化核心"的字面体现——它小到可以在任何环境（包括浏览器）里运行。</p>
+
+<p><strong>Harness 层</strong>（<code>src/harness/**</code>）建立在核心之上，增加了持久化的会话树存储、上下文压缩、分支摘要、skills、prompt 模板，以及内置的文件/Shell 工具。它是"如果你想要一个开箱即用的、可持久化的 Agent"的可选层。</p>
+
+<p>关键洞察在于：<strong>产品层 <code>pi-coding-agent</code> 并没有使用 Harness 层的 <code>AgentHarness</code> 类。</strong> 它在 <code>packages/coding-agent/src/core/sdk.ts</code> 里直接实例化核心 <code>Agent</code>：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">import { Agent, type AgentMessage, setDefaultStreamFn } from "@earendil-works/pi-agent-core";
+// ...
+agent = new Agent({
+	initialState: { systemPrompt: "", model, thinkingLevel, tools: [] },
+	convertToLlm: convertToLlmWithBlockImages,
+	streamFn: async (model, context, options) =&gt; modelRuntime.streamSimple(model, context, { ... }),
+	// ...
+});</pre>
+
+<p>然后产品层在核心 <code>Agent</code> 之上构建了<strong>自己的</strong>编排器 <code>AgentSession</code>（3,333 行）和<strong>自己的</strong> JSONL 会话管理 <code>SessionManager</code>。</p>
+
+<p>为什么要这样？因为产品层需要的编排逻辑（扩展系统、项目信任、三种运行模式、斜杠命令、模型切换 UI）与通用 Harness 的关注点并不重合。<code>pi-agent-core</code> 把"纯净最小循环"和"一种通用的持久化方案"都提供给你，但<strong>不强迫</strong>你用后者——产品层证明了你可以只在最小核心之上，搭建一个完全定制的、面向具体产品的编排层。</p>
+
+<p>这是"最小化"的第二层体现：<strong>即使在一个包内部，核心也保持纯净，把"如何编排"的自由留给上层。</strong> 第 6 章会深入 Harness 层，第 9 章会深入产品层自建的 <code>AgentSession</code>。</p>
+
+<hr class="sep">
+
+<h2 id="golden">黄金路径：从按键到输出</h2>
+
+<p>现在追踪一个请求的完整流转。你输入"为登录函数添加错误处理"，按下回车。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="golden" data-w="920" data-h="760"></canvas></div>
+  <figcaption>图 4：一次 prompt 的黄金路径。模型调用永不抛出、循环是事件流、工具执行与模型边界正交。</figcaption>
+</figure>
+
+<p>关于这条路径，有三点值得注意，它们各自对应后续章节。</p>
+
+<p><strong>循环是事件流，不是回调链。</strong> <code>Agent.prompt()</code> 内部驱动 <code>runLoop</code>，后者通过一个 <code>emit</code> 回调发出 <code>AgentEvent</code>。<code>Agent</code> 类把这些事件归约（reduce）进自己的可变状态，再分发给订阅者。消费者按自己的节奏处理事件——TUI 渲染、print 模式写 stdout、RPC 模式序列化成 JSON。第 3 章会看到，循环本身是一个干净的两层嵌套状态机，没有综合体路线里那种上千行的错误恢复迷宫。</p>
+
+<p><strong>模型调用永不抛出。</strong> 因为 <code>StreamFn</code> 的契约，循环里检查 <code>message.stopReason === "error" | "aborted"</code> 就足以处理所有模型层失败。错误恢复的复杂性被外推给了 <code>pi-ai</code>（双层重试）和扩展（可以 hook <code>before_provider_request</code>）。</p>
+
+<p><strong>工具执行与模型边界正交。</strong> 循环不知道工具是读文件还是跑 shell，也不知道它是并行还是串行——这些信息内聚在 <code>AgentTool</code> 自己的 <code>executionMode</code> 字段里。第 4 章会看到，并发策略就是读这个字段然后选择 <code>Promise.all</code> 还是 <code>for</code> 循环，仅此而已。</p>
+
+<hr class="sep">
+
+<h2 id="trust">安全模型：项目信任，而非逐工具审批</h2>
+
+<p>这是 Pi Agent 与综合体路线最刺眼的分歧，也是最小化哲学最彻底的体现。</p>
+
+<p>综合体路线内置一套精密的权限系统：多种权限模式、每个工具调用前的审批弹窗、LLM 分类器评估转录。Pi Agent 的 <code>README.md</code> 直接放弃了这一切：</p>
+
+<blockquote>
+<p>Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.</p>
+<p>If you need stronger boundaries, containerize or sandbox Pi.</p>
+</blockquote>
+
+<p>它把<strong>隔离</strong>这件事外推给了操作系统和容器（README 给出了三种容器化模式：Gondolin 微虚拟机、普通 Docker、OpenShell 沙箱）。</p>
+
+<p>但这不意味着 Pi Agent 对安全毫无处理。它把安全关注点收窄成了<strong>一个</strong>问题：<em>你是否信任当前项目目录里的资源？</em> 因为项目目录里可能有 <code>AGENTS.md</code>、自定义扩展、skills——这些都会影响 Agent 的行为，可能来自不可信的第三方仓库。</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="trust" data-w="820" data-h="520"></canvas></div>
+  <figcaption>图 5：项目信任决策流。只有项目里出现需要信任的资源时才进入信任决策，否则直接运行。</figcaption>
+</figure>
+
+<p>这个决策由 <code>packages/coding-agent/src/core/trust-manager.ts</code> 的 <code>ProjectTrustStore</code> 持久化（按 cwd 记录），由 <code>project-trust.ts</code> 的 <code>resolveProjectTrusted(...)</code> 解析，CLI 上对应 <code>--approve/-a</code> 与 <code>--no-approve/-na</code> 两个 flag，交互式下对应 <code>/trust</code> 命令和一个 <code>trust-selector</code> 组件。扩展甚至可以 hook <code>project_trust</code> 事件来参与决策。</p>
+
+<p>工具层面的"安全"则通过<strong>允许/拒绝清单</strong>表达，而非审批弹窗：<code>--tools</code>、<code>--exclude-tools</code>、<code>--no-tools</code>、<code>--no-builtin-tools</code>，以及"只读工具组"（<code>grep</code>/<code>find</code>/<code>ls</code> 默认关闭）。</p>
+
+<p>这是一种截然不同的安全姿态：不在每个动作前设卡，而是<strong>在边界处一次性决策，然后把动作的执行环境本身变得安全</strong>。它把"逐个判断工具调用是否安全"这份复杂性，外推给了容器和用户的信任决策。第 14 章讨论扩展时会回到这个模型。</p>
+
+<hr class="sep">
+
+<h2 id="providers">多提供商：协议是少的，端点是多的</h2>
+
+<p>Pi Agent 支持约 38 个 LLM 提供商（OpenAI、Anthropic、Google、Bedrock、Vertex、OpenRouter、Groq、xAI、DeepSeek……）。如果为每个提供商写一套适配，将是巨大的维护负担。<code>pi-ai</code> 的解法是引入<strong>两个层次</strong>：</p>
+
+<ul>
+<li><strong><code>Api</code>（线缆协议）</strong>：如何与<em>一族</em>服务器对话。约 10 种：<code>openai-completions</code>、<code>openai-responses</code>、<code>anthropic-messages</code>、<code>google-generative-ai</code>、<code>bedrock-converse-stream</code>、<code>mistral-conversations</code> 等。</li>
+<li><strong><code>Provider</code>（配置好的端点）</strong>：一个具体的运行时端点（id、baseUrl、认证、模型目录、绑定到哪些 <code>Api</code>）。约 38 个。</li>
+</ul>
+
+<p>关键在于：<strong>许多提供商复用同一个 <code>Api</code>。</strong> OpenRouter、Groq、Together、xAI 都说 <code>openai-completions</code>/<code>openai-responses</code>。于是约 10 个协议适配器就统一了约 38 个厂商——协议是少的，端点是多的。新增一个"说 OpenAI 方言"的提供商，几乎只需要写一个工厂函数和一个模型目录文件。第 2 章详述。</p>
+
+<hr class="sep">
+
+<h2 id="wiring">各组件如何连接</h2>
+
+<p>把六个抽象和九个包合起来，系统的依赖与数据流是这样的：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="wiring" data-w="900" data-h="560"></canvas></div>
+  <figcaption>图 6：各组件如何连接。<code>AgentSession</code> 是产品层的枢纽，核心循环与工具系统之间的环形依赖被包裹在干净的接口之内。</figcaption>
+</figure>
+
+<p><code>AgentSession</code> 是产品层的枢纽：它持有核心 <code>Agent</code>，把用户输入变成 <code>prompt()</code> 调用，把 <code>Agent</code> 发出的 <code>AgentEvent</code> 翻译成更高层的 <code>AgentSessionEvent</code> 分发给运行模式，同时负责持久化、压缩、模型切换、扩展绑定。核心循环与工具系统之间的环形依赖——模型生成工具调用、工具产生结果、结果回灌、模型再决策——依然是系统的心跳，只是它现在被包裹在干净的 <code>StreamFn</code>/<code>AgentEvent</code> 接口之内。</p>
+
+<p>与后续章节的关系：第 2 章放大 <code>pi-ai</code>（<code>StreamFn</code> 的实现）。第 3–5 章放大核心循环、工具与状态。第 6–7 章放大可选的 Harness 与压缩。第 8–11 章放大产品层如何组装这一切。第 12–13 章放大 <code>pi-tui</code>。第 14–15 章放大扩展与远程。第 16 章看如何用 evals 验证这一切真的有效。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>如果你正在构建一个 Agent 系统，Pi Agent 的架构提供了五条可迁移的模式。</p>
+
+<p><strong>用依赖栈做防火墙。</strong> 把系统拆成严格单向依赖的层（模型层 → 运行时层 → 产品层），每层只依赖下一层的抽象接口。它解决的问题是：复杂性在单体里自由蔓延。当 <code>pi-tui</code> 连 <code>pi-ai</code> 都不依赖时，你就知道 UI 的复杂性绝不可能泄漏进 Agent 逻辑。层的边界就是复杂性的防火墙。</p>
+
+<p><strong>把"是否承担复杂性"变成选择。</strong> 权限、远程、存储后端、扩展——这些都不是核心强制内置的，而是可选的包或外推的责任。它解决的问题是：核心被所有边缘需求绑架。当核心保持最小，只想跑一个内存 Agent 的 SDK 用户就不必拖着一整套持久化和远程基础设施。</p>
+
+<p><strong>核心与编排分离，且不强迫绑定。</strong> 同一个运行时包既提供纯净最小循环，也提供可选的持久化 Harness，但产品可以两者都不用、自建编排。它解决的问题是：框架把自己的编排假设强加给所有使用者。把"机制"（循环）和"策略"（如何编排、如何持久化）分开，策略才能因产品而异。</p>
+
+<p><strong>失败编码进流，而非抛出。</strong> <code>StreamFn</code> 约定永不抛出，失败是流末尾的一个终止事件。它解决的问题是：异步流式管道里 <code>try/catch</code> 四处散落、消费者不知道何时该断开。当失败是数据而非控制流，错误处理就退化成了⼀次字段检查。</p>
+
+<p><strong>安全决策放在边界，而非每个动作前。</strong> 不在每个工具调用前弹窗，而是在进入项目时做一次信任决策，再把执行环境本身（容器）变安全。它解决的问题是：审批疲劳与权限系统的维护负担。当然，这条模式的前提是你确实能控制执行环境——如果你的 Agent 直接跑在用户主机上且无法容器化，逐动作审批可能仍是必要的。最小化安全模型有其适用边界，理解这个边界比模仿它更重要。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的架构是一个关于"克制"的论证。它把系统拆成九个单向依赖的包，把核心收窄到一个纯净的两层循环，把权限交给容器，把扩展交给类型化 API，把存储交给可插拔后端。它没有比综合体路线"少做"事情——它只是把每一份额外的复杂性都放到了核心之外，让使用者按需承担。</p>
+
+<p>这种设计不是没有代价。把隔离交给容器，意味着裸跑在主机上的 <code>pi</code> 确实拥有用户的全部权限；不提供 MCP，意味着想接外部工具生态的人要自己写扩展。本书后续不会回避这些权衡。但理解了"复杂性守恒"这条主线，你就能看懂 Pi Agent 每一个看似缺失的功能背后，那份刻意的取舍。</p>
+
+<p>下一章，我们从依赖栈的最底层开始：<code>pi-ai</code> 如何用约 10 个协议适配器，把约 38 个 LLM 提供商藏到一套统一的流式 API 之后。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("packages", function (d) {
+  var LY = { size: 11, color: d.theme.faint, align: "left" };
+
+  d.box({ id: "AI", x: 350, y: 40, w: 200, h: 58, title: "pi-ai", lines: ["统一多提供商 LLM API"], tone: "accent", titleSize: 13 });
+  d.box({ id: "AGENT", x: 100, y: 150, w: 200, h: 58, title: "pi-agent-core", lines: ["Agent 循环 + 工具执行"], tone: "teal", titleSize: 13 });
+  d.box({ id: "TUI", x: 600, y: 150, w: 200, h: 58, title: "pi-tui", lines: ["终端 UI 库"], tone: "teal", titleSize: 13 });
+  d.box({ id: "CA", x: 350, y: 260, w: 200, h: 58, title: "pi-coding-agent", lines: ["CLI 产品 (pi 命令)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "STORAGE", x: 60, y: 400, w: 190, h: 58, title: "pi-storage-sqlite-node", lines: ["SQLite 会话存储 + FTS"], tone: "violet", titleSize: 12, size: 11.5 });
+  d.box({ id: "SERVER", x: 350, y: 400, w: 190, h: 58, title: "pi-server", lines: ["守护进程 / 监督器"], tone: "violet", titleSize: 13 });
+  d.box({ id: "EVALS", x: 640, y: 400, w: 190, h: 58, title: "pi-evals", lines: ["行为评估"], tone: "slate", titleSize: 13 });
+  d.box({ id: "PROTO", x: 60, y: 510, w: 190, h: 58, title: "pi-protocol", lines: ["CBOR 远程协议"], tone: "violet", titleSize: 13 });
+  d.box({ id: "CLIENT", x: 350, y: 510, w: 190, h: 58, title: "pi-client", lines: ["远程客户端"], tone: "violet", titleSize: 13 });
+
+  d.text("基础层", 12, 69, LY);
+  d.text("运行时层", 12, 179, LY);
+  d.text("产品层", 12, 289, LY);
+  d.text("持久化与连接", 12, 429, LY);
+  d.text("质量", 12, 539, LY);
+
+  d.arrow("AI", "AGENT", { from: "bottom", to: "top" });
+  d.path([[350, 98], [350, 122], [30, 122], [30, 400], [60, 400]]);
+  d.arrow("AGENT", "CA", { from: "bottom", to: "top" });
+  d.arrow("TUI", "CA", { from: "bottom", to: "top" });
+  d.path([[200, 208], [200, 230], [150, 230], [150, 400]]);
+  d.arrow("CA", "SERVER", { from: "bottom", to: "top" });
+  d.arrow("CA", "EVALS", { from: "right", to: "left", bend: -30 });
+  d.path([[550, 69], [580, 69], [580, 112], [840, 112], [840, 360], [760, 360], [760, 400]]);
+  d.arrow("PROTO", "CLIENT", { from: "right", to: "left" });
+
+  d.text("依赖严格单向：模型层 → 运行时层 → 产品层", 450, 610, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("abstracts", function (d) {
+  d.box({ id: "streamfn", x: 60, y: 60, w: 180, h: 64, title: "StreamFn", lines: ["LLM 边界", "模型 → 事件流"], tone: "accent", titleSize: 13 });
+  d.box({ id: "loop", x: 330, y: 220, w: 200, h: 80, title: "Agent 循环", lines: ["两层嵌套状态机"], tone: "gold", titleSize: 13.5 });
+  d.box({ id: "event", x: 620, y: 60, w: 180, h: 64, title: "AgentEvent", lines: ["循环的输出", "10 种生命周期事件"], tone: "teal", titleSize: 13 });
+  d.box({ id: "tool", x: 620, y: 220, w: 180, h: 64, title: "AgentTool", lines: ["自描述工具", "schema + 执行 + 并发模式"], tone: "teal", titleSize: 13 });
+  d.box({ id: "msg", x: 620, y: 380, w: 180, h: 64, title: "AgentMessage", lines: ["可扩展消息", "+ convertToLlm 桥"], tone: "teal", titleSize: 13 });
+  d.box({ id: "session", x: 60, y: 380, w: 180, h: 64, title: "Session 树", lines: ["可追加可分支", "的持久转录"], tone: "violet", titleSize: 13 });
+  d.box({ id: "ext", x: 60, y: 220, w: 180, h: 64, title: "ExtensionAPI", lines: ["类型化扩展面", "33 种事件"], tone: "slate", titleSize: 13 });
+
+  d.arrow("streamfn", "loop", { from: "bottom", to: "top" });
+  d.arrow("loop", "event", { from: "right", to: "left" });
+  d.arrow("loop", "tool", { from: "right", to: "left", label: "执行" });
+  d.arrow("tool", "loop", { from: "left", to: "right", label: "结果" });
+  d.arrow("loop", "msg", { from: "right", to: "left" });
+  d.arrow("msg", "session", { from: "left", to: "right" });
+  d.arrow("ext", "loop", { from: "top", to: "bottom", dashed: true, label: "注册工具/命令" });
+});
+
+PB.fig("core-harness", function (d) {
+  d.group({ x: 40, y: 60, w: 740, h: 160, label: "pi-agent-core", tone: "gold", fill: d.theme.panel });
+  d.box({ id: "core", x: 80, y: 100, w: 300, h: 90, title: "核心运行时", lines: ["agent.ts / agent-loop.ts / types.ts", "纯事件流循环，内存转录"], tone: "teal", titleSize: 13, align: "left" });
+  d.box({ id: "harness", x: 440, y: 100, w: 300, h: 90, title: "Harness 层", lines: ["harness/**", "持久会话树、压缩、分支摘要", "skills、内置文件/Shell 工具"], tone: "accent", titleSize: 13, align: "left" });
+  d.arrow("core", "harness", { from: "right", to: "left" });
+
+  d.box({ id: "sdk", x: 80, y: 320, w: 300, h: 64, title: "SDK 消费者", lines: ["可直接用核心 Agent"], tone: "slate", titleSize: 13 });
+  d.box({ id: "prod", x: 440, y: 320, w: 300, h: 64, title: "pi-coding-agent", lines: ["自建 AgentSession 编排"], tone: "gold", titleSize: 13 });
+  d.arrow("core", "sdk", { from: "bottom", to: "top" });
+  d.arrow("core", "prod", { from: "bottom", to: "top" });
+  d.arrow("harness", "sdk", { from: "bottom", to: "right", dashed: true, label: "可选复用" });
+});
+
+PB.fig("golden", function (d) {
+  d.sequence({
+    x: 30, y: 16, w: 860, rowH: 38, tailPad: 8,
+    participants: [
+      { id: "U", label: "用户 / TUI", tone: "accent" },
+      { id: "IM", label: "InteractiveMode", tone: "slate" },
+      { id: "AS", label: "AgentSession", tone: "teal" },
+      { id: "A", label: "Agent (runLoop)", tone: "gold" },
+      { id: "AI", label: "pi-ai", tone: "violet" },
+      { id: "T", label: "工具", tone: "slate" }
+    ],
+    steps: [
+      { from: "U", to: "IM", label: "输入并回车" },
+      { from: "IM", to: "AS", label: "prompt(text)" },
+      { from: "AS", to: "AS", kind: "self", label: "展开 skill/模板，检查压缩" },
+      { from: "AS", to: "A", label: "agent.prompt(messages)" },
+      { from: "A", to: "A", kind: "self", label: "convertToLlm: AgentMessage[] → Message[]" },
+      { from: "A", to: "AI", label: "streamFn(model, context)" },
+      { from: "AI", to: "A", kind: "return", label: "流式事件 (text_delta…)" },
+      { from: "A", to: "AS", kind: "return", label: "AgentEvent (message_update)" },
+      { from: "AS", to: "IM", kind: "return", label: "转发事件" },
+      { from: "IM", to: "U", kind: "return", label: "增量渲染" },
+      { kind: "note", label: "助手发出 toolCall" },
+      { from: "A", to: "T", label: "executeToolCalls (并行/串行)" },
+      { from: "T", to: "A", kind: "return", label: "ToolResultMessage" },
+      { from: "A", to: "AI", label: "带结果再次流式请求" },
+      { kind: "note", label: "无更多 toolCall → 停止" },
+      { from: "A", to: "AS", kind: "return", label: "agent_end" },
+      { from: "AS", to: "AS", kind: "self", label: "持久化进会话树" },
+      { from: "IM", to: "U", kind: "return", label: "渲染最终结果" }
+    ]
+  });
+});
+
+PB.fig("trust", function (d) {
+  d.box({ id: "a", x: 270, y: 30, w: 280, h: 60, title: "启动 pi，进入某项目目录", tone: "accent", titleSize: 13 });
+  d.box({ id: "b", x: 270, y: 150, w: 280, h: 80, title: "项目里有需要信任的资源?", lines: ["(扩展 / skills / AGENTS.md)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "c", x: 40, y: 290, w: 200, h: 60, title: "直接运行", tone: "teal", titleSize: 13 });
+  d.box({ id: "dd", x: 270, y: 290, w: 280, h: 80, title: "信任决策", lines: ["--approve / --no-approve / 询问"], tone: "gold", titleSize: 13 });
+  d.box({ id: "e", x: 40, y: 420, w: 200, h: 60, title: "加载项目资源", tone: "teal", titleSize: 13 });
+  d.box({ id: "f", x: 580, y: 420, w: 200, h: 60, title: "忽略项目资源", tone: "slate", titleSize: 13 });
+  d.box({ id: "g", x: 270, y: 420, w: 280, h: 60, title: "交互式 trust-selector", tone: "violet", titleSize: 13 });
+
+  d.arrow("a", "b", { from: "bottom", to: "top" });
+  d.arrow("b", "c", { from: "left", to: "top", label: "无" });
+  d.arrow("b", "dd", { from: "bottom", to: "top", label: "有" });
+  d.arrow("dd", "e", { from: "left", to: "top", label: "--approve / 已信任" });
+  d.arrow("dd", "f", { from: "right", to: "top", label: "--no-approve / 不信任" });
+  d.arrow("dd", "g", { from: "bottom", to: "top", label: "询问" });
+  d.arrow("g", "e", { from: "left", to: "right" });
+  d.arrow("g", "f", { from: "right", to: "left" });
+});
+
+PB.fig("wiring", function (d) {
+  d.box({ id: "user", x: 390, y: 20, w: 140, h: 50, title: "用户", tone: "accent", titleSize: 13 });
+  d.box({ id: "mode", x: 360, y: 110, w: 200, h: 64, title: "运行模式", lines: ["Interactive / Print / RPC"], tone: "slate", titleSize: 13 });
+  d.box({ id: "as", x: 360, y: 220, w: 200, h: 64, title: "AgentSession", lines: ["产品编排器"], tone: "teal", titleSize: 13 });
+  d.box({ id: "agent", x: 60, y: 220, w: 220, h: 64, title: "Agent (核心循环)", tone: "gold", titleSize: 13 });
+  d.box({ id: "ai", x: 60, y: 110, w: 220, h: 64, title: "pi-ai", lines: ["ModelRuntime"], tone: "accent", titleSize: 13 });
+  d.box({ id: "tools", x: 60, y: 330, w: 220, h: 64, title: "AgentTool[]", tone: "violet", titleSize: 13 });
+  d.box({ id: "tui", x: 640, y: 110, w: 200, h: 64, title: "pi-tui", tone: "teal", titleSize: 13 });
+  d.box({ id: "tree", x: 640, y: 330, w: 220, h: 64, title: "会话树", lines: ["JSONL / SQLite"], tone: "violet", titleSize: 13 });
+  d.box({ id: "ext", x: 640, y: 440, w: 220, h: 64, title: "ExtensionAPI", lines: ["扩展"], tone: "slate", titleSize: 13 });
+
+  d.arrow("user", "mode", { from: "bottom", to: "top" });
+  d.arrow("mode", "as", { from: "bottom", to: "top" });
+  d.arrow("as", "agent", { from: "left", to: "right", label: "prompt", labelDy: -8 });
+  d.arrow("agent", "as", { from: "right", to: "left", label: "AgentEvent", labelDy: 10 });
+  d.arrow("agent", "ai", { from: "top", to: "bottom", label: "StreamFn", labelDy: -8 });
+  d.arrow("ai", "agent", { from: "bottom", to: "top", label: "AssistantMessageEvent", labelDy: 10 });
+  d.arrow("agent", "tools", { from: "bottom", to: "top", label: "execute" });
+  d.arrow("tools", "agent", { from: "top", to: "bottom", label: "ToolResultMessage" });
+  d.arrow("as", "mode", { from: "top", to: "bottom", label: "AgentSessionEvent" });
+  d.arrow("mode", "tui", { from: "right", to: "left", label: "render" });
+  d.arrow("tui", "user", { from: "left", to: "right" });
+  d.arrow("as", "tree", { from: "right", to: "left", label: "持久化" });
+  d.arrow("ext", "as", { from: "top", to: "right", dashed: true, label: "注册工具/命令/hook" });
+  d.arrow("tree", "agent", { from: "bottom", to: "right", dashed: true, label: "buildContext" });
+});
+</script>
+</body>
+</html>

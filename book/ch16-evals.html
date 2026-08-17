@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 16 章 · 行为评估：pi-evals | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch16">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第七部分 · 质量与结语</p>
+  <h1>第 16 章：行为评估——pi-evals</h1>
+  <p class="chapter-sub">把"我的 Agent 变好了吗"从一个感觉变成一个数字：隔离环境、对照矩阵、模型评判与 lift 指标</p>
+</header>
+
+<h2 id="hook">你怎么知道它变好了</h2>
+
+<p>前面 15 章，我们看的是一个 Agent 如何被构建。但还有一个问题同样根本：<strong>你怎么知道你改进了它？</strong></p>
+
+<p>传统软件的测试是确定的：给定输入，断言输出。但 Agent 不是。你改了系统提示词的一句话，或者换了一个模型，或者加了一个工具——它的行为会如何变化？它会在某些任务上变好、某些任务上变坏吗？它会用更多 token 换来更高正确率吗？这些问题无法用单元测试回答，因为 Agent 的行为是<strong>涌现的、非确定的</strong>——同样的提示词跑两次，路径都可能不同。</p>
+
+<p><code>pi-evals</code>（<code>packages/evals</code>）是 Pi Agent 对这个问题的回答。它的 README 开宗明义：</p>
+
+<blockquote>
+<p>Pi evals are behavioral, model-backed checks for Pi workflows.</p>
+</blockquote>
+
+<p>"行为性的、模型驱动的"——这是关键词。它不 mock 模型、不假装确定性，而是<strong>真的跑一个 Agent</strong>，用模型评判输出，然后在 baseline 和 candidate 之间做严格对照。本章拆解这套评估框架，看它如何把"我的 Agent 变好了吗"从一个感觉变成一个数字。</p>
+
+<p>对一个以"最小化"为哲学的 Agent，这套框架尤其重要：当你不断在"核心该不该加这个功能"之间做取舍时，你需要一个客观的裁判，告诉你某个改动到底是帮助还是伤害。</p>
+
+<hr class="sep">
+
+<h2 id="harness">核心抽象：harness</h2>
+
+<p><code>pi-evals</code> 建立在第三方框架 <code>vitest-evals</code> 之上，把它适配到 pi。核心适配器是 <code>createPiCodingAgentHarness</code>（<code>packages/evals/src/pi-harness.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/pi-harness.ts">export function createPiCodingAgentHarness&lt;TOutput extends JsonValue&gt;(
+	options: PiCodingAgentHarnessWithOutput&lt;TOutput&gt;,
+): Harness&lt;PiCodingAgentInput, TOutput&gt;;
+export function createPiCodingAgentHarness(options?: PiCodingAgentHarnessOptions): Harness&lt;PiCodingAgentInput, string&gt;;</pre>
+
+<p>它返回一个 <code>Harness</code>——<code>vitest-evals</code> 的概念，本质是"给定输入，产生输出"的可评估单元。选项包括：</p>
+
+<pre class="code" data-lang="ts">{
+	name: string;
+	model: { provider: string; id: string };
+	noTools?: ...;
+	transformSystemPrompt?: (defaultPrompt: string) =&gt; string; // 变换系统提示词
+	output?: ({ response, session }) =&gt; TOutput;               // 自定义输出提取
+}</pre>
+
+<p>输入类型（<code>PiCodingAgentInput</code>）可以是单个提示词，或一个步骤序列：</p>
+
+<pre class="code" data-lang="ts">export type PiCodingAgentInput = string | Array&lt;{ type: "prompt"; content: string } | { type: "reload" }&gt;;</pre>
+
+<p><code>{ type: "reload" }</code> 步骤很有用——它让 eval 可以"先让 agent 创建一个资源，然后 reload 资源，再让 agent 使用它"。我们马上会在 extensions eval 里看到这个模式。</p>
+
+<p><code>transformSystemPrompt</code> 是对照实验的关键：它接收默认系统提示词，返回一个变换后的版本。于是你可以构造两个 harness——一个用完整提示词，一个用删掉某段的提示词——然后比较它们的表现。这正是"我的提示词改动有用吗"的严格测试方法。</p>
+
+<hr class="sep">
+
+<h2 id="run">跑一个真实的 Agent</h2>
+
+<p><code>runPiCodingAgent</code>（<code>packages/evals/src/pi-harness.ts:109</code>）是真正的工作流。它不复用任何现有会话，而是在<strong>完全隔离的环境</strong>里跑一个全新的 <code>AgentSession</code>：</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="workflow" data-w="900" data-h="1000"></canvas></div>
+  <figcaption>图 1：一次 eval 运行的完整工作流：解析模型 → 搭建隔离环境 → 逐步执行 prompt/reload → 断言与快照 → 清理；transformSystemPrompt 分支决定系统提示词的来源。</figcaption>
+</figure>
+
+<p>几个设计决策值得注意。</p>
+
+<p><strong>完全隔离。</strong> 每个 eval 在一个 <code>mkdtemp</code> 出来的临时目录里跑，有自己的 <code>workspace/</code>（agent 操作的项目）和 <code>agent/</code>（配置/会话）。<code>SettingsManager.inMemory()</code> 避免读写真实设置。跑完后删除临时目录。这保证了 eval 之间互不干扰，也不污染开发者的真实环境。</p>
+
+<p><strong><code>thinkingLevel: "off"</code>。</strong> eval 默认关掉 thinking——为了减少非确定性、降低成本、加快评估。这是一个"评估关注行为而非推理过程"的选择。</p>
+
+<p><strong>断言 <code>stopReason === "stop"</code>。</strong> 每个 prompt 步骤后，断言响应正常完成（不是 error/aborted/length）。如果 agent 没能正常完成，eval 失败——这是一个基本的健全性检查。</p>
+
+<p><strong>输出提取可定制。</strong> 默认输出是 <code>getLastAssistantText()</code>（最后一条助手文本）。<code>output</code> 选项可以自定义——比如从会话状态里提取结构化数据。</p>
+
+<p><strong>会话快照为 artifact。</strong> 跑完后，整个会话的 JSONL 被快照成一个测试 artifact（<code>PI_SESSION_SNAPSHOT_ARTIFACT = "piSessionJsonl"</code>）。这意味着每个 eval 运行都留下了完整的、可回看的会话记录——你可以打开它，看 agent 到底做了什么、调了哪些工具、花了多少 token。</p>
+
+<hr class="sep">
+
+<h2 id="comparison">对照实验：<code>evalHarnessTable</code></h2>
+
+<p>单个 harness 跑一次只能告诉你"它做了什么"。要回答"它比之前好吗"，需要<strong>对照</strong>。<code>evalHarnessTable</code>（<code>packages/evals/src/vitest-evals/harness-table.ts</code>）构造一个 baseline × candidate 的对照矩阵：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/vitest-evals/harness-table.ts">evalHarnessTable(evalSet, {
+	baseline,        // 基准 harness
+	candidate | candidates, // 候选 harness（可以有多个）
+	repetitions?,    // 每组重复次数
+}): EvalHarnessTableRow[]</pre>
+
+<p>它把每个 harness × 每个输入 × 每次重复展开成一行，配合 Vitest 的 <code>describe.for(...)</code> 跑。每个运行被打上一个 <code>EVAL_HARNESS_ITERATION_ARTIFACT</code>（evalSet、groupKey、harness、baseline、candidates、repetition），以便后续配对。</p>
+
+<p><code>deriveEvalGroupKey(input, repetition)</code> 把观测值按"输入 id（或输入 JSON 的 SHA-256）+ 重复次数"配对——这样 baseline 和 candidate 在<strong>完全相同的输入和重复</strong>上被比较。<code>canonicalizeJson</code> 强制 JSON 规范化（有限数字、无环、排序键），确保同样的输入产生同样的 key。</p>
+
+<p><code>repetitions</code> 很重要：因为 Agent 行为非确定，跑一次可能是运气。重复多次，才能区分"真的变好了"和"这次恰好运气好"。</p>
+
+<hr class="sep">
+
+<h2 id="judge">评判：score 与 judge</h2>
+
+<p>每个 eval 运行产生一个 score（分数）。<code>vitest-evals</code> 的约定是：<strong>score &gt;= 1 算通过。</strong> 分数可以来自：</p>
+
+<ul>
+<li><strong>确定性判断</strong>：检查输出是否满足某些硬性条件。</li>
+<li><strong>模型判断</strong>：用另一个 LLM 评判输出质量（model-backed）。</li>
+</ul>
+
+<p><code>extensions.eval.ts</code> 是确定性判断的好例子。它评估"agent 能否正确编写一个 pi 扩展"，用一个确定性的 <code>ExtensionAuthoringJudge</code>（<code>createJudge</code>）打分，检查：</p>
+
+<ul>
+<li>生成的扩展 import 的是 <code>@earendil-works/pi-coding-agent</code>（不是过时的 <code>@mariozechner/</code> 或 <code>@sinclair/typebox</code>）</li>
+<li>扩展能无错加载</li>
+<li>注册了一个 <code>hello</code> 工具</li>
+<li><code>hello({ name: "Bob" })</code> 返回 <code>"Hello, Bob!"</code></li>
+</ul>
+
+<p>这个 eval 的输入是一个步骤序列：创建扩展 → <code>reload</code> → 使用扩展。它用 <code>judgeThreshold: null</code>——低分算"观测值"而非"失败"。这是一个微妙但重要的设计：探索性的 eval（你还在了解 baseline 表现）不应该因为分数低就让测试红掉，而应该作为数据收集。</p>
+
+<p><code>smoke.eval.ts</code> 则是最简单的端到端检查：用 <code>noTools: "all"</code> 跑一个事实性提问，断言输出是 "Paris"，并检查 usage 元数据。它验证"评估框架本身能跑通"。</p>
+
+<hr class="sep">
+
+<h2 id="metrics">指标：lift 与配对差</h2>
+
+<p>跑完对照实验，<code>summarizeHarnessComparisons</code>（<code>packages/evals/src/vitest-evals/summary.ts</code>）计算两类指标。</p>
+
+<p><strong>正确性 lift</strong>（<code>CorrectnessLiftSummary</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/vitest-evals/summary.ts">export type CorrectnessLiftSummary = {
+	eligiblePairs: number;
+	baselinePassRate: number | null;
+	candidatePassRate: number | null;
+	lift: number | null; // candidatePassRate - baselinePassRate
+};</pre>
+
+<p><code>lift = candidatePassRate - baselinePassRate</code>，以百分点（pp）计。如果候选 harness 的通过率比基准高 12 个百分点，lift 就是 +12pp。这是"我的改动让正确率提升了多少"的直接答案。</p>
+
+<p><strong>配对指标差</strong>（<code>PairedMetricSummary</code>）：对 <code>totalTokens</code>、<code>totalMs</code>（延迟）、<code>estimatedCostUsd</code>（成本），计算 baseline 和 candidate 的配对差。这回答"正确率的提升花了多少额外 token/时间/钱"。</p>
+
+<p>报告（<code>formatHarnessComparisonReport</code>）把这些渲染成彩色终端输出：</p>
+
+<pre class="code" data-lang="text">correctness: +12.0 pp (candidate 85%, baseline 73%)
+totalTokens: +1,234 (candidate ..., baseline ...)
+estimatedCostUsd: +$0.05 (...)</pre>
+
+<p>它还诊断不完整的观测：<code>missing-observation</code>、<code>duplicate-observation</code>、<code>harness-error</code>、<code>missing-score</code>、<code>unscorable-outcome</code>。这些诊断让你知道哪些对照对没能产生有效数据，避免被不完整的统计误导。</p>
+
+<p>于是，"换这个模型/改这句提示词/加这个工具值不值"变成了一个多维度的客观判断：正确率 lift 是正的，但 token 和成本涨了多少？如果正确率 +5pp 但成本翻倍，可能不值；如果正确率 +5pp 且成本持平，那就是净改进。</p>
+
+<hr class="sep">
+
+<h2 id="minimal">为什么这对最小化 Agent 尤其重要</h2>
+
+<p>回到本书的主线。Pi Agent 的核心哲学是"最小化"——不断把功能推出核心。但每一次这样的取舍都需要回答：这个决定让 Agent 变好了还是变坏了？</p>
+
+<p>比如：</p>
+
+<ul>
+<li>把某条 guideline 从默认提示词里删掉（让提示词更精简），agent 表现会变差吗？<code>extensions.eval.ts</code> 正是测这个——它对照"完整提示词"和"删掉 Guidelines/文档段的提示词"。</li>
+<li>默认激活 4 个工具 vs 7 个工具，哪个更好？</li>
+<li>换一个更便宜的模型，正确率掉多少？成本省多少？</li>
+<li>加一个 skill，它真的被有效使用了吗？</li>
+</ul>
+
+<p>这些问题都没有先验答案。<code>pi-evals</code> 提供了一个<strong>客观裁判</strong>：构造 baseline 和 candidate，跑对照实验，看 lift 和成本差。于是"最小化"不再是信仰，而是可以被验证的假设——如果删掉某个东西，eval 显示 lift ≈ 0 且成本下降，那就放心删；如果 lift 是负的，那就保留。</p>
+
+<p>这是"用数据驱动架构决策"的典范。很多 Agent 项目的提示词和工具集是靠直觉调的；Pi Agent 把这套调优变成了可重复、可对照、可量化的实验。<code>evals</code> 包是 <code>private: true</code>——它不发布给用户，纯粹是开发期的质量基础设施。但它的存在，是整个项目能持续做最小化取舍的底气。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p><code>pi-evals</code> 为"如何评估一个非确定性的 Agent"提供了四条可迁移的模式。</p>
+
+<p><strong>用真实模型评估，而非 mock。</strong> eval 真的跑一个 <code>AgentSession</code>、真的调模型、真的执行工具。它解决的问题是：mock 掉模型只能测你<em>以为</em>它会做什么，测不出它<em>实际</em>做什么。当评估是 model-backed 的，你测的是真实的涌现行为，而非你的假设。代价是 eval 慢、花钱、非确定——但对"行为是否正确"这个问题，没有更便宜的捷径。</p>
+
+<p><strong>隔离 + 可回看 artifact。</strong> 每个 eval 在临时目录里跑、用内存设置、跑完删除，但会话 JSONL 被快照成 artifact。它解决的问题是：eval 之间互相干扰、污染真实环境，且失败后无从查起。当每次运行既隔离又留下完整记录，eval 既可重复又可调试。</p>
+
+<p><strong>对照 + 重复，把"感觉"变成"数字"。</strong> baseline × candidate 矩阵，相同输入配对，多次重复，计算正确率 lift 和 token/成本配对差。它解决的问题是：单次运行的结果可能是运气，且"变好了"是个模糊感觉。当对照配对、重复多次、量化 lift，改进就成了可统计判断的事实。</p>
+
+<p><strong>用评估驱动架构取舍。</strong> 用 eval 验证"删掉/简化某个东西是否伤害行为"，让最小化成为可验证的假设而非信仰。它解决的问题是：架构取舍靠直觉，删错了不知道。当每个取舍都能被 eval 裁判，"保持最小"就有了客观依据——这是把工程品味和工程纪律结合起来的方法。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p><code>pi-evals</code> 是 Pi Agent 的行为评估框架：<code>createPiCodingAgentHarness</code> 把一个真实的 <code>AgentSession</code> 适配成 <code>vitest-evals</code> 的 harness，在完全隔离的临时环境里跑（内存设置、thinking 关闭、会话快照为 artifact）；<code>evalHarnessTable</code> 构造 baseline × candidate 对照矩阵并多次重复；评判用确定性 judge 或模型 judge，score &gt;= 1 算通过；<code>summary</code> 计算正确率 lift（百分点）和 token/延迟/成本配对差，渲染成对照报告。</p>
+
+<p>它不发布给用户（<code>private: true</code>），却是整个项目能持续做最小化取舍的底气——每一次"核心该不该加/删这个"的决策，都能被它客观裁判。这是把"最小化"从信仰变成可验证假设的基础设施。</p>
+
+<p>下一章，我们合上这本书，回顾 Pi Agent 的六个架构赌注，提炼可迁移的经验，并审视最小化路线的代价与边界。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("workflow", function (d) {
+  var BX = 280, BW = 340;
+
+  d.box({ id: "A", x: BX, y: 24, w: BW, h: 58, title: "解析模型", lines: ["(选项或 PI_PROVIDER/PI_MODEL)"], tone: "accent", titleSize: 13, size: 11.5 });
+  d.box({ id: "B", x: BX, y: 104, w: BW, h: 44, title: "创建 ModelRuntime", tone: "accent", titleSize: 13 });
+  d.box({ id: "C", x: BX, y: 170, w: BW, h: 58, title: "mkdtemp 隔离根目录", lines: ["workspace/ + agent/"], tone: "teal", titleSize: 13, size: 11.5 });
+  d.box({ id: "D", x: BX, y: 250, w: BW, h: 58, title: "createAgentSessionServices", lines: ["(SettingsManager.inMemory)"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "E", x: BX, y: 330, w: BW, h: 44, title: "创建 SessionManager", tone: "teal", titleSize: 13 });
+  d.box({ id: "F", x: BX, y: 396, w: BW, h: 58, title: "createAgentSessionFromServices", lines: ["(thinkingLevel: off)"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "G", x: BX, y: 476, w: BW, h: 52, title: "transformSystemPrompt?", tone: "gold", titleSize: 13.5 });
+  d.box({ id: "H", x: 640, y: 550, w: 240, h: 44, title: "变换 + reload 系统提示词", tone: "violet", titleSize: 13 });
+  d.box({ id: "I", x: 60, y: 550, w: 200, h: 44, title: "用默认", tone: "slate", titleSize: 13 });
+  d.box({ id: "J", x: BX, y: 620, w: BW, h: 44, title: "逐步跑 prompt/reload", tone: "teal", titleSize: 13 });
+  d.box({ id: "K", x: BX, y: 686, w: BW, h: 58, title: "断言 stopReason === stop", lines: ["提取 getLastAssistantText"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "L", x: BX, y: 766, w: BW, h: 58, title: "转 TranscriptEvent[]", lines: ["收集 usage/stats"], tone: "teal", titleSize: 13, size: 11.5 });
+  d.box({ id: "M", x: BX, y: 846, w: BW, h: 44, title: "快照会话 JSONL 为 artifact", tone: "teal", titleSize: 13 });
+  d.box({ id: "N", x: BX, y: 912, w: BW, h: 44, title: "dispose + 删除临时目录", tone: "slate", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "F", { from: "bottom", to: "top" });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "H", { from: "right", to: "left", label: "是" });
+  d.arrow("G", "I", { from: "left", to: "right", label: "否" });
+  d.arrow("H", "J", { from: "bottom", to: "top" });
+  d.arrow("I", "J", { from: "bottom", to: "top" });
+  d.arrow("J", "K", { from: "bottom", to: "top" });
+  d.arrow("K", "L", { from: "bottom", to: "top" });
+  d.arrow("L", "M", { from: "bottom", to: "top" });
+  d.arrow("M", "N", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

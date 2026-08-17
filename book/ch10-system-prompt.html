@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · 系统提示词与资源装配 | Pi Agent 源码解析</title>
+<link rel="stylesheet" href="style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch10">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">第四部分 · 编码 Agent 产品</p>
+  <h1>第 10 章：系统提示词与资源装配</h1>
+  <p class="chapter-sub">系统提示词不是硬编码的字符串，而是从工具的自描述、项目上下文文件与两阶段 skill 加载中装配出来的</p>
+</header>
+
+<h2 id="job">Agent 的"岗位说明书"</h2>
+
+<p>模型本身不知道自己是谁、能用什么工具、该遵循什么规范。这一切都写在系统提示词里——Agent 的"岗位说明书"。第 9 章的 <code>prompt()</code> 漏斗把用户输入处理干净，但在那之前，<code>AgentSession</code> 早已装配好了一份系统提示词，作为每次模型调用的背景。</p>
+
+<p>这份提示词不是硬编码的字符串。它是<strong>装配</strong>出来的：根据激活的工具、加载的 skills、项目里的上下文文件、用户的定制，动态拼装。本章拆解这个装配过程，以及它背后的资源系统——skills、prompt 模板、项目上下文文件、斜杠命令。</p>
+
+<p>这里藏着一个 Pi Agent 的标志性模式：<strong>两阶段 skill 加载</strong>。系统提示词里只放 skill 的名字和描述，完整内容让模型按需去读。这个看似简单的决策，解决了"能力越多、提示词越臃肿"的根本矛盾。</p>
+
+<hr class="sep">
+
+<h2 id="assembly"><code>buildSystemPrompt</code>：装配的主流程</h2>
+
+<p>系统提示词由 <code>buildSystemPrompt</code>（<code>packages/coding-agent/src/core/system-prompt.ts</code>）装配。它的输入是一个选项对象：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">export interface BuildSystemPromptOptions {
+	customPrompt?: string;        // --system-prompt，替换默认提示词
+	selectedTools?: string[];     // 默认 [read, bash, edit, write]
+	toolSnippets?: Record&lt;string, string&gt;; // 每个工具的一行简介
+	promptGuidelines?: string[];  // 追加的指南
+	appendSystemPrompt?: string;  // --append-system-prompt，追加到末尾
+	cwd: string;
+	contextFiles?: Array&lt;{ path: string; content: string }&gt;; // AGENTS.md 等
+	skills?: Skill[];
+}</pre>
+
+<p>默认提示词（没有 <code>customPrompt</code> 时）的骨架是这样的：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+
+Available tools:
+${toolsList}
+
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
+Guidelines:
+${guidelines}
+
+Pi documentation (read only when the user asks about pi itself, ...):
+- Main documentation: ${readmePath}
+- Additional docs: ${docsPath}
+- Examples: ${examplesPath}
+...`;
+
+if (appendSection) prompt += appendSection;          // --append-system-prompt
+// 项目上下文文件
+if (contextFiles.length &gt; 0) {
+	prompt += "\n\n&lt;project_context&gt;\n\n";
+	prompt += "Project-specific instructions and guidelines:\n\n";
+	for (const { path: filePath, content } of contextFiles) {
+		prompt += `&lt;project_instructions path="${filePath}"&gt;\n${content}\n&lt;/project_instructions&gt;\n\n`;
+	}
+	prompt += "&lt;/project_context&gt;\n";
+}
+// skills
+if (hasRead &amp;&amp; skills.length &gt; 0) prompt += formatSkillsForPrompt(skills);
+// 工作目录
+prompt += `\nCurrent working directory: ${promptCwd}`;</pre>
+
+<p>让我们逐段看这个装配。</p>
+
+<hr class="sep">
+
+<h2 id="tools">"Available tools"：来自工具的自描述</h2>
+
+<p>提示词里的工具列表不是手写的，而是从激活工具的 <code>promptSnippet</code> 拼出来的：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">const tools = selectedTools || ["read", "bash", "edit", "write"];
+const visibleTools = tools.filter((name) =&gt; !!toolSnippets?.[name]);
+const toolsList = visibleTools.length &gt; 0
+	? visibleTools.map((name) =&gt; `- ${name}: ${toolSnippets![name]}`).join("\n")
+	: "(none)";</pre>
+
+<p>回忆第 4 章：每个 <code>ToolDefinition</code> 都自带一个 <code>promptSnippet</code>（比如 read 工具的是 "Read file contents"）。<code>buildSystemPrompt</code> 收集激活工具的 snippet，拼成"Available tools"段落。<strong>工具激活，它的简介就自动出现在提示词里；工具关闭，简介就消失。</strong> 这是工具自描述设计的直接收益——新增一个工具，不需要手动更新系统提示词。</p>
+
+<p>注意那句"In addition to the tools above, you may have access to other custom tools depending on the project"——它告诉模型还可能有扩展注册的自定义工具（第 14 章），让模型对未知工具保持开放。</p>
+
+<hr class="sep">
+
+<h2 id="guidelines">"Guidelines"：根据工具集条件生成</h2>
+
+<p>指南段落不是固定的，而是根据<strong>哪些工具激活</strong>动态生成：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">const hasBash = tools.includes("bash");
+const hasGrep = tools.includes("grep");
+const hasFind = tools.includes("find");
+const hasLs = tools.includes("ls");
+
+// 文件探索指南
+if (hasBash &amp;&amp; !hasGrep &amp;&amp; !hasFind &amp;&amp; !hasLs) {
+	addGuideline("Use bash for file operations like ls, rg, find");
+}
+
+for (const guideline of promptGuidelines ?? []) {
+	addGuideline(guideline.trim()); // 工具自带的 promptGuidelines
+}
+
+// 总是包含
+addGuideline("Be concise in your responses");
+addGuideline("Show file paths clearly when working with files");</pre>
+
+<p>看第一条条件：如果激活了 <code>bash</code> 但没有 <code>grep</code>/<code>find</code>/<code>ls</code>（默认情况就是如此），就告诉模型"用 bash 做 ls、rg、find 这类文件操作"。因为默认工具集里这三个只读工具是关闭的（第 4 章），模型需要知道它该用 bash 命令来搜索文件。如果用户用 <code>--tools</code> 开启了 grep/find/ls，这条指南就不会出现——因为模型有专门工具了。</p>
+
+<p><code>addGuideline</code> 用一个 <code>Set</code> 去重——工具的 <code>promptGuidelines</code>（第 4 章）和默认指南合并时不会重复。于是每个工具自带的指南（比如 read 的 "Use read to examine files instead of cat or sed"）也会自动进入这个段落。</p>
+
+<p>这又是一个自描述的胜利：工具不仅声明自己"是什么"（snippet），还声明"用我时该注意什么"（guidelines），系统提示词自动收集。</p>
+
+<hr class="sep">
+
+<h2 id="context">项目上下文文件：&lt;project_context&gt;</h2>
+
+<p>如果项目目录里有 <code>AGENTS.md</code>（或 <code>CLAUDE.md</code>）这类上下文文件，它们的内容会被包进一个 <code>&lt;project_context&gt;</code> 块：</p>
+
+<pre class="code" data-lang="text">&lt;project_context&gt;
+
+Project-specific instructions and guidelines:
+
+&lt;project_instructions path="AGENTS.md"&gt;
+...文件内容...
+&lt;/project_instructions&gt;
+
+&lt;/project_context&gt;</pre>
+
+<p>这些文件由 <code>ResourceLoader</code>（<code>packages/coding-agent/src/core/resource-loader.ts</code> 的 <code>loadProjectContextFiles</code>）发现并加载。用 XML 风格的标签包裹有两个好处：其一，给模型一个清晰的结构化边界（"这是项目特定的指令"）；其二，<code>path</code> 属性让模型知道每条指令来自哪个文件。</p>
+
+<p>回忆第 1 章的安全模型：项目上下文文件来自可能不可信的第三方仓库，所以它们的加载受<strong>项目信任</strong>门控。<code>--no-approve</code> 或 <code>--no-context-files</code> 会跳过它们。这是"项目信任"决策在提示词装配处的体现——不信任，就不把项目文件注入提示词。</p>
+
+<hr class="sep">
+
+<h2 id="skills">两阶段 skill 加载</h2>
+
+<p>现在到本章的精华。skills 是"针对特定任务的专业指令"——比如"如何审查代码""如何写迁移脚本"。一个项目可能有几十个 skill，每个 skill 的完整内容可能有几百行。如果把所有 skill 的完整内容都塞进系统提示词，提示词会爆炸。</p>
+
+<p>Pi Agent 的解法是<strong>两阶段加载</strong>：系统提示词里只放 skill 的<strong>名字、描述、位置</strong>，完整内容让模型<strong>按需读取</strong>。<code>formatSkillsForPrompt</code>（<code>packages/coding-agent/src/core/skills.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/skills.ts">export function formatSkillsForPrompt(skills: Skill[]): string {
+	const visibleSkills = skills.filter((s) =&gt; !s.disableModelInvocation);
+	if (visibleSkills.length === 0) return "";
+
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		"Use the read tool to load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory ...",
+		"",
+		"&lt;available_skills&gt;",
+	];
+	for (const skill of visibleSkills) {
+		lines.push("  &lt;skill&gt;");
+		lines.push(`    &lt;name&gt;${escapeXml(skill.name)}&lt;/name&gt;`);
+		lines.push(`    &lt;description&gt;${escapeXml(skill.description)}&lt;/description&gt;`);
+		lines.push(`    &lt;location&gt;${escapeXml(skill.filePath)}&lt;/location&gt;`);
+		lines.push("  &lt;/skill&gt;");
+	}
+	lines.push("&lt;/available_skills&gt;");
+	return lines.join("\n");
+}</pre>
+
+<p>看这段提示词的关键指令：</p>
+
+<blockquote>
+<p>Use the read tool to load a skill's file when the task matches its description.</p>
+</blockquote>
+
+<p>系统提示词只给模型一份"skill 目录"（名字 + 描述 + 文件位置），并告诉它："当任务匹配某个 skill 的描述时，用 read 工具去读它的文件。"于是：</p>
+
+<ul>
+<li><strong>启动时</strong>：只加载 skill 的 frontmatter（名字、描述），成本极低。</li>
+<li><strong>调用时</strong>：模型判断当前任务匹配某个 skill，用 <code>read</code> 工具读取完整的 <code>SKILL.md</code>，把详细指令加载进上下文。</li>
+</ul>
+
+<p>这就是两阶段：<strong>frontmatter 进提示词，body 按需读取。</strong> 30 个 skill 的目录可能只占几百 token，而它们的完整内容可能有几万 token——但后者只在真正需要时才进入上下文。</p>
+
+<p><code>Skill</code> 接口（<code>packages/coding-agent/src/core/skills.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/skills.ts">export interface SkillFrontmatter {
+	name?: string;
+	description?: string;
+	"disable-model-invocation"?: boolean;
+	[key: string]: unknown;
+}
+
+export interface Skill {
+	name: string;
+	description: string;
+	filePath: string;
+	baseDir: string;
+	sourceInfo: SourceInfo;
+	disableModelInvocation: boolean;
+}</pre>
+
+<p>skill 是一个带 YAML frontmatter 的 <code>SKILL.md</code> 文件。<code>disableModelInvocation: true</code> 的 skill 不会出现在提示词里（<code>visibleSkills</code> 过滤掉它们）——它们只能由用户显式 <code>/skill:name</code> 调用，模型不能自主触发。这给了一些 skill "只对人不给模型"的控制。</p>
+
+<p>两阶段加载是 Pi Agent "把复杂性推到边缘"哲学的又一例：系统提示词保持精简（核心），完整能力按需加载（边缘）。它和参考书里 Claude Code 的"两阶段 Skill 加载"模式异曲同工——这是一个被反复验证的好模式。</p>
+
+<hr class="sep">
+
+<h2 id="templates">prompt 模板：可复用的提示词片段</h2>
+
+<p>prompt 模板（<code>packages/coding-agent/src/core/prompt-templates.ts</code>）是另一个"可复用提示词"机制，但和 skill 不同：模板是<strong>用户输入时展开</strong>的，skill 是<strong>模型按需读取</strong>的。</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/prompt-templates.ts">export interface PromptTemplate {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	content: string;
+	sourceInfo: SourceInfo;
+	filePath: string;
+}</pre>
+
+<p>模板是一个文件，内容是带占位符的提示词。用户输入 <code>/template-name arg1 arg2</code> 时，<code>expandPromptTemplate</code>（<code>:269</code>）把它展开成完整文本，<code>substituteArgs</code>（<code>:70</code>）把参数填进占位符：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/prompt-templates.ts">export function substituteArgs(content: string, args: string[]): string {
+	// 把 $1, $2, ... 和 $@ 等占位符替换为实际参数
+}</pre>
+
+<p><code>parseCommandArgs</code> 用 bash 风格的引号规则解析参数（支持 <code>"quoted arg"</code>）。于是用户可以定义一个 <code>/review</code> 模板，内容是"请审查以下方面的代码：$1"，输入 <code>/review security</code> 就展开成"请审查以下方面的代码：security"。</p>
+
+<p>模板和 skill 的分工：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>prompt 模板</th><th>skill</th></tr></thead>
+<tbody>
+<tr><td>触发者</td><td>用户（输入 <code>/name</code>）</td><td>模型（判断任务匹配）或用户</td></tr>
+<tr><td>展开时机</td><td>输入时（<code>prompt()</code> 漏斗里）</td><td>运行时（模型用 read 读取）</td></tr>
+<tr><td>进系统提示词</td><td>否（只在用到时展开）</td><td>是（目录进提示词）</td></tr>
+<tr><td>用途</td><td>用户常用的提示词快捷方式</td><td>给模型的专业任务指令</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两者都是"把常用的提示词固化成文件"，但服务的对象和时机不同。</p>
+
+<hr class="sep">
+
+<h2 id="slash">斜杠命令：22 个内置入口</h2>
+
+<p>用户以 <code>/</code> 开头的输入会被当作命令。<code>BUILTIN_SLASH_COMMANDS</code>（<code>packages/coding-agent/src/core/slash-commands.ts</code>）定义了 22 个内置命令：</p>
+
+<pre class="code" data-lang="text">/settings  /model  /scoped-models  /export  /import  /share  /copy
+/name  /session  /changelog  /hotkeys  /fork  /clone  /tree
+/trust  /login  /logout  /new  /compact  /resume  /reload  /quit</pre>
+
+<p>这些命令分几类：</p>
+
+<ul>
+<li><strong>会话管理</strong>：<code>/new</code>（新会话）、<code>/session</code>（切换）、<code>/fork</code>/<code>/clone</code>（分支）、<code>/tree</code>（查看会话树）、<code>/resume</code>（恢复）、<code>/name</code>（命名）</li>
+<li><strong>模型与设置</strong>：<code>/model</code>（选模型）、<code>/scoped-models</code>、<code>/settings</code>、<code>/hotkeys</code></li>
+<li><strong>压缩</strong>：<code>/compact</code>（手动压缩，第 7 章）</li>
+<li><strong>导入导出</strong>：<code>/export</code>/<code>/import</code>（HTML/JSONL）、<code>/share</code>（GitHub gist）、<code>/copy</code></li>
+<li><strong>认证</strong>：<code>/login</code>/<code>/logout</code></li>
+<li><strong>信任</strong>：<code>/trust</code>（项目信任，第 1 章）</li>
+<li><strong>扩展</strong>：<code>/reload</code>（重新加载扩展/资源）</li>
+</ul>
+
+<p>回忆第 9 章：<code>prompt()</code> 漏斗的第一步就是 <code>_tryExecuteExtensionCommand</code>——以 <code>/</code> 开头的输入先尝试匹配扩展命令。扩展、skills、模板都可以注册自己的斜杠命令（<code>SlashCommandSource = "extension" | "prompt" | "skill"</code>），与内置命令共享同一个 <code>/</code> 入口。于是 <code>/</code> 成了产品、扩展、skill、模板的统一命令面。</p>
+
+<hr class="sep">
+
+<h2 id="loader"><code>ResourceLoader</code>：资源的发现者</h2>
+
+<p>skills、模板、上下文文件、扩展、主题——这些资源从哪里来？由 <code>ResourceLoader</code> 统一发现（<code>packages/coding-agent/src/core/resource-loader.ts</code>）：</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/resource-loader.ts">export interface ResourceLoader {
+	reload(): Promise&lt;...&gt;; // 重新发现并加载所有资源
+	// ...
+}
+export class DefaultResourceLoader implements ResourceLoader { ... }</pre>
+
+<p><code>DefaultResourceLoader.reload</code> 扫描多个位置（项目目录的 <code>.pi/</code>、用户全局的 <code>~/.pi/</code>、CLI flag 指定的路径），发现扩展、skills、prompt 模板、主题、上下文文件。它尊重 <code>--extension</code>/<code>--no-extensions</code>、<code>--skill</code>/<code>--no-skills</code>、<code>--prompt-template</code>、<code>--theme</code>、<code>--no-context-files</code> 等 flag。</p>
+
+<p><code>/reload</code> 命令会重新调用 <code>reload()</code>——当你编辑了一个扩展或 skill，不用重启 pi，<code>/reload</code> 就能重新加载。<code>AgentSessionRuntime</code>（第 8 章）的工厂闭包在这里发挥作用：reload 可能触发会话重建。</p>
+
+<p>资源发现也受项目信任门控——不信任的项目，其 <code>.pi/</code> 里的扩展和 skill 不会被加载。这又一次把第 1 章的安全模型落到了实处。</p>
+
+<hr class="sep">
+
+<h2 id="practice">实践应用</h2>
+
+<p>Pi Agent 的资源装配为"如何给 Agent 注入能力和指令"提供了四条可迁移的模式。</p>
+
+<p><strong>系统提示词是装配出来的，不是硬编码的。</strong> 工具列表来自工具的 snippet，指南根据激活工具条件生成，项目文件和 skills 动态注入。它解决的问题是：提示词与工具集/能力脱节，加一个工具要手动改提示词。当提示词从组件的自描述里装配，能力与提示词永远同步。</p>
+
+<p><strong>两阶段加载：目录进提示词，内容按需读。</strong> skill 只在提示词里放名字+描述+位置，完整 body 让模型用 read 工具按需加载。它解决的问题是：能力越多提示词越臃肿，最终撑爆上下文或稀释注意力。当只有"目录"常驻、"内容"按需，能力的数量就不再受提示词大小限制。这个模式适用于任何"有很多可选能力，但每次只用少数几个"的场景。</p>
+
+<p><strong>区分"给人的快捷方式"和"给模型的专业指令"。</strong> prompt 模板由用户输入时展开，skill 由模型按需读取——两者都是固化提示词，但触发者和时机不同。它解决的问题是：把两类需求混为一谈，导致要么用户记不住命令、要么模型不知道何时该用。分清服务对象，机制才能各司其职。</p>
+
+<p><strong>统一的命令入口，开放的注册面。</strong> 内置命令、扩展命令、skill、模板共享 <code>/</code> 入口，<code>prompt()</code> 漏斗第一步就分发给扩展。它解决的问题是：命令系统封闭，扩展无法拥有自己的命令。当入口统一且对扩展开放，产品的命令面可以随扩展线性增长。</p>
+
+<hr class="sep">
+
+<h2 id="summary">总结</h2>
+
+<p>Pi Agent 的系统提示词是装配出来的：<code>buildSystemPrompt</code> 从激活工具的 <code>promptSnippet</code>/<code>promptGuidelines</code> 拼出工具列表和指南（工具自描述的胜利），把项目上下文文件包进 <code>&lt;project_context&gt;</code>（受项目信任门控），用两阶段加载注入 skills（目录进提示词、body 按需读），最后加上工作目录。prompt 模板和 skills 是两种"可复用提示词"，分别服务用户和模型；22 个内置斜杠命令与扩展/skill/模板命令共享 <code>/</code> 入口；<code>ResourceLoader</code> 统一发现所有资源，并支持 <code>/reload</code> 热加载。</p>
+
+<p>最深刻的是两阶段 skill 加载。它用"目录常驻、内容按需"解决了"能力越多、提示词越臃肿"的根本矛盾——这又一次体现了 Pi Agent 的核心哲学：把复杂性推到边缘，让核心（这里是系统提示词）保持精简。</p>
+
+<p>下一章，我们看装配好的 <code>AgentSession</code> 如何被三种运行模式消费——同一条事件流，三种截然不同的呈现。</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>
