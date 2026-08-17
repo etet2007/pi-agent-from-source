@@ -92,7 +92,6 @@ hr.sep { border: none; border-top: 1px solid var(--border); margin: 3rem 0; }
   border-bottom: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #pb-header .pb-site:hover { border-bottom: none; }
-#pb-header .pb-site .pb-mark { color: var(--accent); font-weight: 800; }
 #pb-header .pb-site .pb-crumb {
   color: var(--fg-muted); font-weight: 500; font-size: 0.9em;
   overflow: hidden; text-overflow: ellipsis;

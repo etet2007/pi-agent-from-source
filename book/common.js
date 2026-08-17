@@ -65,9 +65,7 @@
 
     var site = el("a", "pb-site");
     site.href = "index.html";
-    var mark = el("span", "pb-mark", "π");
     var name = el("span", "pb-name", BOOK.title);
-    site.appendChild(mark);
     site.appendChild(name);
     if (ch && ch.no) {
       var crumb = el("span", "pb-crumb", "第 " + ch.no + " 章 · " + ch.title);
