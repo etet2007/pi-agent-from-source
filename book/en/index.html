@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preface · Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-page="index">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">PI AGENT FROM SOURCE</p>
+  <h1>Pi Agent Source Code Analysis</h1>
+  <p class="chapter-sub">The architecture, patterns, and internals of a minimal AI coding agent</p>
+</header>
+
+<div class="epigraph">
+  <p>This book is an educational source-code study. Its subject, <a href="https://pi.dev">Pi Agent</a> (<code>@earendil-works/pi-coding-agent</code> and its sibling packages), is an MIT-licensed open-source project, so every code excerpt here is taken directly from the real source, with file paths and function names you can verify one by one. This book is independent of Pi Agent's maintainers and has not been endorsed or sponsored by them.</p>
+  <p>The analysis is based on version <code>v0.83.0</code> of each package in the monorepo.</p>
+</div>
+
+<h2 id="q1">The Question This Book Sets Out to Answer</h2>
+
+<p>Most production-grade AI coding agents on the market are behemoths. Claude Code, for instance, is a monolith of nearly two thousand TypeScript files: seven built-in permission modes, more than forty tools, a forked terminal renderer, four layers of context compaction, and twenty-seven lifecycle hooks. Its complexity is submarine-grade complexity — behind every <code>if</code> branch stands a failure mode that once caused an incident in production.</p>
+
+<p>Pi Agent chose the opposite direction. The first sentence of its <code>CONTRIBUTING.md</code> reads:</p>
+
+<blockquote><p><strong>pi's core is minimal.</strong> If your feature does not belong in the core, it should be an extension.</p></blockquote>
+
+<p>This is not marketing copy; it is an organizing principle that runs through the entire codebase. Pi Agent has no built-in per-tool permission approval system — it hands isolation to the container; it has no MCP and no Claude Code-style lifecycle hooks — it hands extensibility to a TypeScript extension system; its core agent loop is not a thousand-line "submarine" but a clean two-layer nested state machine. The whole product is split into nine npm packages, each with a single responsibility and independently reusable, from the lowest-level unified LLM API (<code>pi-ai</code>), to the agent runtime (<code>pi-agent-core</code>), to the terminal UI library (<code>pi-tui</code>), up to the CLI that assembles everything (<code>pi-coding-agent</code>).</p>
+
+<p>The core question this book answers is:</p>
+
+<div class="epigraph">
+  <p><strong>How does an agent that deliberately stays minimal keep complexity out of its core without sacrificing production-grade capability?</strong></p>
+</div>
+
+<p>We will dismantle the system bottom-up along the dependency stack. Each chapter focuses on one abstraction, making clear what it <em>is</em>, <em>why it is designed this way</em>, and <em>what would be lost under a different design</em>.</p>
+
+<h2 id="contrast">A Contrast with Claude Code</h2>
+
+<p>This book borrows the structure and narrative approach of Analyzing Claude Code, the companion book, but the two subjects are almost opposites in design philosophy, so the chapter structure has been adjusted accordingly. The table below is a rough side-by-side of the two routes, useful as a mental anchor while reading:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Dimension</th><th>Claude Code (comprehensive route)</th><th>Pi Agent (minimal route)</th></tr></thead>
+<tbody>
+<tr><td>Code organization</td><td>A monolith of nearly two thousand files</td><td>Nine single-responsibility packages</td></tr>
+<tr><td>Agent loop</td><td><code>query.ts</code>, a single <code>while(true)</code> of about 1,730 lines</td><td><code>agent-loop.ts</code>, a clean two-layer nested loop</td></tr>
+<tr><td>Permissions</td><td>Seven built-in permission modes + per-tool approval</td><td>No built-in approval; project trust + containerized isolation</td></tr>
+<tr><td>Extensibility</td><td>Lifecycle hooks (27 events) + MCP</td><td>TypeScript extension system + skills + templates</td></tr>
+<tr><td>Terminal UI</td><td>A forked Ink/React renderer</td><td>A fully homegrown string-diffing renderer</td></tr>
+<tr><td>Session storage</td><td>Message arrays + compaction</td><td>An appendable, forkable <strong>session tree</strong></td></tr>
+<tr><td>Multi-provider</td><td>Four infrastructure paths, one SDK</td><td>A two-layer <code>Api</code> (protocol)/<code>Provider</code> (endpoint) abstraction, ~38 providers</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>It is worth stressing: minimal does not mean crude. Pi Agent moves "comprehensiveness" from the core to the <strong>edges</strong> — into extensions, into containers, into an optional daemon. The core therefore stays small and clean, while the system's overall capability boundary does not shrink. Understanding how this "conservation of complexity" is achieved is the main thread of this book.</p>
+
+<h2 id="packages">Nine Packages, One Dependency Graph</h2>
+
+<p>Pi Agent is a monorepo. Understanding the responsibilities and dependency directions of these nine packages is a prerequisite for understanding the whole system. The book's chapters unfold largely bottom-up along this graph:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="packages" data-w="880" data-h="520"></canvas></div>
+  <figcaption>Figure 1: The dependency stack of the nine packages. The top three layers form a one-way dependency chain of "model layer → runtime layer → product layer"; persistence &amp; connectivity and quality are independent side branches.</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Package</th><th>npm name</th><th>One-line responsibility</th><th>Chapters</th></tr></thead>
+<tbody>
+<tr><td><code>packages/ai</code></td><td><code>@earendil-works/pi-ai</code></td><td>Unifies roughly 38 LLM providers behind a single streaming API</td><td>Chapter 2</td></tr>
+<tr><td><code>packages/agent</code></td><td><code>@earendil-works/pi-agent-core</code></td><td>Agent loop, tool execution, state, and the optional persistent Harness</td><td>Chapters 3–7</td></tr>
+<tr><td><code>packages/tui</code></td><td><code>@earendil-works/pi-tui</code></td><td>A fully homegrown terminal UI library with diff rendering</td><td>Chapters 12–13</td></tr>
+<tr><td><code>packages/coding-agent</code></td><td><code>@earendil-works/pi-coding-agent</code></td><td>The <code>pi</code> command itself, the CLI product that assembles everything</td><td>Chapters 8–11, 14</td></tr>
+<tr><td><code>packages/protocol</code></td><td><code>@earendil-works/pi-protocol</code></td><td>A transport-agnostic CBOR remote-session protocol</td><td>Chapter 15</td></tr>
+<tr><td><code>packages/client</code></td><td><code>@earendil-works/pi-client</code></td><td>A runtime-agnostic remote-session client</td><td>Chapter 15</td></tr>
+<tr><td><code>packages/server</code></td><td><code>@earendil-works/pi-server</code></td><td>A daemon that supervises multiple headless agent subprocesses</td><td>Chapter 15</td></tr>
+<tr><td><code>packages/storage/sqlite-node</code></td><td><code>@earendil-works/pi-storage-sqlite-node</code></td><td>SQLite storage backend for the session tree + full-text search</td><td>Chapter 5</td></tr>
+<tr><td><code>packages/evals</code></td><td><code>@earendil-works/pi-evals</code></td><td>A model-driven behavioral evaluation framework</td><td>Chapter 16</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="golden">The Golden Path: From a Keystroke to an Output</h2>
+
+<p>As with the reference book, we first establish a "golden path" that runs through the whole book. When you type <code>pi</code> in the terminal and enter "fix the null-pointer bug in auth.ts", the request flows through the system like this:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="golden" data-w="920" data-h="720"></canvas></div>
+  <figcaption>Figure 2: The golden path of a single prompt. Model calls never throw, the loop is an event stream, and tool execution is orthogonal to the model boundary — these three properties shape the entire path.</figcaption>
+</figure>
+
+<p>Every segment of this path is expanded in a later chapter:</p>
+
+<ul>
+<li>How the <code>pi</code> command starts and decides which mode to enter → <a href="ch08-bootstrap.html">Chapter 8</a></li>
+<li>How <code>AgentSession</code> orchestrates a conversation turn and expands skills and templates → <a href="ch09-agent-session.html">Chapter 9</a>, <a href="ch10-system-prompt.html">Chapter 10</a></li>
+<li>How the <code>Agent</code> core loop streams model calls, executes tools, and decides when to stop → <a href="ch03-agent-loop.html">Chapter 3</a>, <a href="ch04-tools.html">Chapter 4</a></li>
+<li>How <code>pi-ai</code> routes the request to the right provider and parses the streaming response → <a href="ch02-ai-layer.html">Chapter 2</a></li>
+<li>How <code>InteractiveMode</code> renders the event stream to the terminal screen → <a href="ch11-modes.html">Chapter 11</a>, <a href="ch12-tui-rendering.html">Chapter 12</a></li>
+<li>How this conversation turn is persisted into the session tree → <a href="ch05-state-and-session-tree.html">Chapter 5</a></li>
+</ul>
+
+<p>Once you internalize this path, every later chapter is just a deep dive into one of its segments.</p>
+
+<h2 id="structure">Structure of the Book</h2>
+
+<p>The book has seven parts. Part I establishes the big picture; Part II is the heartbeat of the system — the core loop, tools, and state; Part III covers the optional persistent orchestration and compaction; Part IV covers how the <code>pi</code> command product assembles everything; Part V covers the terminal UI; Part VI covers extensions and connectivity; Part VII is quality and the conclusion.</p>
+
+<div class="toc-part">
+<h3>Part I · Foundations</h3>
+<p class="toc-part-sub">Before an agent can think, it needs a layer that can talk to models.</p>
+<ol class="toc-list">
+<li><a href="ch01-architecture.html"><span class="toc-no">01</span><span class="toc-title">Architecture Overview: The Design Philosophy of a Minimal Agent</span><span class="toc-brief">The nine-package dependency stack, the core/harness split, project trust, and a comparison with the monolith route</span></a></li>
+<li><a href="ch02-ai-layer.html"><span class="toc-no">02</span><span class="toc-title">Talking to Models: The pi-ai Unified LLM Layer</span><span class="toc-brief">The Api/Provider two-layer abstraction, unified message format, EventStream, SSE parsing, lazy loading, model metadata generation, two-layer retries, and cost accounting</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part II · Agent Core</h3>
+<p class="toc-part-sub">The heartbeat of the system: stream output, execute tools, observe results, repeat.</p>
+<ol class="toc-list">
+<li><a href="ch03-agent-loop.html"><span class="toc-no">03</span><span class="toc-title">Agent Loop: Two Nested Loops</span><span class="toc-brief">The runLoop state machine, the StreamFn boundary, the AgentEvent stream, continue/stop decisions, and truncation protection</span></a></li>
+<li><a href="ch04-tools.html"><span class="toc-no">04</span><span class="toc-title">The Tool System: From Definition to Execution</span><span class="toc-brief">The AgentTool interface, the prepare/execute/finalize phases, sequential vs parallel, the file-mutex queue, and the seven built-in tools</span></a></li>
+<li><a href="ch05-state-and-session-tree.html"><span class="toc-no">05</span><span class="toc-title">State, Messages, and the Session Tree</span><span class="toc-brief">Mutable AgentState, AgentMessage and declaration merging, convertToLlm, the appendable/forkable session tree, and JSONL/SQLite storage backends</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part III · Persistent Orchestration</h3>
+<p class="toc-part-sub">Giving the agent memory and structure across turns and sessions.</p>
+<ol class="toc-list">
+<li><a href="ch06-harness.html"><span class="toc-no">06</span><span class="toc-title">AgentHarness: A Persistable Orchestrator</span><span class="toc-brief">The core/harness layering, the phase state machine, turn snapshots, the hook system, write buffering, and ExecutionEnv dependency inversion</span></a></li>
+<li><a href="ch07-compaction.html"><span class="toc-no">07</span><span class="toc-title">Context Compaction and Branch Summaries</span><span class="toc-brief">shouldCompact, cut-point selection, summary generation, branch summaries, and token estimation</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part IV · Coding Agent Product</h3>
+<p class="toc-part-sub">How the <code>pi</code> command assembles all of the above into a usable product.</p>
+<ol class="toc-list">
+<li><a href="ch08-bootstrap.html"><span class="toc-no">08</span><span class="toc-title">The Bootstrap Pipeline: From cli.ts to Mode Dispatch</span><span class="toc-brief">The entry shim, the main() bootstrap sequence, resolveAppMode, argument parsing, and the three operating modes</span></a></li>
+<li><a href="ch09-agent-session.html"><span class="toc-no">09</span><span class="toc-title">AgentSession: The Central Orchestrator</span><span class="toc-brief">createAgentSession as the assembly point, the event system, the prompt() lifecycle, and the steering/follow-up queues</span></a></li>
+<li><a href="ch10-system-prompt.html"><span class="toc-no">10</span><span class="toc-title">System Prompts and Resource Assembly</span><span class="toc-brief">buildSystemPrompt, skills, prompt templates, project context files, and slash commands</span></a></li>
+<li><a href="ch11-modes.html"><span class="toc-no">11</span><span class="toc-title">Three Operating Modes</span><span class="toc-brief">The interactive TUI REPL, print/headless mode, and how RPC mode consumes the same event stream</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part V · Terminal UI</h3>
+<p class="toc-part-sub">Everything the user sees flows through this layer — and it was written from scratch.</p>
+<ol class="toc-list">
+<li><a href="ch12-tui-rendering.html"><span class="toc-no">12</span><span class="toc-title">pi-tui: A Homegrown Renderer</span><span class="toc-brief">Components as render(width) =&gt; string[], line-by-line diffing, the main/alternate dual renderers, frame scheduling, and synchronized output</span></a></li>
+<li><a href="ch13-input-and-editor.html"><span class="toc-no">13</span><span class="toc-title">Input, Keybindings, and the Editor</span><span class="toc-brief">Kitty keyboard protocol negotiation, StdinBuffer sequence reassembly, key parsing, keybindings, and the Editor component</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part VI · Extensions &amp; Connectivity</h3>
+<p class="toc-part-sub">How the minimal core extends outward without being drowned in complexity.</p>
+<ol class="toc-list">
+<li><a href="ch14-extensions.html"><span class="toc-no">14</span><span class="toc-title">The Extension System: Extending the Minimal Core</span><span class="toc-brief">ExtensionAPI, registering tools/commands/keybindings/flags, skills/templates/themes, and why there is no MCP or hooks</span></a></li>
+<li><a href="ch15-remote.html"><span class="toc-no">15</span><span class="toc-title">Remote Control: Daemon, RPC, and Protocols</span><span class="toc-brief">The pi-server supervisor, headless RPC subprocesses, the Radius relay, and the CBOR channel of pi-protocol/pi-client</span></a></li>
+</ol>
+</div>
+
+<div class="toc-part">
+<h3>Part VII · Quality &amp; Conclusion</h3>
+<p class="toc-part-sub">How to verify that an agent is actually getting better, and what we learned along the way.</p>
+<ol class="toc-list">
+<li><a href="ch16-evals.html"><span class="toc-no">16</span><span class="toc-title">Behavioral Evaluation: pi-evals</span><span class="toc-brief">Model-driven end-to-end evaluation, the harness comparison table, pass-rate lift, and paired token/latency/cost deltas</span></a></li>
+<li><a href="ch17-epilogue.html"><span class="toc-no">17</span><span class="toc-title">Epilogue: The Minimalist Bet</span><span class="toc-brief">Six architectural bets, transferable lessons, and the minimalism-versus-comprehensiveness tradeoff</span></a></li>
+</ol>
+</div>
+
+<h2 id="patterns">Ten Patterns Running Through the Book</h2>
+
+<p>If you only read these:</p>
+
+<ol>
+<li><strong>Layering is a firewall</strong> — split the system into the <code>ai → agent → coding-agent</code> dependency stack; each layer depends only on the abstraction of the layer below, and complexity is held back by the interfaces between layers.</li>
+<li><strong>Separating <code>Api</code> from <code>Provider</code></strong> — roughly ten "wire protocol" adapters unify about 38 providers; the protocols are few, the endpoints are many.</li>
+<li><strong>The stream is the contract</strong> — the <code>EventStream</code> async-iterable primitive runs through the whole stack; failures are not thrown but encoded into the stream's terminal event.</li>
+<li><strong>Two nested loops</strong> — the inner loop handles tool calls and steering, the outer loop handles follow-ups; every continue-and-stop decision is explicitly visible.</li>
+<li><strong>Tools are self-describing objects</strong> — concurrency modes, parameter schemas, and UI rendering all cohere inside the tool definition; the loop itself knows nothing about tools.</li>
+<li><strong>The session is a tree</strong> — the transcript is not a flat array but an appendable, forkable, compactable tree of immutable entries, with <code>leaf</code> marking the current position.</li>
+<li><strong>The core/harness split</strong> — the same package holds both the pure minimal loop and the optional persistent orchestrator; a product can pick either one.</li>
+<li><strong>Project trust replaces per-tool approval</strong> — instead of popping a dialog before every tool call, it asks once "do you trust the resources in this project?" and hands isolation to the container.</li>
+<li><strong>Rendering is string diffing</strong> — components output <code>string[]</code>, and the renderer only does a line-by-line equality scan plus synchronized output; there is no virtual DOM.</li>
+<li><strong>Extensions are typed</strong> — extensibility does not rely on runtime hook strings but on a strongly typed <code>ExtensionAPI</code> with about 40 events.</li>
+</ol>
+
+<h2 id="conventions">Code Citation Conventions</h2>
+
+<ul>
+<li>All file paths in the book are <strong>relative to the <code>pi-agent-src/</code> directory</strong> (the root of the Pi Agent repository). For example, <code>packages/agent/src/agent-loop.ts</code> refers to <code>pi-agent-src/packages/agent/src/agent-loop.ts</code>.</li>
+<li>For clarity, code excerpts may omit some type annotations or branches, but function names, type names, field names, and file locations all match the source and can be looked up and verified directly.</li>
+<li>The analysis is based on version <code>v0.83.0</code> of each package in the monorepo.</li>
+</ul>
+
+<h2 id="audience">Intended Audience</h2>
+
+<ul>
+<li><strong>Engineers building agentic systems</strong> — who want to see how the "minimal" route plays out in practice and borrow transferable patterns.</li>
+<li><strong>Technical leads evaluating architectures</strong> — weighing the "comprehensive" route against "minimal core + extensions".</li>
+<li><strong>Anyone curious about how production-grade AI tools work under the hood</strong> — especially those who want to understand how an open-source agent organizes its code and its boundaries.</li>
+</ul>
+
+<h2 id="disclaimer">Disclaimer</h2>
+
+<p>This book is an independent technical analysis for purely educational purposes. Pi Agent is the product of its respective maintainers; this book is unrelated to it and has not been endorsed or sponsored by them. The views expressed are the author's interpretations based on the source code; in case of any errors or omissions, the source code prevails.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("packages", function (d) {
+  d.stack({
+    x: 60, y: 20, w: 760, gap: 16,
+    layers: [
+      { label: "Product layer · packages/coding-agent", sub: "The pi CLI itself", tone: "gold", perRow: 3,
+        items: ["AgentSession orchestration", "Built-in tools & extensions", "Three operating modes", "System prompt & resources", "Project trust", "Bootstrap & CLI"] },
+      { label: "Runtime layer · packages/agent + packages/tui", sub: "Core loop / diff rendering", tone: "teal", perRow: 3,
+        items: ["agent-loop nested loops", "Tool execution core", "Optional Harness persistence"] },
+      { label: "Base layer · packages/ai", sub: "Unified LLM API", tone: "accent", perRow: 3,
+        items: ["Api / Provider abstraction", "Streaming event stream", "Model metadata & retries"] },
+      { label: "Persistence & connectivity", sub: "storage · protocol · client · server", tone: "violet", perRow: 4,
+        items: ["SQLite session storage + FTS", "CBOR remote protocol", "Transport-agnostic client", "Daemon / supervisor"] },
+      { label: "Quality · packages/evals", sub: "Behavioral evaluation", tone: "slate", perRow: 3,
+        items: ["Model-driven end-to-end evaluation"] }
+    ]
+  });
+});
+
+PB.fig("golden", function (d) {
+  d.sequence({
+    x: 30, y: 16, w: 860, rowH: 38, tailPad: 8,
+    participants: [
+      { id: "U", label: "User / TUI", tone: "accent" },
+      { id: "IM", label: "InteractiveMode", tone: "slate" },
+      { id: "AS", label: "AgentSession", tone: "teal" },
+      { id: "A", label: "Agent (runLoop)", tone: "gold" },
+      { id: "AI", label: "pi-ai", tone: "violet" },
+      { id: "T", label: "Tool system", tone: "slate" }
+    ],
+    steps: [
+      { from: "U", to: "IM", label: "Type prompt, Enter" },
+      { from: "IM", to: "AS", label: "prompt(text)" },
+      { from: "AS", to: "AS", kind: "self", label: "Expand skills/templates, check compaction" },
+      { from: "AS", to: "A", label: "agent.prompt(messages)" },
+      { from: "A", to: "A", kind: "self", label: "convertToLlm: AgentMessage[] → Message[]" },
+      { from: "A", to: "AI", label: "streamFn(model, context)" },
+      { from: "AI", to: "A", kind: "return", label: "Stream AssistantMessageEvent" },
+      { from: "A", to: "AS", kind: "return", label: "AgentEvent (message_update…)" },
+      { from: "AS", to: "IM", kind: "return", label: "Forward events" },
+      { from: "IM", to: "U", kind: "return", label: "Render text incrementally" },
+      { from: "A", to: "T", label: "Run tool (read / edit / bash)" },
+      { from: "T", to: "A", kind: "return", label: "ToolResultMessage" },
+      { from: "A", to: "AI", label: "Stream again with tool results" },
+      { from: "A", to: "AS", kind: "return", label: "agent_end" },
+      { from: "AS", to: "AS", kind: "self", label: "Persist to session tree (JSONL)" },
+      { from: "IM", to: "U", kind: "return", label: "Render final result" }
+    ]
+  });
+});
+</script>
+</body>
+</html>

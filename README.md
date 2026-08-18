@@ -1,13 +1,15 @@
 # Pi Agent 源码解析
 
+[ **中文** | [English](README.en.md) ]
+
 一份教育性的源码分析笔记：逐行拆解 [Pi Agent](https://pi.dev)（`@earendil-works/pi-coding-agent` 及其同族包）——一个刻意保持最小化的开源编码 Agent（版本 `v0.83.0`）。
 
-全书以中文写成，用**零依赖 HTML** 直接编写（仅 `book/style.css` 与 `book/common.js` 两个共享文件），无构建步骤、无第三方库，浏览器打开即可阅读。
+全书以中文写成，用**零依赖 HTML** 直接编写（仅 `book/style.css` 与 `book/common.js` 两个共享文件），无构建步骤、无第三方库，浏览器打开即可阅读。英文版位于 `book/en/`（部署后以 `/en/...` 访问）。
 
 ## 如何阅读
 
-- **在线**：<https://kuwii.xyz/pi-agent-from-source/>
-- **本地**：直接用浏览器打开 `book/index.html` 即可（`file://` 协议，无需起服务器或安装任何依赖）
+- **在线**：<https://kuwii.xyz/pi-agent-from-source/>；英文版在 `/en/` 下（<https://kuwii.xyz/pi-agent-from-source/en/>）
+- **本地**：直接用浏览器打开 `book/index.html` 即可（`file://` 协议，无需起服务器或安装任何依赖）；英文版打开 `book/en/index.html`
 
 ## 关于本书
 
@@ -32,6 +34,7 @@ Pi Agent 是"最小化"路线的一个极端样本：九个职责单一的 npm �
 | 路径 | 说明 |
 |---|---|
 | `book/` | 书籍全部内容：`index.html`（序言）与 `ch01–ch17` 各章，以及共享的 `style.css`、`common.js` |
+| `book/en/` | 英文版（同框架、英文内容），部署后位于 `/en/...` |
 | `pi-agent-src/` | git submodule，指向上游 [earendil-works/pi](https://github.com/earendil-works/pi.git)，**只读分析对象** |
 | `AGENTS.md` | 给 AI 维护者的写作规范与事项清单 |
 

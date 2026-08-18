@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 8 · The Bootstrap Pipeline: From cli.ts to Mode Dispatch | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch08">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part IV · Coding Agent Product</p>
+  <h1>Chapter 8: The Bootstrap Pipeline: From cli.ts to Mode Dispatch</h1>
+  <p class="chapter-sub">The full startup journey, from process-level setup to three run shapes: subcommands exit early, TTY detection auto-downgrades - all in service of loading nothing you don't need</p>
+</header>
+
+<h2 id="birth">The Birth of a Command</h2>
+
+<p>Across the previous three parts, we worked bottom-up through <code>pi-ai</code> (the model layer) and <code>pi-agent-core</code> (the runtime layer). Now we enter the product layer, <code>pi-coding-agent</code> - the <code>pi</code> command itself. This chapter traces the most everyday of actions: what happens between the moment you type <code>pi</code> and press Enter, and the moment the prompt waiting for input appears on screen.</p>
+
+<p>The startup pipeline may look trivial, but it exposes a product's core architectural decisions. Pi Agent's startup must answer a chain of questions in a very short time: which mode? which model? trust this project? load which extensions? activate which tools? And these decisions must be made <strong>without loading anything you don't need</strong> - recall the lazy loading of Chapter 2; startup speed is Pi Agent's obsession.</p>
+
+<p>We will see how this pipeline fans out "one CLI command" into three very different run shapes: the interactive TUI, headless print, and RPC for IDEs.</p>
+
+<hr class="sep">
+
+<h2 id="shim">The Entry Shim: cli.ts</h2>
+
+<p>Everything starts with a minimal entry file (<code>packages/coding-agent/src/cli.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/cli.ts">#!/usr/bin/env node
+import { APP_NAME } from "./config.ts";
+import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { main } from "./main.ts";
+
+process.title = APP_NAME;
+process.env.PI_CODING_AGENT = "true";
+process.emitWarning = (() =&gt; {}) as typeof process.emitWarning;
+
+// 在任何提供商 SDK 发请求之前配置 undici 的全局 dispatcher
+configureHttpDispatcher();
+
+main(process.argv.slice(2));</pre>
+
+<p>This file does just four things, each deliberate:</p>
+
+<ul>
+<li><strong><code>process.title = APP_NAME</code></strong>: sets the process name to <code>pi</code>, so <code>ps</code> shows <code>pi</code> instead of <code>node</code>.</li>
+<li><strong><code>process.env.PI_CODING_AGENT = "true"</code></strong>: stamps an environment marker. Child processes (like the shells tools launch) can use it to know they are running inside pi.</li>
+<li><strong><code>process.emitWarning = () =&gt; {}</code></strong>: silences Node's warning output. A user-facing CLI should not be spammed with DeprecationWarnings.</li>
+<li><strong><code>configureHttpDispatcher()</code></strong>: configures the global dispatcher of undici (Node's HTTP client) <strong>before</strong> any provider SDK sends a request - this is where the HTTP proxy is set. The comment stresses the timing: it must happen before the first request.</li>
+</ul>
+
+<p>Then it calls the real bootstrap function, <code>main(process.argv.slice(2))</code>. Separating the entry shim from the bootstrap logic lets <code>main</code> be called programmatically - SDK users, tests, and the daemon can call <code>main</code> or the lower-level <code>createAgentSession</code> directly without going through this shim.</p>
+
+<hr class="sep">
+
+<h2 id="bootstrap">main(): The Bootstrap Sequence</h2>
+
+<p><code>main()</code> (<code>packages/coding-agent/src/main.ts</code>, about 918 lines) is the real bootstrap. Its signature reveals an extension point:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">export interface MainOptions {
+	extensionFactories?: InlineExtension[];
+}
+export async function main(args: string[], options?: MainOptions)</pre>
+
+<p><code>extensionFactories</code> lets the caller inject inline extensions - the built-in llama.cpp extension joins through exactly this mechanism (detailed in Chapter 14).</p>
+
+<p>The bootstrap sequence looks roughly like this (in order):</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="bootflow" data-w="820" data-h="1340"></canvas></div>
+  <figcaption>Figure 1: The full decision chain of startup bootstrap. From <code>main(args)</code> to mode dispatch, three decision points (subcommand, version/export, help/model list) each carry a bypass that exits early.</figcaption>
+</figure>
+
+<p>A few key nodes deserve a closer look.</p>
+
+<p><strong>Subcommands exit early.</strong> Subcommands like <code>pi install/remove/update/list</code> (package management) and <code>pi auth print-api-key</code> (credential printing) are handled and exit early in bootstrap - they don't need a full Agent session. This avoids the waste of "wanting just a version number but waiting for an entire session to assemble."</p>
+
+<p><strong>The <code>createRuntime</code> factory closure.</strong> <code>main</code> does not create the session directly; instead it builds a <strong>factory closure</strong>, <code>createRuntime</code>, and hands it to <code>createAgentSessionRuntime</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">const createRuntime: CreateAgentSessionRuntimeFactory = async ({ ... }) =&gt; {
+	// 在这里解析项目信任、构建 services、创建 AgentSession
+	const trusted = await resolveProjectTrusted({ cwd, trustStore, trustOverride, defaultProjectTrust, extensionsResult, ... });
+	// ...
+};
+const runtime = await createAgentSessionRuntime(createRuntime, { ... });</pre>
+
+<p>Why a factory instead of creating directly? Because the session may need to be <strong>recreated</strong> - the <code>/reload</code> command, switching sessions, and forking all trigger a rebuild. The host, <code>AgentSessionRuntime</code>, holds the factory and calls it to reassemble a fresh session when needed. Chapter 9 will show this runtime host.</p>
+
+<p><strong>Project trust is decided during bootstrap.</strong> <code>resolveProjectTrusted</code> (the trust model from Chapter 1) is called during bootstrap to decide whether to load this project's extensions/skills/AGENTS.md. The decision affects later assembly - untrusted means project resources are skipped.</p>
+
+<hr class="sep">
+
+<h2 id="appmode">Mode Resolution: resolveAppMode</h2>
+
+<p>The core decision of bootstrap is "which mode to enter." That decision is surprisingly simple (<code>packages/coding-agent/src/main.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}</pre>
+
+<p>Four modes, in priority order:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Mode</th><th>Trigger</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td><code>rpc</code></td><td><code>--mode rpc</code></td><td>JSON-RPC over stdin/stdout, for IDEs/daemon</td></tr>
+<tr><td><code>json</code></td><td><code>--mode json</code></td><td>headless, streams all events out as JSON lines</td></tr>
+<tr><td><code>print</code></td><td><code>--print</code>/<code>-p</code>, or stdin/stdout is not a TTY</td><td>headless, prints only the final text</td></tr>
+<tr><td><code>interactive</code></td><td>default (both TTYs present)</td><td>full TUI REPL</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Notice the elegance of the third branch: <code>!stdinIsTTY || !stdoutIsTTY</code>. It means <code>echo "fix the bug" | pi</code> <strong>automatically downgrades</strong> to print mode - because stdin is occupied by a pipe, not an interactive terminal. Likewise, <code>pi &gt; out.txt</code> also downgrades. This embodies the Unix philosophy: a program should adjust its behavior based on whether it is attached to a terminal, so piped compositions just work. <code>--print</code> is explicit force; TTY detection is implicit inference.</p>
+
+<p><code>toPrintOutputMode</code> folds both <code>json</code> and <code>print</code> into the print path, differing only in the output format (<code>json</code> vs <code>text</code>):</p>
+
+<pre class="code" data-lang="ts">function toPrintOutputMode(appMode: AppMode): Exclude&lt;Mode, "rpc"&gt; {
+	return appMode === "json" ? "json" : "text";
+}</pre>
+
+<p>So <code>json</code> and <code>print</code> share the <code>runPrintMode</code> implementation, differing only in the output-mode parameter. RPC takes the entirely separate <code>runRpcMode</code>.</p>
+
+<hr class="sep">
+
+<h2 id="parseargs">Argument Parsing: parseArgs</h2>
+
+<p><code>parseArgs</code> (<code>packages/coding-agent/src/cli/args.ts</code>) parses command-line arguments into an <code>Args</code> object. Its fields cover the product's entire configurable surface:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/cli/args.ts">export interface Args {
+	provider?; model?; apiKey?;           // 模型选择
+	systemPrompt?; appendSystemPrompt?;    // 提示词定制
+	thinking?;                             // off|minimal|low|medium|high|xhigh|max
+	continue?; resume?;                    // 会话续接
+	help?; version?; mode?; name?;
+	noSession?; session?; sessionId?; fork?; sessionDir?; // 会话管理
+	models?;                               // Ctrl+P 循环的模型集
+	tools?; excludeTools?; noTools?; noBuiltinTools?; // 工具控制
+	extensions?; noExtensions?;            // 扩展控制
+	print?; export?; noSkills?; skills?;
+	promptTemplates?; themes?; noContextFiles?;
+	listModels?; offline?; alt?; verbose?;
+	projectTrustOverride?;                 // --approve / --no-approve
+	messages: string[];                    // 位置参数（提示词）
+	fileArgs: string[];                    // @file 参数
+	unknownFlags: Map&lt;string, boolean | string&gt;; // 未知 flag，留给扩展
+	diagnostics: ...;
+}</pre>
+
+<p>A few design choices stand out.</p>
+
+<p><strong>Fine-grained control over tools and extensions.</strong> <code>--tools</code>/<code>--exclude-tools</code>/<code>--no-tools</code>/<code>--no-builtin-tools</code> give precise control over the tool set - this is the CLI surface of Pi Agent's "allow/deny list replaces per-tool approval" security model (Chapter 1). <code>--extensions</code>/<code>--no-extensions</code> likewise control extension loading.</p>
+
+<p><strong>The <code>@file</code> argument.</strong> <code>fileArgs</code> collects arguments of the form <code>@path/to/file</code>, handled by <code>file-processor.ts</code> - appending the file's contents to the prompt. It's the convenient syntax for "feeding a file to the agent."</p>
+
+<p><strong><code>unknownFlags</code> is reserved for extensions.</strong> Any <code>--flag</code> that pi itself doesn't recognize is not an error; it's collected into <code>unknownFlags</code> and handed to the extension system. Extensions can register their own CLI flags (Chapter 14) and receive arguments through this mechanism. This is how the core CLI opens itself to extensions - the core doesn't reject unknown flags; it passes them to whoever might understand them.</p>
+
+<p>The help text generated by <code>printHelp</code> lists the built-in tool names (<code>read</code>, <code>bash</code>, <code>edit</code>, <code>write</code>, <code>grep</code>, <code>find</code>, <code>ls</code>) and all flags, and dynamically adds flags registered by extensions.</p>
+
+<hr class="sep">
+
+<h2 id="dispatch">Dispatch: Three Paths</h2>
+
+<p>The last step of bootstrap is dispatch by mode (<code>packages/coding-agent/src/main.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/main.ts">if (appMode === "rpc") {
+	printTimings();
+	await runRpcMode(runtime);
+} else if (appMode === "interactive") {
+	const interactiveMode = new InteractiveMode(runtime, {
+		migratedProviders,
+		modelFallbackMessage,
+		autoTrustOnReloadCwd,
+		initialMessage,
+		initialImages,
+		initialMessages: parsed.messages,
+		verbose: parsed.verbose,
+		alt: parsed.alt,
+	});
+	// ... startupBenchmark 特判 ...
+	printTimings();
+	await interactiveMode.run();
+} else {
+	printTimings();
+	const exitCode = await runPrintMode(runtime, {
+		mode: toPrintOutputMode(appMode),
+		messages: parsed.messages,
+		initialMessage,
+		initialImages,
+	});
+	stopThemeWatcher();
+	restoreStdout();
+	if (exitCode !== 0) process.exitCode = exitCode;
+	return;
+}</pre>
+
+<p>All three paths share the same <code>runtime</code> (<code>AgentSessionRuntime</code>), but consume it very differently:</p>
+
+<ul>
+<li><strong><code>runRpcMode(runtime)</code></strong>: enters a JSON-RPC loop, reading commands from stdin and writing responses/events to stdout until the peer closes. It renders no UI - it's for machines (IDEs, daemon).</li>
+<li><strong><code>new InteractiveMode(runtime).run()</code></strong>: builds a <code>pi-tui</code> TUI and enters the interactive REPL. This one is for humans.</li>
+<li><strong><code>runPrintMode(runtime, ...)</code></strong>: runs one (or a few) turns of conversation, writes the final text or a JSON event stream to stdout, then exits with an exit code. This one is for scripts and pipelines.</li>
+</ul>
+
+<p>Note that <code>printTimings()</code> is called before every path - if <code>PI_STARTUP_BENCHMARK</code> is set, it prints how long each startup stage took. Pi Agent's obsession with startup speed shows up in this performance instrumentation that can be switched on at any time.</p>
+
+<p>There's also a <code>startupBenchmark</code> special case: in interactive mode, if the startup benchmark is set, it <code>init()</code>s the TUI, waits 150ms for the stdin handler to consume the terminal query replies (Kitty keyboard protocol, device attributes, cell size - detailed in Chapter 13), then immediately <code>stop()</code>s and exits. This measures, precisely, the time "from startup to TUI ready."</p>
+
+<hr class="sep">
+
+<h2 id="assembly">The Assembly Hub: createAgentSession</h2>
+
+<p>Whatever the mode, everything ultimately needs an <code>AgentSession</code>. Its creation lives in <code>createAgentSession</code> in <code>packages/coding-agent/src/core/sdk.ts</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">export interface CreateAgentSessionOptions {
+	model?; thinkingLevel?; tools?; excludeTools?; noTools?; customTools?;
+	cwd?; agentDir?; resourceLoader?; settingsManager?; sessionManager?; modelRuntime?;
+	// ...
+}
+export interface CreateAgentSessionResult {
+	session: AgentSession;
+	extensionsResult: LoadExtensionsResult;
+	modelFallbackMessage?: string;
+}
+export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise&lt;CreateAgentSessionResult&gt;</pre>
+
+<p>This function is the hub where the three packages meet. It resolves cwd/agentDir, creates <code>ModelRuntime</code> (from <code>pi-ai</code>), <code>SettingsManager</code>, <code>SessionManager</code>, and <code>DefaultResourceLoader</code>, resolves the initial model and thinking level, computes the active tool set, then instantiates the core <code>Agent</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">agent = new Agent({
+	initialState: { systemPrompt: "", model, thinkingLevel, tools: [] },
+	convertToLlm: convertToLlmWithBlockImages,
+	streamFn: async (model, context, options) =&gt; {
+		const providerRetrySettings = settingsManager.getProviderRetrySettings();
+		// ... 解析超时、重试设置 ...
+		return modelRuntime.streamSimple(model, context, {
+			...options,
+			timeoutMs,
+			maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+			maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+			transformHeaders: async (requestHeaders) =&gt; {
+				const headers = mergeProviderAttributionHeaders(model, settingsManager, options?.sessionId, requestHeaders);
+				return headerRunner?.hasHandlers("before_provider_headers")
+					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+					: (headers ?? {});
+			},
+		});
+	},
+	// onPayload / onResponse / transformContext / 扩展 hook ...
+});</pre>
+
+<p>Look at this <code>streamFn</code>: it's a closure that plugs the core <code>Agent</code>'s <code>StreamFn</code> slot into <code>pi-ai</code>'s <code>modelRuntime.streamSimple</code>. But it's not a simple pass-through - in the middle it injects <strong>settings</strong> (timeouts and retry policy read from <code>SettingsManager</code>) and <strong>extension hooks</strong> (<code>transformHeaders</code> fires the extension's <code>before_provider_headers</code> event). This is the concrete embodiment of the product layer "building its own orchestration on top of the core Agent" (Chapter 6): the core only knows a <code>streamFn</code>; the product layer stuffs settings management and the extension system into that slot.</p>
+
+<p><code>convertToLlmWithBlockImages</code> is the product-grade version of the message bridge - on top of <code>convertToLlm</code>, it dynamically decides, based on <code>settingsManager.getBlockImages()</code>, whether to replace images with the placeholder text "Image reading is disabled." Note the comment: "Check setting dynamically so mid-session changes take effect" - settings are read dynamically on every call, so changing a setting mid-session takes effect immediately.</p>
+
+<p>Once <code>Agent</code> is created, it's wrapped into an <code>AgentSession</code> (the protagonist of Chapter 9). <code>createAgentSession</code> returns <code>{ session, extensionsResult, modelFallbackMessage }</code> - <code>extensionsResult</code> is the result of extension loading, and <code>modelFallbackMessage</code> is the notice "the model you asked for isn't available, so we fell back to another."</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's startup pipeline offers four transferable patterns for "how to design the startup of a CLI product."</p>
+
+<p><strong>Separate the entry shim from the bootstrap logic.</strong> <code>cli.ts</code> only does process-level setup (title, env, HTTP dispatcher) and then calls <code>main</code>; the bootstrap logic lives in <code>main</code> and can be called programmatically. The problem it solves: coupling the CLI entry to reusable logic forces SDK users and tests to go through the shim. After separation, the same <code>main</code>/<code>createAgentSession</code> serves the CLI, the SDK, and the daemon.</p>
+
+<p><strong>Use TTY detection to downgrade modes automatically.</strong> <code>!stdinIsTTY || !stdoutIsTTY</code> automatically switches to headless mode, letting piped compositions just work. The problem it solves: users would have to remember to add <code>--print</code> to use it in scripts. When a program adjusts itself based on whether it's attached to a terminal, <code>echo ... | pi</code> and <code>pi | grep ...</code> "just work" - that's the essence of Unix composability.</p>
+
+<p><strong>Use a factory closure to defer creation and support rebuilding.</strong> <code>main</code> doesn't create the session directly; it hands a <code>createRuntime</code> factory to the runtime host, which rebuilds when needed. The problem it solves: sessions need to be recreated (reload, switch, fork), but the creation logic was scattered around. Wrapping creation in a factory turns rebuilding into "just call the factory again."</p>
+
+<p><strong>Stay open to unknown input; hand it to whoever can handle it.</strong> The core CLI doesn't reject unknown <code>--flag</code>s; it collects them into <code>unknownFlags</code> and passes them to extensions. The problem it solves: either the core CLI is forced to know every extension's arguments, or extensions can't own their own arguments. When the core hands unknown input onward, extensions get their own CLI surface while the core stays stable.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>The startup of the <code>pi</code> command is a carefully designed pipeline: <code>cli.ts</code> does process-level setup, then calls <code>main</code>; <code>main</code> merges extensions, parses arguments, uses <code>resolveAppMode</code> (combining explicit flags and TTY detection) to decide which mode to enter, makes the project-trust decision during bootstrap, builds the <code>createRuntime</code> factory, creates the <code>AgentSessionRuntime</code> host, and finally dispatches to the three paths: <code>runRpcMode</code>/<code>InteractiveMode</code>/<code>runPrintMode</code>. All three paths share the same runtime but consume it differently - for machines, for humans, for scripts. And <code>createAgentSession</code> is the hub where the three packages meet: it plugs the core <code>Agent</code>'s <code>streamFn</code> slot into <code>pi-ai</code>, injecting settings management and extension hooks in between.</p>
+
+<p>Every design in the startup pipeline - subcommands exiting early, lazy loading, automatic TTY downgrade, the startup benchmark - points to the same obsession: be fast, and don't load anything you don't need.</p>
+
+<p>Next chapter, we go deep into the hub object all three paths share, <code>AgentSession</code> - how this 3,333-line central orchestrator drives a single turn of conversation.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("bootflow", function (d) {
+  d.box({ id: "A", x: 180, y: 40, w: 300, h: 50, title: "main(args)", tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 180, y: 116, w: 300, h: 50, title: "Merge builtInExtensions + inline", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "C", x: 180, y: 192, w: 300, h: 50, title: "Detect offline mode", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "D", x: 180, y: 268, w: 300, h: 50, title: "Create bootstrap SettingsManager", lines: ["Apply HTTP proxy"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "E", x: 180, y: 344, w: 300, h: 50, title: "Package mgmt / auth subcommand?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "E1", x: 560, y: 344, w: 230, h: 50, title: "Handle, exit early", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "F", x: 180, y: 420, w: 300, h: 50, title: "parseArgs(args)", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "G", x: 180, y: 496, w: 300, h: 50, title: "--version / --export?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "G1", x: 560, y: 496, w: 230, h: 50, title: "Handle, exit", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "H", x: 180, y: 572, w: 300, h: 50, title: "resolveAppMode", lines: ["Decide run mode"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "I", x: 180, y: 648, w: 300, h: 50, title: "Run migrations", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "J", x: 180, y: 724, w: 300, h: 50, title: "First-run setup (interactive only)", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "K", x: 180, y: 800, w: 300, h: 50, title: "createSessionManager", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "L", x: 180, y: 876, w: 300, h: 50, title: "resolveProjectTrusted", lines: ["Project trust decision"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "M", x: 180, y: 952, w: 300, h: 50, title: "Build createRuntime factory closure", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "N", x: 180, y: 1028, w: 300, h: 50, title: "createAgentSessionRuntime", tone: "teal", titleSize: 12.5 });
+  d.box({ id: "O", x: 180, y: 1104, w: 300, h: 50, title: "--help / --list-models?", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "O1", x: 560, y: 1104, w: 230, h: 50, title: "Print, exit", tone: "slate", titleSize: 12.5 });
+  d.box({ id: "P", x: 180, y: 1180, w: 300, h: 50, title: "Read piped stdin", lines: ["Prepare initial message / initTheme"], tone: "violet", titleSize: 12.5 });
+  d.box({ id: "Q", x: 180, y: 1256, w: 300, h: 50, title: "Dispatch by mode", tone: "accent", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "E1", { from: "right", to: "left", label: "yes" });
+  d.arrow("E", "F", { from: "bottom", to: "top", label: "no", labelDy: 0 });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "G1", { from: "right", to: "left", label: "yes" });
+  d.arrow("G", "H", { from: "bottom", to: "top", label: "no", labelDy: 0 });
+  d.arrow("H", "I", { from: "bottom", to: "top" });
+  d.arrow("I", "J", { from: "bottom", to: "top" });
+  d.arrow("J", "K", { from: "bottom", to: "top" });
+  d.arrow("K", "L", { from: "bottom", to: "top" });
+  d.arrow("L", "M", { from: "bottom", to: "top" });
+  d.arrow("M", "N", { from: "bottom", to: "top" });
+  d.arrow("N", "O", { from: "bottom", to: "top" });
+  d.arrow("O", "O1", { from: "right", to: "left", label: "yes" });
+  d.arrow("O", "P", { from: "bottom", to: "top", label: "no", labelDy: 0 });
+  d.arrow("P", "Q", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

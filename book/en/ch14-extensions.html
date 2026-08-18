@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 14 · The Extension System: Extending the Minimal Core | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch14">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part VI · Extensions &amp; Connectivity</p>
+  <h1>Chapter 14: The Extension System — Extending the Minimal Core</h1>
+  <p class="chapter-sub">A factory function, about 40 typed events, and four groups of registration surfaces — the core pushes every "do one more thing" need out to extensions</p>
+</header>
+
+<h2 id="cost">The Cost of Minimalism — and the Answer</h2>
+
+<p>By now you will have noticed that Pi Agent "lacks" quite a lot: no built-in per-tool permission approval, no MCP, no Claude Code's 27 runtime hooks. Chapter 1 called this "conservation of complexity" — those capabilities didn't disappear; they were pushed out of the core.</p>
+
+<p>This chapter reveals where they were pushed: the <strong>extension system</strong>. This is the payoff of the minimalism philosophy. The core can stay minimal because almost every "I want the agent to do one more thing" need can be met by an extension, without touching the core. Tools, commands, shortcuts, CLI flags, message rendering, lifecycle interception — extensions can register all of it.</p>
+
+<p>More importantly, Pi Agent's extensions are not runtime hook strings (<code>hooks.on("PreToolUse", ...)</code>), but a <strong>strongly typed TypeScript API</strong>. Behind this choice is careful thought about how extensibility and maintainability can coexist. This chapter dissects the system and answers the question that runs through the book: why would Pi Agent rather go without MCP, and still shape its extensibility the way it has?</p>
+
+<hr class="sep">
+
+<h2 id="shape">What an Extension Looks Like</h2>
+
+<p>An extension is simply a factory function (<code>packages/coding-agent/src/core/extensions/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export type ExtensionFactory = (pi: ExtensionAPI) =&gt; void | Promise&lt;void&gt;;</pre>
+
+<p>It receives a <code>pi</code> object (the <code>ExtensionAPI</code>) and registers things on it. A minimal extension might look like:</p>
+
+<pre class="code" data-lang="ts">export default function myExtension(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "hello",
+		label: "hello",
+		description: "Greet someone",
+		parameters: Type.Object({ name: Type.String() }),
+		async execute(_id, { name }) {
+			return { content: [{ type: "text", text: `Hello, ${name}!` }], details: {} };
+		},
+	});
+}</pre>
+
+<p>That's all there is to it. Drop it into the project's <code>.pi/extensions/</code> directory, and pi will discover and load it at startup — the model now has one more tool, <code>hello</code>. No config file, no manifest, no registry: a TypeScript file exporting a factory function is an extension.</p>
+
+<hr class="sep">
+
+<h2 id="extension-api"><code>ExtensionAPI</code>: ~40 Events and Registration Surfaces</h2>
+
+<p><code>ExtensionAPI</code> (<code>packages/coding-agent/src/core/extensions/types.ts:1193</code>) is everything an extension can do. It falls into a few broad categories.</p>
+
+<h3>Event Subscription: <code>on(...)</code></h3>
+
+<p>An extension can subscribe to about 40 events, each with a precisely typed payload and return value. <code>on</code> is a set of overloads:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export interface ExtensionAPI {
+	// 会话生命周期
+	on(event: "project_trust", handler: ProjectTrustHandler): void;
+	on(event: "session_start", handler: ExtensionHandler&lt;SessionStartEvent&gt;): void;
+	on(event: "session_before_switch", handler: ExtensionHandler&lt;SessionBeforeSwitchEvent, SessionBeforeSwitchResult&gt;): void;
+	on(event: "session_before_fork", handler: ExtensionHandler&lt;SessionBeforeForkEvent, SessionBeforeForkResult&gt;): void;
+	on(event: "session_before_compact", handler: ExtensionHandler&lt;SessionBeforeCompactEvent, SessionBeforeCompactResult&gt;): void;
+	on(event: "session_shutdown", handler: ExtensionHandler&lt;SessionShutdownEvent&gt;): void;
+	// 提供商层
+	on(event: "context", handler: ExtensionHandler&lt;ContextEvent, ContextEventResult&gt;): void;
+	on(event: "before_provider_request", handler: ExtensionHandler&lt;BeforeProviderRequestEvent, BeforeProviderRequestEventResult&gt;): void;
+	on(event: "before_provider_headers", handler: ExtensionHandler&lt;BeforeProviderHeadersEvent&gt;): void;
+	on(event: "after_provider_response", handler: ExtensionHandler&lt;AfterProviderResponseEvent&gt;): void;
+	// Agent / 轮次 / 消息
+	on(event: "before_agent_start", handler: ExtensionHandler&lt;BeforeAgentStartEvent, BeforeAgentStartEventResult&gt;): void;
+	on(event: "agent_start", handler: ExtensionHandler&lt;AgentStartEvent&gt;): void;
+	on(event: "turn_start", handler: ExtensionHandler&lt;TurnStartEvent&gt;): void;
+	on(event: "message_end", handler: ExtensionHandler&lt;MessageEndEvent, MessageEndEventResult&gt;): void;
+	// 工具
+	on(event: "tool_call", handler: ExtensionHandler&lt;ToolCallEvent, ToolCallEventResult&gt;): void;
+	on(event: "tool_result", handler: ExtensionHandler&lt;ToolResultEvent, ToolResultEventResult&gt;): void;
+	// 输入
+	on(event: "input", handler: ExtensionHandler&lt;InputEvent, InputEventResult&gt;): void;
+	on(event: "user_bash", handler: ExtensionHandler&lt;UserBashEvent, UserBashEventResult&gt;): void;
+	// ... 共约 40 种
+}</pre>
+
+<p>Note the <code>ExtensionHandler&lt;Event, Result&gt;</code> generic: every event's payload type and return type are precisely constrained. When you subscribe to <code>tool_call</code>, your handler receives an <code>event</code> of type <code>ToolCallEvent</code> and returns a <code>ToolCallEventResult</code> (you can block the tool with <code>{ block: true, reason }</code>). A wrong event name, payload field, or return type is a <strong>compile-time</strong> error.</p>
+
+<p>This stands in stark contrast to runtime hook strings. Recall the <code>AgentHarnessEventResultMap</code> from the Harness in Chapter 6 — the product-layer extension system inherits that "typed extension" taste and takes it further. The ~40 events cover the whole lifecycle: sessions, providers, agents, turns, messages, tools, and input.</p>
+
+<p>Many of these events are the productized exposure of seams we saw in earlier chapters:</p>
+
+<ul>
+<li><code>context</code> → the <code>transformContext</code> slot from Chapter 3</li>
+<li><code>tool_call</code>/<code>tool_result</code> → Chapter 4's <code>beforeToolCall</code>/<code>afterToolCall</code></li>
+<li><code>input</code> → extension interception of the <code>prompt()</code> funnel in Chapter 9</li>
+<li><code>before_provider_headers</code> → the <code>transformHeaders</code> inside Chapter 8's <code>streamFn</code></li>
+<li><code>session_before_compact</code>/<code>session_before_tree</code> → the compaction/fork hooks from Chapter 7</li>
+</ul>
+
+<p>The core and the Harness provide the mechanisms (the slots); the product-layer extension system exposes those mechanisms to extensions as about 40 typed events. It is yet another instance of layering.</p>
+
+<h3>Tool Registration: <code>registerTool</code></h3>
+
+<pre class="code" data-lang="ts">registerTool&lt;TParams extends TSchema, TDetails, TState&gt;(tool: ToolDefinition&lt;TParams, TDetails, TState&gt;): void;</pre>
+
+<p>Tools registered by extensions use the <code>ToolDefinition</code> from Chapter 4 — the rich interface with <code>promptSnippet</code>, <code>promptGuidelines</code>, <code>renderCall</code>, and <code>renderResult</code>. Custom tools thus get, for free: a place in the system prompt (snippet/guidelines, Chapter 10), rendering in the terminal (renderCall/renderResult, Chapter 12), and execution by the loop (Chapter 4). Internally, <code>registerTool</code> wraps the <code>ToolDefinition</code> into an <code>AgentTool</code> (<code>wrapToolDefinition</code>) and hands it to the core.</p>
+
+<p>Custom tools and built-in tools are completely equal in the system — the model neither knows nor cares whether a tool is built in or registered by an extension. This is the ultimate payoff of the self-describing tool design: extension tools need no special handling.</p>
+
+<h3>Command, Shortcut, and Flag Registration</h3>
+
+<pre class="code" data-lang="ts">registerCommand(name: string, options: Omit&lt;RegisteredCommand, "name" | "sourceInfo"&gt;): void;
+registerShortcut(shortcut: KeyId, options: { description?; handler: (ctx) =&gt; void | Promise&lt;void&gt; }): void;
+registerFlag(name: string, options: { description?; type: "boolean" | "string"; default? }): void;
+getFlag(name: string): boolean | string | undefined;</pre>
+
+<p>Extensions can register:</p>
+
+<ul>
+<li><strong>Slash commands</strong> (<code>registerCommand</code>): join the <code>/</code> command surface from Chapter 10, alongside the 22 built-in commands.</li>
+<li><strong>Shortcuts</strong> (<code>registerShortcut</code>): the <code>shortcut</code> is the type-safe <code>KeyId</code> from Chapter 13, bound to a handler.</li>
+<li><strong>CLI flags</strong> (<code>registerFlag</code>): recall Chapter 8 — the core CLI collects unknown <code>--flag</code>s into <code>unknownFlags</code>; an extension declares its own flags via <code>registerFlag</code> and reads them with <code>getFlag</code>. Extensions can thus own their command-line arguments.</li>
+</ul>
+
+<p>These three registration surfaces let extensions hook into every interaction entry point of the product: commands, the keyboard, and the command line.</p>
+
+<h3>Rendering Registration</h3>
+
+<pre class="code" data-lang="ts">registerMessageRenderer&lt;T&gt;(customType: string, renderer: MessageRenderer&lt;T&gt;): void;
+registerEntryRenderer&lt;T&gt;(customType: string, renderer: EntryRenderer&lt;T&gt;): void;
+registerMarkdownTransformer(transformer: MarkdownTransformer): void;</pre>
+
+<p>Recall Chapter 5: <code>AgentMessage</code> can be extended with custom types via declaration merging. An extension can register custom message types and provide their renderers in the terminal via <code>registerMessageRenderer</code>/<code>registerEntryRenderer</code> (returning <code>pi-tui</code> components). <code>registerMarkdownTransformer</code> can transform the user's or assistant's Markdown before pi renders it.</p>
+
+<p>Extensions can thus influence not just the agent's behavior but also its <strong>presentation</strong> — custom message types plus custom rendering let an extension add anything it wants to show into the transcript.</p>
+
+<h3>Actions: Cross-Process UI</h3>
+
+<p><code>ExtensionAPI</code> also offers a set of "action" methods (excerpt): <code>select</code>, <code>confirm</code>, <code>input</code>, <code>notify</code>, widgets, and more. An extension can pop a selection box, ask for confirmation, request input, or send a notification.</p>
+
+<p>In interactive mode these UI actions are rendered directly by the TUI. But in RPC mode (Chapter 11) they cross process boundaries through the <code>extension_ui_request</code>/<code>extension_ui_response</code> mechanism — the UI request is serialized and sent to the peer (the IDE), which renders it and sends the user's selection back. So the same extension can pop UI in both interactive and RPC modes; only the rendering location differs. This is the "event stream as contract" idea extended to extension UI.</p>
+
+<hr class="sep">
+
+<h2 id="loading">Loading Extensions and Trust</h2>
+
+<p>Where do extensions come from? They are discovered by the <code>ResourceLoader</code> (Chapter 10), loaded by <code>discoverAndLoadExtensions</code> (<code>packages/coding-agent/src/core/extensions/loader.ts</code>), and run by the <code>ExtensionRunner</code> (<code>runner.ts</code>). Discovery locations include:</p>
+
+<ul>
+<li>the project's <code>.pi/extensions/</code></li>
+<li>the user-global <code>~/.pi/extensions/</code></li>
+<li>paths specified by the <code>--extension/-e</code> flag</li>
+<li>built-in extensions (<code>builtInExtensions</code>)</li>
+</ul>
+
+<p>Loading is gated by <strong>project trust</strong> (Chapter 1). This is a key point of the security model: extensions in a project directory come from potentially untrusted third-party repositories, and they can register tools, intercept events, and influence agent behavior — a huge attack surface. So before loading a project's extensions, pi asks: "Do you trust this project?" If not (<code>--no-approve</code>), it doesn't load its extensions.</p>
+
+<p>Recall Chapter 1: Pi Agent has no per-tool approval and leaves isolation to containers. But the project-trust decision at extension loading is a concrete instance of its "check once at the boundary" model — no gate before every tool call, but one question before loading potentially malicious extensions. The <code>project_trust</code> event even lets extensions participate in that decision (<code>ProjectTrustHandler</code>).</p>
+
+<p><code>--no-extensions</code> disables extensions entirely, and <code>--extension</code> explicitly loads a specific one. Unknown flags are handed to extensions via <code>unknownFlags</code> (Chapter 8).</p>
+
+<hr class="sep">
+
+<h2 id="llama">Built-in Extension: llama.cpp</h2>
+
+<p>The most interesting example is the built-in extension. <code>packages/coding-agent/src/extensions/index.ts</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/extensions/index.ts">export const builtInExtensions: InlineExtension[] = [
+	{ name: "llama.cpp", factory: llamaExtension, hidden: true },
+];</pre>
+
+<p>Pi Agent made <strong>llama.cpp local model support</strong> an extension (<code>src/extensions/llama/</code>)! It includes <code>provider.ts</code> (registers a local model provider), <code>client.ts</code> (talks to the llama.cpp server), <code>huggingface.ts</code> (downloads models), and <code>ui.ts</code> (a model management UI).</p>
+
+<p>This example perfectly illustrates the expressiveness of the extension system: <strong>even "adding a new LLM provider" can be an extension, without entering the core.</strong> Recall Chapter 2: providers are a core capability of <code>pi-ai</code>. But a provider like llama.cpp — niche, optional, requiring extra dependencies — lives in an extension, loaded on demand. The core's provider list stays lean; long-tail needs are carried by extensions.</p>
+
+<p><code>hidden: true</code> means it doesn't appear in the extension list (it's built in, so users don't manage it). Chapter 8's <code>main()</code> injects it via <code>MainOptions.extensionFactories</code>.</p>
+
+<hr class="sep">
+
+<h2 id="lighter">Skills, Templates, Themes: Lighter Extension Points</h2>
+
+<p>The extension system (TypeScript code) is the most powerful extension point, but not the only one. Several mechanisms introduced in Chapter 10 are lighter ways to extend:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Extension point</th><th>Form</th><th>Capability</th><th>Barrier</th></tr></thead>
+<tbody>
+<tr><td><strong>Extension</strong></td><td>TypeScript code</td><td>Tools, events, commands, UI, providers... everything</td><td>High (requires code)</td></tr>
+<tr><td><strong>Skills</strong></td><td><code>SKILL.md</code> file</td><td>Task instructions for the model</td><td>Low (write Markdown)</td></tr>
+<tr><td><strong>Prompt templates</strong></td><td>Template files</td><td>Shortcuts for user prompts</td><td>Low</td></tr>
+<tr><td><strong>Themes</strong></td><td>JSON files</td><td>Terminal color scheme</td><td>Low</td></tr>
+<tr><td><strong>Custom providers</strong></td><td>Extension + <code>pi-ai</code> API</td><td>Connect a new LLM</td><td>Medium</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>This is a <strong>layered extension system</strong>: simple needs (adding a task instruction) use plain-text mechanisms like skills; complex needs (registering tools, intercepting events) use TypeScript extensions. Barrier scales with capability. A user doesn't need to write an extension to "add a rule for the model" — that's a skill's job.</p>
+
+<p>This layering is itself an expression of the minimalism philosophy: the core doesn't build in a pile of complex "rule config" or "template config" mechanisms; instead it offers a graduated range of extension points, from plain text to code, so users can pick the lightest one that fits.</p>
+
+<hr class="sep">
+
+<h2 id="mcp">Why There Is No MCP</h2>
+
+<p>Now for that question: why doesn't Pi Agent support MCP (Model Context Protocol)?</p>
+
+<p>MCP is a standardized "external tool protocol" — it defines how agents connect to external tool servers (8 transports, OAuth, tool wrapping). The everything-included route (Claude Code, for instance) builds MCP in, letting agents plug into the vast MCP tool ecosystem.</p>
+
+<p>Pi Agent's choice: <strong>not built in, but implementable as an extension.</strong> Its reasoning:</p>
+
+<ol>
+<li>MCP is an <strong>optional, ecosystem-related</strong> capability; it doesn't belong in the "minimal core".</li>
+<li>The extension system is powerful enough that one could write an extension that "connects to an MCP server and registers MCP tools as pi tools" (using <code>registerTool</code> plus an MCP client).</li>
+<li>Building MCP in would suck the complexity of 8 transports, OAuth, and protocol version management into the core — against the minimalism principle.</li>
+</ol>
+
+<p>So Pi Agent turned "whether to support MCP" into an extension decision rather than a core decision. Users who want MCP install an MCP extension; users who don't have no such code in the core at all.</p>
+
+<p>This is the same logic as "llama.cpp as an extension" in Chapter 2: <strong>long-tail, optional, ecosystem-related capabilities go to extensions; the core keeps only what is universal and necessary.</strong> That is the fundamental way a minimal core stays minimal — not by refusing to do these things, but by making them pluggable edges.</p>
+
+<p>Of course, this choice has a cost: out of the box, Pi Agent doesn't reach the MCP ecosystem as conveniently as a built-in-MCP approach would; it relies on the community to provide extensions. This is the trade-off between "minimalism" and "works out of the box", and Pi Agent has explicitly chosen the former.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's extension system offers four transferable patterns for designing extensible systems.</p>
+
+<p><strong>Extensibility via a typed API, not hook strings.</strong> Extensions face a strongly typed <code>ExtensionAPI</code>; the payloads and return values of the ~40 events have precise types, so mistakes fail at compile time. The problem it solves: runtime hook strings (event names, payload shapes) only surface errors at runtime, with no autocompletion. When the extension surface is typed, extension development gains compile-time safety and IDE support, and maintainability improves dramatically.</p>
+
+<p><strong>Extensions and built-ins are equal in the system.</strong> Tools registered by extensions use the same <code>ToolDefinition</code> and are treated identically to built-in tools; even adding a provider can be an extension. The problem it solves: extensions as "second-class citizens", with limited capabilities or special paths. When extensions and built-ins run through the same mechanism, extension expressiveness has no artificial ceiling, and the core needs no special cases.</p>
+
+<p><strong>Layered extension points, where barrier scales with capability.</strong> Plain-text skills/templates/themes serve simple needs; TypeScript extensions serve complex ones. The problem it solves: a single heavyweight extension mechanism, so even "adding a rule" requires code. When extension points are layered from light to heavy, users can always pick the lightest one, and the core doesn't need to build in configuration machinery.</p>
+
+<p><strong>Push optional ecosystem capabilities out into extensions.</strong> Optional, ecosystem-related capabilities like MCP and llama.cpp stay out of the core and are carried by extensions. The problem it solves: a core held hostage by long-tail needs, growing ever more bloated. When the core keeps only universal necessities and hands the long tail to pluggable extensions, it can stay minimal for the long run — this is "conservation of complexity" realized along the extension dimension.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's extension system is the payoff of the minimalism philosophy: the core stays minimal because almost every "do one more thing" need can be satisfied by an extension. An extension is a factory function <code>(pi: ExtensionAPI) =&gt; void</code>; <code>ExtensionAPI</code> provides about 40 typed event subscriptions, tool/command/shortcut/flag registration, custom message rendering, and cross-process UI actions. Extension loading is gated by project trust — the point where the "check once at the boundary" security model lands. The built-in llama.cpp extension proves that even "adding a provider" can be an extension; skills/templates/themes are lighter extension points.</p>
+
+<p>It has no MCP and no runtime hook strings — not a deficiency but a choice: optional ecosystem capabilities like MCP are left to extensions, and extensibility itself is expressed through a strongly typed API rather than string hooks. Understand this, and you understand how Pi Agent, without building everything in, still commands nearly unbounded extensibility.</p>
+
+<p>In the next chapter, we see how Pi Agent extends beyond localhost: the daemon, RPC subprocesses, remote relay, and two very different designs for remote control.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>

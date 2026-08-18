@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 10 · System Prompts and Resource Assembly | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch10">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part IV · Coding Agent Product</p>
+  <h1>Chapter 10: System Prompts and Resource Assembly</h1>
+  <p class="chapter-sub">The system prompt isn't a hardcoded string — it's assembled from tools' self-descriptions, project context files, and two-phase skill loading</p>
+</header>
+
+<h2 id="job">The Agent's "Job Description"</h2>
+
+<p>The model itself doesn't know who it is, what tools it can use, or what conventions to follow. All of that lives in the system prompt — the Agent's "job description." Chapter 9's <code>prompt()</code> funnel cleans up user input, but before that ever runs, <code>AgentSession</code> has already assembled a system prompt as the backdrop for every model call.</p>
+
+<p>This prompt is not a hardcoded string. It is <strong>assembled</strong>: dynamically pieced together from the active tools, the loaded skills, the project's context files, and the user's customizations. This chapter dissects that assembly process and the resource system behind it — skills, prompt templates, project context files, and slash commands.</p>
+
+<p>Here lies a signature Pi Agent pattern: <strong>two-phase skill loading</strong>. The system prompt carries only each skill's name and description; the model reads the full content on demand. This seemingly simple decision resolves the fundamental tension between "more capabilities" and "bloated prompts."</p>
+
+<hr class="sep">
+
+<h2 id="assembly"><code>buildSystemPrompt</code>: The Assembly Pipeline</h2>
+
+<p>The system prompt is assembled by <code>buildSystemPrompt</code> (<code>packages/coding-agent/src/core/system-prompt.ts</code>). Its input is an options object:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">export interface BuildSystemPromptOptions {
+	customPrompt?: string;        // --system-prompt，替换默认提示词
+	selectedTools?: string[];     // 默认 [read, bash, edit, write]
+	toolSnippets?: Record&lt;string, string&gt;; // 每个工具的一行简介
+	promptGuidelines?: string[];  // 追加的指南
+	appendSystemPrompt?: string;  // --append-system-prompt，追加到末尾
+	cwd: string;
+	contextFiles?: Array&lt;{ path: string; content: string }&gt;; // AGENTS.md 等
+	skills?: Skill[];
+}</pre>
+
+<p>The default prompt (when there is no <code>customPrompt</code>) has this skeleton:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+
+Available tools:
+${toolsList}
+
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
+Guidelines:
+${guidelines}
+
+Pi documentation (read only when the user asks about pi itself, ...):
+- Main documentation: ${readmePath}
+- Additional docs: ${docsPath}
+- Examples: ${examplesPath}
+...`;
+
+if (appendSection) prompt += appendSection;          // --append-system-prompt
+// 项目上下文文件
+if (contextFiles.length &gt; 0) {
+	prompt += "\n\n&lt;project_context&gt;\n\n";
+	prompt += "Project-specific instructions and guidelines:\n\n";
+	for (const { path: filePath, content } of contextFiles) {
+		prompt += `&lt;project_instructions path="${filePath}"&gt;\n${content}\n&lt;/project_instructions&gt;\n\n`;
+	}
+	prompt += "&lt;/project_context&gt;\n";
+}
+// skills
+if (hasRead &amp;&amp; skills.length &gt; 0) prompt += formatSkillsForPrompt(skills);
+// 工作目录
+prompt += `\nCurrent working directory: ${promptCwd}`;</pre>
+
+<p>Let's walk through this assembly piece by piece.</p>
+
+<hr class="sep">
+
+<h2 id="tools">"Available tools": From the Tools' Self-Descriptions</h2>
+
+<p>The tool list in the prompt isn't handwritten; it's stitched together from the active tools' <code>promptSnippet</code>s:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">const tools = selectedTools || ["read", "bash", "edit", "write"];
+const visibleTools = tools.filter((name) =&gt; !!toolSnippets?.[name]);
+const toolsList = visibleTools.length &gt; 0
+	? visibleTools.map((name) =&gt; `- ${name}: ${toolSnippets![name]}`).join("\n")
+	: "(none)";</pre>
+
+<p>Recall from Chapter 4: every <code>ToolDefinition</code> carries its own <code>promptSnippet</code> (for the read tool, it's "Read file contents"). <code>buildSystemPrompt</code> collects the snippets of active tools and assembles the "Available tools" section. <strong>When a tool is active, its blurb automatically appears in the prompt; when it's disabled, the blurb disappears.</strong> This is the direct payoff of the self-describing tool design — adding a new tool requires no manual update to the system prompt.</p>
+
+<p>Note the line "In addition to the tools above, you may have access to other custom tools depending on the project" — it tells the model that extensions may register custom tools (Chapter 14), keeping the model open to tools it hasn't seen.</p>
+
+<hr class="sep">
+
+<h2 id="guidelines">"Guidelines": Generated Conditionally from the Toolset</h2>
+
+<p>The guidelines section isn't fixed; it's generated dynamically based on <strong>which tools are active</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/system-prompt.ts">const hasBash = tools.includes("bash");
+const hasGrep = tools.includes("grep");
+const hasFind = tools.includes("find");
+const hasLs = tools.includes("ls");
+
+// 文件探索指南
+if (hasBash &amp;&amp; !hasGrep &amp;&amp; !hasFind &amp;&amp; !hasLs) {
+	addGuideline("Use bash for file operations like ls, rg, find");
+}
+
+for (const guideline of promptGuidelines ?? []) {
+	addGuideline(guideline.trim()); // 工具自带的 promptGuidelines
+}
+
+// 总是包含
+addGuideline("Be concise in your responses");
+addGuideline("Show file paths clearly when working with files");</pre>
+
+<p>Look at the first condition: if <code>bash</code> is active but <code>grep</code>/<code>find</code>/<code>ls</code> are not (the default), the model is told to "Use bash for file operations like ls, rg, find." Because these three read-only tools are off in the default toolset (Chapter 4), the model needs to know it should use bash commands to search files. If the user enables grep/find/ls via <code>--tools</code>, this guideline disappears — the model now has dedicated tools.</p>
+
+<p><code>addGuideline</code> deduplicates with a <code>Set</code> — the tools' <code>promptGuidelines</code> (Chapter 4) merge with the default guidelines without repetition. So each tool's own guidelines (like read's "Use read to examine files instead of cat or sed") also flow into this section automatically.</p>
+
+<p>Another win for self-description: tools not only declare what they "are" (snippet), but also what to "watch out for when using them" (guidelines), and the system prompt collects all of it automatically.</p>
+
+<hr class="sep">
+
+<h2 id="context">Project Context Files: &lt;project_context&gt;</h2>
+
+<p>If the project directory contains context files like <code>AGENTS.md</code> (or <code>CLAUDE.md</code>), their contents are wrapped in a <code>&lt;project_context&gt;</code> block:</p>
+
+<pre class="code" data-lang="text">&lt;project_context&gt;
+
+Project-specific instructions and guidelines:
+
+&lt;project_instructions path="AGENTS.md"&gt;
+...文件内容...
+&lt;/project_instructions&gt;
+
+&lt;/project_context&gt;</pre>
+
+<p>These files are discovered and loaded by <code>ResourceLoader</code> (its <code>loadProjectContextFiles</code> in <code>packages/coding-agent/src/core/resource-loader.ts</code>). Wrapping them in XML-style tags has two benefits: first, it gives the model a clear structural boundary ("these are project-specific instructions"); second, the <code>path</code> attribute lets the model know which file each instruction comes from.</p>
+
+<p>Recall Chapter 1's security model: project context files come from potentially untrusted third-party repositories, so their loading is gated by <strong>project trust</strong>. <code>--no-approve</code> or <code>--no-context-files</code> skips them. This is the "project trust" decision showing up at the prompt-assembly stage — if you don't trust the project, its files never get injected into the prompt.</p>
+
+<hr class="sep">
+
+<h2 id="skills">Two-Phase Skill Loading</h2>
+
+<p>Now for the highlight of this chapter. Skills are "specialized instructions for specific tasks" — like "how to review code" or "how to write migration scripts." A project may have dozens of skills, and each skill's full content can run hundreds of lines. Stuffing every skill's complete content into the system prompt would make it explode.</p>
+
+<p>Pi Agent's solution is <strong>two-phase loading</strong>: the system prompt carries only each skill's <strong>name, description, and location</strong>, and the model <strong>reads the full content on demand</strong>. <code>formatSkillsForPrompt</code> (<code>packages/coding-agent/src/core/skills.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/skills.ts">export function formatSkillsForPrompt(skills: Skill[]): string {
+	const visibleSkills = skills.filter((s) =&gt; !s.disableModelInvocation);
+	if (visibleSkills.length === 0) return "";
+
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		"Use the read tool to load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory ...",
+		"",
+		"&lt;available_skills&gt;",
+	];
+	for (const skill of visibleSkills) {
+		lines.push("  &lt;skill&gt;");
+		lines.push(`    &lt;name&gt;${escapeXml(skill.name)}&lt;/name&gt;`);
+		lines.push(`    &lt;description&gt;${escapeXml(skill.description)}&lt;/description&gt;`);
+		lines.push(`    &lt;location&gt;${escapeXml(skill.filePath)}&lt;/location&gt;`);
+		lines.push("  &lt;/skill&gt;");
+	}
+	lines.push("&lt;/available_skills&gt;");
+	return lines.join("\n");
+}</pre>
+
+<p>Here's the key instruction in that prompt text:</p>
+
+<blockquote>
+<p>Use the read tool to load a skill's file when the task matches its description.</p>
+</blockquote>
+
+<p>The system prompt gives the model only a "skill catalog" (name + description + file location) and tells it: "when a task matches a skill's description, use the read tool to load its file." Hence:</p>
+
+<ul>
+<li><strong>At startup</strong>: only the skill's frontmatter (name, description) is loaded — very cheap.</li>
+<li><strong>At call time</strong>: the model judges that the current task matches a skill, uses the <code>read</code> tool to load the full <code>SKILL.md</code>, and brings the detailed instructions into context.</li>
+</ul>
+
+<p>That's the two phases: <strong>frontmatter goes into the prompt; the body is read on demand.</strong> A catalog of 30 skills might cost only a few hundred tokens, while their full contents could total tens of thousands — but the latter enters context only when actually needed.</p>
+
+<p>The <code>Skill</code> interface (<code>packages/coding-agent/src/core/skills.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/skills.ts">export interface SkillFrontmatter {
+	name?: string;
+	description?: string;
+	"disable-model-invocation"?: boolean;
+	[key: string]: unknown;
+}
+
+export interface Skill {
+	name: string;
+	description: string;
+	filePath: string;
+	baseDir: string;
+	sourceInfo: SourceInfo;
+	disableModelInvocation: boolean;
+}</pre>
+
+<p>A skill is a <code>SKILL.md</code> file with YAML frontmatter. Skills with <code>disableModelInvocation: true</code> don't appear in the prompt (<code>visibleSkills</code> filters them out) — they can only be invoked explicitly by the user via <code>/skill:name</code>; the model can't trigger them on its own. This gives certain skills "for humans only, not the model" control.</p>
+
+<p>Two-phase loading is another instance of Pi Agent's "push complexity to the edge" philosophy: the system prompt stays lean (the core), and full capabilities load on demand (the edge). It parallels the "two-phase skill loading" pattern of Claude Code in the reference book — a pattern proven repeatedly.</p>
+
+<hr class="sep">
+
+<h2 id="templates">Prompt Templates: Reusable Prompt Fragments</h2>
+
+<p>Prompt templates (<code>packages/coding-agent/src/core/prompt-templates.ts</code>) are another "reusable prompt" mechanism, but unlike skills: templates are <strong>expanded when the user types</strong>, while skills are <strong>read on demand by the model</strong>.</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/prompt-templates.ts">export interface PromptTemplate {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	content: string;
+	sourceInfo: SourceInfo;
+	filePath: string;
+}</pre>
+
+<p>A template is a file whose content is a prompt with placeholders. When the user types <code>/template-name arg1 arg2</code>, <code>expandPromptTemplate</code> (<code>:269</code>) expands it into full text, and <code>substituteArgs</code> (<code>:70</code>) fills the arguments into the placeholders:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/prompt-templates.ts">export function substituteArgs(content: string, args: string[]): string {
+	// 把 $1, $2, ... 和 $@ 等占位符替换为实际参数
+}</pre>
+
+<p><code>parseCommandArgs</code> parses arguments with bash-style quoting rules (supporting <code>"quoted arg"</code>). So a user can define a <code>/review</code> template whose content is "Review the code for the following aspects: $1", and typing <code>/review security</code> expands to "Review the code for the following aspects: security".</p>
+
+<p>The division of labor between templates and skills:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>Prompt templates</th><th>Skills</th></tr></thead>
+<tbody>
+<tr><td>Triggered by</td><td>User (types <code>/name</code>)</td><td>Model (judges task match) or user</td></tr>
+<tr><td>Expansion timing</td><td>At input time (in the <code>prompt()</code> funnel)</td><td>At runtime (model reads via read)</td></tr>
+<tr><td>Into system prompt</td><td>No (expanded only when used)</td><td>Yes (catalog goes into the prompt)</td></tr>
+<tr><td>Purpose</td><td>Prompt shortcuts for the user's frequent use</td><td>Professional task instructions for the model</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Both mechanisms "bake frequently used prompts into files," but they serve different audiences at different times.</p>
+
+<hr class="sep">
+
+<h2 id="slash">Slash Commands: 22 Built-in Entry Points</h2>
+
+<p>Input starting with <code>/</code> is treated as a command. <code>BUILTIN_SLASH_COMMANDS</code> (<code>packages/coding-agent/src/core/slash-commands.ts</code>) defines 22 built-in commands:</p>
+
+<pre class="code" data-lang="text">/settings  /model  /scoped-models  /export  /import  /share  /copy
+/name  /session  /changelog  /hotkeys  /fork  /clone  /tree
+/trust  /login  /logout  /new  /compact  /resume  /reload  /quit</pre>
+
+<p>These commands fall into a few categories:</p>
+
+<ul>
+<li><strong>Session management</strong>: <code>/new</code> (new session), <code>/session</code> (switch), <code>/fork</code>/<code>/clone</code> (branch), <code>/tree</code> (view the session tree), <code>/resume</code> (resume), <code>/name</code> (name)</li>
+<li><strong>Model and settings</strong>: <code>/model</code> (pick a model), <code>/scoped-models</code>, <code>/settings</code>, <code>/hotkeys</code></li>
+<li><strong>Compaction</strong>: <code>/compact</code> (manual compaction, Chapter 7)</li>
+<li><strong>Import/export</strong>: <code>/export</code>/<code>/import</code> (HTML/JSONL), <code>/share</code> (GitHub gist), <code>/copy</code></li>
+<li><strong>Authentication</strong>: <code>/login</code>/<code>/logout</code></li>
+<li><strong>Trust</strong>: <code>/trust</code> (project trust, Chapter 1)</li>
+<li><strong>Extensions</strong>: <code>/reload</code> (reload extensions/resources)</li>
+</ul>
+
+<p>Recall Chapter 9: the first step of the <code>prompt()</code> funnel is <code>_tryExecuteExtensionCommand</code> — input starting with <code>/</code> first tries to match an extension command. Extensions, skills, and templates can all register their own slash commands (<code>SlashCommandSource = "extension" | "prompt" | "skill"</code>), sharing the same <code>/</code> entry point as the built-ins. So <code>/</code> becomes the unified command surface of the product, extensions, skills, and templates.</p>
+
+<hr class="sep">
+
+<h2 id="loader"><code>ResourceLoader</code>: The Resource Discoverer</h2>
+
+<p>Skills, templates, context files, extensions, themes — where do these resources come from? They're all discovered uniformly by <code>ResourceLoader</code> (<code>packages/coding-agent/src/core/resource-loader.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/resource-loader.ts">export interface ResourceLoader {
+	reload(): Promise&lt;...&gt;; // 重新发现并加载所有资源
+	// ...
+}
+export class DefaultResourceLoader implements ResourceLoader { ... }</pre>
+
+<p><code>DefaultResourceLoader.reload</code> scans multiple locations (the project's <code>.pi/</code>, the user-global <code>~/.pi/</code>, and paths given via CLI flags) and discovers extensions, skills, prompt templates, themes, and context files. It honors flags like <code>--extension</code>/<code>--no-extensions</code>, <code>--skill</code>/<code>--no-skills</code>, <code>--prompt-template</code>, <code>--theme</code>, and <code>--no-context-files</code>.</p>
+
+<p>The <code>/reload</code> command re-invokes <code>reload()</code> — when you edit an extension or skill, <code>/reload</code> picks it up without restarting pi. <code>AgentSessionRuntime</code>'s (Chapter 8) factory closure plays a role here: a reload can trigger session reconstruction.</p>
+
+<p>Resource discovery is also gated by project trust — for an untrusted project, extensions and skills in its <code>.pi/</code> are never loaded. Once again, Chapter 1's security model is put into practice.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's resource assembly offers four transferable patterns for "how to give an agent capabilities and instructions."</p>
+
+<p><strong>The system prompt is assembled, not hardcoded.</strong> The tool list comes from tools' snippets, guidelines are generated conditionally from the active tools, and project files and skills are injected dynamically. The problem it solves: the prompt drifts out of sync with the toolset/capabilities, forcing you to hand-edit the prompt whenever you add a tool. When the prompt is assembled from components' self-descriptions, capabilities and prompt stay in sync forever.</p>
+
+<p><strong>Two-phase loading: catalog in the prompt, content read on demand.</strong> A skill puts only its name + description + location in the prompt, and the model loads the full body via the read tool when needed. The problem it solves: more capabilities mean a fatter prompt, until it blows up the context or dilutes attention. When only the "catalog" stays resident and "content" loads on demand, the number of capabilities is no longer bounded by prompt size. This pattern applies to any situation with "many optional capabilities, but only a few used at a time."</p>
+
+<p><strong>Distinguish "shortcuts for humans" from "professional instructions for the model."</strong> Prompt templates expand when the user types; skills are read on demand by the model — both pin down prompts as files, but their triggers and timing differ. The problem it solves: conflating the two needs, so either the user can't remember the commands or the model doesn't know when to use them. Once you separate the audiences, each mechanism can do its own job.</p>
+
+<p><strong>A unified command entry with an open registration surface.</strong> Built-in commands, extension commands, skills, and templates share the <code>/</code> entry point, and the first step of the <code>prompt()</code> funnel dispatches to extensions. The problem it solves: a closed command system leaves extensions unable to own their own commands. With a unified entry open to extensions, the product's command surface can grow linearly with its extensions.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's system prompt is assembled: <code>buildSystemPrompt</code> stitches the tool list and guidelines from the active tools' <code>promptSnippet</code>/<code>promptGuidelines</code> (a win for tool self-description), wraps project context files in <code>&lt;project_context&gt;</code> (gated by project trust), injects skills via two-phase loading (catalog in the prompt, body read on demand), and finally appends the working directory. Prompt templates and skills are two kinds of "reusable prompts" serving the user and the model respectively; the 22 built-in slash commands share the <code>/</code> entry point with extension/skill/template commands; <code>ResourceLoader</code> discovers all resources uniformly and supports hot reload via <code>/reload</code>.</p>
+
+<p>The most profound piece is two-phase skill loading. With "catalog resident, content on demand," it resolves the fundamental tension of "more capabilities, fatter prompts" — yet another expression of Pi Agent's core philosophy: push complexity to the edge, and keep the core (here, the system prompt) lean.</p>
+
+<p>Next chapter, we'll see how the assembled <code>AgentSession</code> is consumed by the three operating modes — the same event stream, three strikingly different presentations.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>

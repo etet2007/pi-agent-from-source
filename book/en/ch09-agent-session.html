@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 9 · AgentSession: The Central Orchestrator | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch09">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part IV · Coding Agent Product</p>
+  <h1>Chapter 9: AgentSession – The Central Orchestrator</h1>
+  <p class="chapter-sub">The heart of the product layer: how a line of input passes through extension interception, skill expansion, queueing, and validation before it reaches the core loop</p>
+</header>
+
+<h2 id="heart">The Heart of the Product Layer</h2>
+
+<p>In Chapter 8 we saw that the three operating modes share a single <code>runtime</code>. At the core of this runtime is one object: <code>AgentSession</code> (<code>packages/coding-agent/src/core/agent-session.ts</code>, 3,333 lines). It is the heart of the product layer – every mode drives the conversation through it, and every product-level concern converges here.</p>
+
+<p>Recall the key conclusion of Chapter 6: the product layer does not use <code>pi-agent-core</code>'s <code>AgentHarness</code>; it builds its own orchestration. <code>AgentSession</code> is that self-built orchestrator. Sitting on top of the core <code>Agent</code>, it translates the pristine <code>AgentEvent</code> stream of Chapter 3 into a much richer product-level event stream, and expands the act of "the user typed a line" into a chain of product logic – extension interception, skill expansion, template substitution, model validation, auth checks, compaction decisions.</p>
+
+<p>This chapter dissects this orchestrator. By the end you will understand why a "minimal core" does not mean a "simple product": the core can be small, but a complete CLI product still has just as much to handle – it is simply that all of it lives outside the core.</p>
+
+<hr class="sep">
+
+<h2 id="wraps">What It Wraps</h2>
+
+<p><code>AgentSession</code> is built from an <code>AgentSessionConfig</code> (<code>packages/coding-agent/src/core/agent-session.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">export interface AgentSessionConfig {
+	agent: Agent;                  // 核心 Agent（第 5 章）
+	sessionManager: SessionManager; // JSONL 会话持久化（第 5 章）
+	settingsManager: SettingsManager; // 设置
+	cwd: string;
+	scopedModels?: Array&lt;{ model: Model&lt;any&gt;; thinkingLevel?: ThinkingLevel }&gt;; // Ctrl+P 循环的模型
+	resourceLoader: ResourceLoader; // 扩展/skills/模板/主题/上下文文件
+	customTools?: ToolDefinition[]; // SDK 注册的自定义工具
+	modelRuntime: ModelRuntime;     // pi-ai 的模型运行时
+	// ...
+}</pre>
+
+<p>This configuration list reveals <code>AgentSession</code>'s "convergence" role: it holds the core <code>Agent</code>, session management, settings, the model runtime, the resource loader, and custom tools. Components from different packages and subsystems are assembled here into a usable product.</p>
+
+<p>At construction time, <code>AgentSession</code> subscribes to the core <code>Agent</code>'s event stream:</p>
+
+<pre class="code" data-lang="ts">this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);</pre>
+
+<p>This is the junction of the two event systems. The core <code>Agent</code> emits <code>AgentEvent</code> (the ten kinds from Chapter 3); <code>AgentSession._handleAgentEvent</code> receives them, performs product-level processing (persistence, state updates), and translates them into <code>AgentSessionEvent</code> distributed to the modes' subscribers.</p>
+
+<hr class="sep">
+
+<h2 id="events"><code>AgentSessionEvent</code>: A Richer Vocabulary</h2>
+
+<p>The core <code>AgentEvent</code> has only ten event kinds, enough to describe "what the loop is doing". But the product needs more – compaction started, retry scheduled, session renamed, thinking level changed. <code>AgentSessionEvent</code> (<code>packages/coding-agent/src/core/agent-session.ts</code>) extends <code>AgentEvent</code> with these product-level events:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">export type AgentSessionEvent =
+	// 继承核心的大部分事件
+	| Exclude&lt;AgentEvent, { type: "agent_end" }&gt;
+	// agent_end 被增强：多了 willRetry
+	| { type: "agent_end"; messages: AgentMessage[]; willRetry: boolean }
+	// 产品级事件：
+	| { type: "agent_settled" }
+	| { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_end"; reason: ...; result: CompactionResult | undefined; aborted: boolean; willRetry: boolean; errorMessage?: string }
+	| { type: "entry_appended"; entry: SessionEntry }
+	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "summarization_retry_scheduled"; ... }
+	| { type: "bash_execution_update"; id?: string; delta: string };</pre>
+
+<p>Notice a few design choices.</p>
+
+<p><strong><code>agent_end</code> is enhanced.</strong> The core's <code>agent_end</code> carries only <code>messages</code>. The product version adds <code>willRetry</code> – telling the UI "this turn is over, but an automatic retry is coming". The UI can then show "Error, retrying in 3 seconds" instead of "Done".</p>
+
+<p><strong>Compaction has a complete event pair.</strong> <code>compaction_start</code>/<code>compaction_end</code> carry a <code>reason</code> (<code>manual</code>/<code>threshold</code>/<code>overflow</code> – manual, threshold reached, overflow recovery), letting the UI distinguish "user-initiated compaction" from "automatic system compaction" and show progress.</p>
+
+<p><strong>Retries are visible.</strong> <code>auto_retry_start</code>/<code>auto_retry_end</code> expose Chapter 2's <code>pi-ai</code> two-layer retry to the UI. Users can see "request failed, retrying 2/3".</p>
+
+<p><strong><code>queue_update</code> exposes queue state.</strong> Emitted when the contents of the steering/followUp queues change, letting the UI show "2 messages queued".</p>
+
+<p>This is a clear "event translation" pattern: the core provides fine-grained loop events, and the product aggregates them into high-level events meaningful to users. The modes (TUI/print/RPC) subscribe to <code>AgentSessionEvent</code> and never need to care about the details of the core <code>AgentEvent</code>.</p>
+
+<hr class="sep">
+
+<h2 id="prompt"><code>prompt()</code>: The Lifecycle of One Turn</h2>
+
+<p><code>AgentSession.prompt()</code> (<code>packages/coding-agent/src/core/agent-session.ts:1114</code>) is the most central method of the product layer. When the user types a line and presses Enter, it ultimately lands here. It expands "a line of text" into a chain of product logic:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="prompt-flow" data-w="960" data-h="920"></canvas></div>
+  <figcaption>Figure 1: <code>prompt()</code>'s product-logic funnel. The user's input is routed through extension-command dispatch, extension interception, skill/template expansion, and streaming queueing; after model/auth validation and a compaction check, it finally drives the core loop.</figcaption>
+</figure>
+
+<p>Step by step (key code excerpts):</p>
+
+<p><strong>1. Extension commands first.</strong> If the text starts with <code>/</code>, try executing it as an extension command first:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">if (expandPromptTemplates &amp;&amp; text.startsWith("/")) {
+	const handled = await this._tryExecuteExtensionCommand(text);
+	if (handled) {
+		preflightResult?.(true);
+		return; // 扩展命令已执行，没有提示词要发
+	}
+}</pre>
+
+<p>Extension commands (Chapter 14) manage their own LLM interaction and do not go through the normal prompt path. Note that they execute immediately even during streaming – extension commands are control instructions and should not be queued.</p>
+
+<p><strong>2. Extensions intercept input.</strong> An <code>input</code> event is emitted to extensions, which can "handle" (handled) or "transform" (transform) the input:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">if (this._extensionRunner.hasHandlers("input")) {
+	const inputResult = await this._extensionRunner.emitInput(currentText, currentImages, options?.source ?? "interactive", ...);
+	if (inputResult.action === "handled") { preflightResult?.(true); return; }
+	if (inputResult.action === "transform") {
+		currentText = inputResult.text;
+		currentImages = inputResult.images ?? currentImages;
+	}
+}</pre>
+
+<p>This is the main hook for extensions to intervene in user input – for example, an extension could intercept something like <code>!ls</code> and handle it itself, or apply some preprocessing to the input text.</p>
+
+<p><strong>3. Expand skills and templates.</strong> Expand <code>/skill:name args</code> and <code>/template args</code> into actual text:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">let expandedText = currentText;
+if (expandPromptTemplates) {
+	expandedText = this._expandSkillCommand(expandedText);
+	expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+}</pre>
+
+<p>Skills and prompt templates (Chapter 10) are "reusable prompt fragments". A user typing <code>/review</code> may have it expanded into a full code-review prompt.</p>
+
+<p><strong>4. Queue during streaming.</strong> If the agent is working (<code>isStreaming</code>), a new message cannot be sent directly – it must be queued:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">if (this.isStreaming) {
+	if (!options?.streamingBehavior) {
+		throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+	}
+	if (options.streamingBehavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
+	else await this._queueSteer(expandedText, currentImages);
+	preflightResult?.(true);
+	return;
+}</pre>
+
+<p>Recall from Chapters 3 and 5: steering is "interjecting while working", followUp is "say it when you're done". <code>streamingBehavior</code> makes the caller choose explicitly. If it is not specified, an error is thrown – a "force explicit intent" design that keeps user messages from being silently dropped or misqueued. <code>_queueSteer</code>/<code>_queueFollowUp</code> ultimately call the core <code>Agent</code>'s <code>steer()</code>/<code>followUp()</code> (the two queues of Chapter 5).</p>
+
+<p><strong>5–7. Flush, validate, compact.</strong> Flush pending bash messages, verify a model is selected and auth is valid (an expired OAuth token prompts <code>/login</code>), then <code>_checkCompaction</code> checks whether the previous turn's response triggered a compaction condition:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/agent-session.ts">const lastAssistant = this._findLastAssistantMessage();
+if (lastAssistant) {
+	await this._checkCompaction(lastAssistant, false);
+}</pre>
+
+<p><code>_checkCompaction</code> (<code>:1953</code>) uses Chapter 7's <code>shouldCompact</code> to decide, triggering compaction when needed. It checks before the prompt in order to catch "an aborted response from the previous turn" – if the previous response was aborted mid-way, the token count may be inaccurate, so this is a re-evaluation.</p>
+
+<p><strong>8. Build the message and drive the core.</strong> Finally, build the <code>messages</code> array (user message + optional images) and call <code>this.agent.prompt(messages)</code> – handing control back to the core <code>Agent</code> and entering Chapter 3's loop.</p>
+
+<p>The whole <code>prompt()</code> is a "product-logic funnel": the user's raw input passes through extension interception, skill expansion, template substitution, queue decisions, model validation, auth checks, and compaction decisions, finally becoming a clean user message fed to the core loop. The core loop knows nothing about this product logic – it only receives a message.</p>
+
+<hr class="sep">
+
+<h2 id="models">Model and Thinking Management</h2>
+
+<p><code>AgentSession</code> also manages "which model, and how deep the thinking". This is a product-level concern – the core <code>Agent</code> has just one <code>model</code> field, but the product must support runtime switching, cycling, and a UI selector.</p>
+
+<pre class="code" data-lang="ts">get model();
+get thinkingLevel();
+async setModel(model: Model&lt;any&gt;): Promise&lt;void&gt;;       // :1578
+async cycleModel(direction): Promise&lt;void&gt;;
+setThinkingLevel(level): void;
+cycleThinkingLevel(): void;</pre>
+
+<p><code>scopedModels</code> (from the <code>--models</code> flag) defines the set of models that can be cycled through. In interactive mode, pressing Ctrl+P calls <code>cycleModel</code>, rotating among these models – each switch takes effect at a turn boundary via <code>prepareNextTurn</code> (Chapter 3) and fires a <code>thinking_level_changed</code>/model-change event, persisted as a <code>ModelChangeEntry</code> in the session tree (Chapter 5). So "I switched to a stronger model at turn 5" becomes part of the session history.</p>
+
+<p><code>setModel</code> is not merely changing a field – it must update the core <code>Agent</code>'s state, persist the model change, notify subscribers, and possibly re-resolve auth. All this orchestration lives in <code>AgentSession</code>; the core <code>Agent</code> still only knows "my model changed".</p>
+
+<hr class="sep">
+
+<h2 id="compaction">Compaction and Session Tree Operations</h2>
+
+<p><code>AgentSession</code> exposes Chapter 7's compaction and Chapter 5's session-tree operations as product methods:</p>
+
+<pre class="code" data-lang="ts">async compact(customInstructions?: string): Promise&lt;CompactionResult&gt;; // :1783 手动压缩
+get isCompacting(): boolean;
+setAutoCompactionEnabled(enabled: boolean): void;
+async navigateTree(...): Promise&lt;...&gt;;   // 分支导航
+getUserMessagesForForking(): ...;
+createReplacedSessionContext(): ...;</pre>
+
+<p><code>compact()</code> is manual compaction (the <code>/compact</code> command); <code>_checkCompaction</code> is automatic compaction (threshold reached or overflow recovery). Both fire <code>compaction_start</code>/<code>compaction_end</code> events so the UI can show progress.</p>
+
+<p><code>navigateTree</code> navigates the session tree – the machinery behind the <code>/tree</code>, <code>/fork</code>, and <code>/clone</code> commands. It may generate a branch summary (Chapter 7), then move the leaf. When forking a session, <code>getUserMessagesForForking</code> extracts the user messages and <code>createReplacedSessionContext</code> builds the new session's context.</p>
+
+<p>These operations all build on Chapter 5's tree structure. <code>AgentSession</code> simply wraps them into product methods with events and UI feedback.</p>
+
+<hr class="sep">
+
+<h2 id="bash">Bash Execution and Export</h2>
+
+<p><code>AgentSession</code> also handles some product-specific features:</p>
+
+<pre class="code" data-lang="ts">async executeBash(...): Promise&lt;...&gt;;   // 直接执行 bash（! 命令）
+recordBashResult(...): void;
+abortBash(): void;
+getSessionStats(): SessionStats;
+getContextUsage(): ...;
+async exportToHtml(): Promise&lt;...&gt;;     // HTML 导出
+exportToJsonl(): ...;
+getLastAssistantText(): string;</pre>
+
+<p><code>executeBash</code> supports the <code>!command</code> syntax – users can run shell commands right in the input box without going through the model. The <code>bash_execution_update</code> event streams the command's stdout.</p>
+
+<p><code>exportToHtml</code>/<code>exportToJsonl</code> export the session – the <code>/export</code> command. <code>getSessionStats</code>/<code>getContextUsage</code> give the UI token usage and cost statistics (from Chapter 2's <code>Usage</code>). <code>getLastAssistantText</code> extracts the last assistant text – print mode uses it to output the final result.</p>
+
+<hr class="sep">
+
+<h2 id="walkthrough">Walkthrough: A <code>/model</code> Switch + a Question</h2>
+
+<p>Let's tie <code>AgentSession</code> together. In interactive mode you press Ctrl+P to switch models, then ask a question.</p>
+
+<ol>
+<li><strong>Ctrl+P</strong>: <code>InteractiveMode</code> captures the keybinding and calls <code>session.cycleModel("next")</code>. <code>AgentSession</code> takes the next model from <code>scopedModels</code> and calls <code>setModel</code>. <code>setModel</code> updates the core <code>Agent</code>'s state, persists a <code>ModelChangeEntry</code> via <code>sessionManager.appendModelChange(provider, modelId)</code>, and fires a model-change event. The TUI receives the event and updates the model display in the footer.</li>
+<li><strong>Type "keep fixing"</strong>: <code>prompt("keep fixing")</code>. It does not start with <code>/</code>, so extension commands are skipped. <code>emitInput</code> – no extension interception. Skill/template expansion – no change. Not streaming. Flush bash. Validate the model (the one just switched) and auth. <code>_checkCompaction</code> – threshold not reached. Build the user message and call <code>agent.prompt(messages)</code>.</li>
+<li><strong>Core loop</strong>: enter Chapter 3's loop. <code>prepareNextTurn</code> rebuilds context from the session tree between turns, picking up the model change just made – the next turn uses the new model.</li>
+<li><strong>Event backflow</strong>: the core emits <code>AgentEvent</code>; <code>_handleAgentEvent</code> translates it into <code>AgentSessionEvent</code>; the TUI renders incrementally.</li>
+</ol>
+
+<p>Throughout, <code>AgentSession</code> is the hub: it receives user actions, orchestrates product logic, drives the core loop, translates the event backflow, and persists state. The core <code>Agent</code> always sees only clean messages and configuration.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>AgentSession</code> offers four transferable patterns for "how to build a product on top of a minimal core".</p>
+
+<p><strong>Isolate core from product with event translation.</strong> The core emits fine-grained events; the product aggregates them into high-level events meaningful to users; the modes subscribe to product events and never touch core events. The problem it solves: the UI being forced to understand the core's internal events, or the core being forced to accommodate the UI's needs. When <code>AgentSession</code> does the translation, the core stays pristine and the UI gets "compaction started" instead of a combination of low-level events.</p>
+
+<p><strong>Turn user input into a processing funnel.</strong> Extension interception → skill expansion → template substitution → queue decisions → validation → compaction → drive the core; every step can short-circuit or transform. The problem it solves: product logic scattered everywhere, or crammed into the core loop. When <code>prompt()</code> is a clear funnel, every product concern has a definite place, and the core loop only receives clean input at the end of the funnel.</p>
+
+<p><strong>Force explicit intent instead of silent guessing.</strong> Sending a message during streaming requires specifying <code>streamingBehavior</code>, otherwise an error is thrown. The problem it solves: user messages silently dropped or misqueued, causing the confusion of "I said something but the agent didn't react". Demanding explicitness at ambiguity is safer than guessing user intent.</p>
+
+<p><strong>Configuration changes take effect at turn boundaries and are persisted.</strong> <code>setModel</code> updates state, persists a change entry, and takes effect between turns via <code>prepareNextTurn</code>. The problem it solves: configuration changes mid-run either don't take effect or conflict with in-flight work. When changes have a definite effective moment and are persisted, both consistency and traceability are guaranteed.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>AgentSession</code> is the heart of the product layer: a 3,333-line central orchestrator. It wraps the core <code>Agent</code>, subscribes to its <code>AgentEvent</code> and translates it into the richer <code>AgentSessionEvent</code> (<code>agent_end</code> with <code>willRetry</code>, a compaction event pair, retry events, queue updates); its <code>prompt()</code> is a product-logic funnel (extension interception, skill/template expansion, streaming queueing, model/auth validation, compaction checks) that hands a clean message to the core loop only at the end; it also manages model switching, thinking levels, compaction, session-tree navigation, bash execution, and export.</p>
+
+<p>It embodies Chapter 6's conclusion perfectly: the core provides the mechanism (loop + event stream), and the product builds its own policy (<code>AgentSession</code>). Because the core is small, it can be cleanly wrapped by such a large product orchestrator – all product complexity lives in <code>AgentSession</code>, and the core loop remains pristine.</p>
+
+<p>In the next chapter, we look at the key step glossed over in <code>prompt()</code>'s funnel: how the system prompt is assembled from tools, skills, templates, and project context files.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("prompt-flow", function (d) {
+  d.box({ id: "A", x: 200, y: 40, w: 200, h: 50, title: "prompt(text)", tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 200, y: 130, w: 200, h: 60, title: "Starts with /?", tone: "gold", titleSize: 13 });
+  d.box({ id: "C", x: 620, y: 120, w: 300, h: 64, title: "_tryExecuteExtensionCommand", lines: ["Extension command runs immediately"], tone: "teal", titleSize: 13 });
+  d.box({ id: "Z", x: 620, y: 240, w: 300, h: 50, title: "Return", tone: "slate", titleSize: 13 });
+  d.box({ id: "D", x: 200, y: 230, w: 200, h: 60, title: "emitInput", lines: ["Extensions intercept input"], tone: "teal", titleSize: 13 });
+  d.box({ id: "E", x: 200, y: 330, w: 200, h: 50, title: "Replace text/images", tone: "teal", titleSize: 13 });
+  d.box({ id: "F", x: 200, y: 420, w: 200, h: 60, title: "Expand skill commands", lines: ["+ prompt templates"], tone: "teal", titleSize: 13 });
+  d.box({ id: "G", x: 200, y: 520, w: 200, h: 60, title: "Streaming now?", tone: "gold", titleSize: 13 });
+  d.box({ id: "H", x: 620, y: 360, w: 300, h: 60, title: "By streamingBehavior", lines: ["Queue to steer / followUp"], tone: "teal", titleSize: 13 });
+  d.box({ id: "I", x: 200, y: 620, w: 200, h: 50, title: "Flush pending bash msgs", tone: "teal", titleSize: 13 });
+  d.box({ id: "J", x: 80, y: 720, w: 170, h: 56, title: "Validate model", tone: "teal", titleSize: 13 });
+  d.box({ id: "K", x: 320, y: 720, w: 170, h: 56, title: "Validate auth", tone: "teal", titleSize: 13 });
+  d.box({ id: "L", x: 560, y: 720, w: 210, h: 56, title: "_checkCompaction", lines: ["Check if compaction needed"], tone: "gold", titleSize: 13 });
+  d.box({ id: "M", x: 560, y: 816, w: 210, h: 56, title: "Build messages", lines: ["Drive agent.prompt()"], tone: "accent", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "right", to: "left", label: "Yes" });
+  d.arrow("C", "Z", { from: "bottom", to: "top", label: "Handled" });
+  d.arrow("B", "D", { from: "bottom", to: "top", label: "No" });
+  d.path([[280, 292], [280, 330]]);
+  d.path([[320, 292], [320, 330]]);
+  d.text("transform", 258, 311, { size: 11.5, color: d.theme.muted, align: "right" });
+  d.text("pass", 342, 311, { size: 11.5, color: d.theme.muted, align: "left" });
+  d.arrow("E", "F", { from: "bottom", to: "top" });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "H", { from: "right", to: "left", label: "Yes" });
+  d.arrow("G", "I", { from: "bottom", to: "top", label: "No" });
+  d.arrow("H", "Z", { from: "right", to: "right" });
+  d.arrow("I", "J", { from: "bottom", to: "top" });
+  d.arrow("J", "K", { from: "right", to: "left" });
+  d.arrow("K", "L", { from: "right", to: "left" });
+  d.arrow("L", "M", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 5 · State, Messages, and the Session Tree | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch05">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part II · Agent Core</p>
+  <h1>Chapter 5: State, Messages, and the Session Tree</h1>
+  <p class="chapter-sub">Defensive copying in memory, the bridge at the message layer, the immutable session tree, and pluggable storage backends — Pi Agent splits "memory" into four layers</p>
+</header>
+
+<h2 id="memory">What an Agent Needs to Remember</h2>
+
+<p>The previous chapters were about "actions": how the model gets called, how tools get executed. But an agent is more than its actions — it also has memory. It has to remember how far the conversation has gotten, which tools it has used, and which model it is currently using. An agent without state will keep repeating the same mistakes forever.</p>
+
+<p>Pi Agent's state is organized in two levels, matching two very different needs:</p>
+
+<ul>
+<li><strong>In-memory state</strong>: the current transcript and runtime flags held by the core <code>Agent</code> class. It has a short lifetime (one run), is read and written frequently, and needs no persistence.</li>
+<li><strong>Persistent state</strong>: the session tree. It has a long lifetime (across runs and restarts), needs to be forkable and compactable, and must be able to land on disk.</li>
+</ul>
+
+<p>The relationship between these two levels — and Pi Agent's distinctive choice to model the persistent transcript as <strong>a tree</strong> rather than an array — is the subject of this chapter. The latter is the design that sets Pi Agent apart from most agents: it makes "fork a session", "go back three steps and try a different angle", and "compact without losing history" all first-class citizens.</p>
+
+<hr class="sep">
+
+<h2 id="memory-state">Layer One: In-Memory State</h2>
+
+<p>The core <code>Agent</code> class (<code>packages/agent/src/agent.ts</code>) is a "stateful wrapper around the loop". Its doc comment is blunt:</p>
+
+<blockquote>
+<p>Stateful wrapper around the low-level agent loop. <code>Agent</code> owns the current transcript, emits lifecycle events, executes tools, and exposes queueing APIs for steering and follow-up messages.</p>
+</blockquote>
+
+<h3>Copying Arrays with Accessor Properties</h3>
+
+<p><code>Agent</code>'s state is created by <code>createMutableAgentState</code>. This function has a detail worth noting — <code>tools</code> and <code>messages</code> are not plain fields but getter/setter accessor properties, and the setters <strong>copy the array passed in</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">function createMutableAgentState(initialState?) {
+	let tools = initialState?.tools?.slice() ?? [];
+	let messages = initialState?.messages?.slice() ?? [];
+	return {
+		systemPrompt: initialState?.systemPrompt ?? "",
+		model: initialState?.model ?? DEFAULT_MODEL,
+		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		get tools() {
+			return tools;
+		},
+		set tools(nextTools: AgentTool&lt;any&gt;[]) {
+			tools = nextTools.slice(); // 复制顶层数组
+		},
+		get messages() {
+			return messages;
+		},
+		set messages(nextMessages: AgentMessage[]) {
+			messages = nextMessages.slice(); // 复制顶层数组
+		},
+		isStreaming: false,
+		streamingMessage: undefined,
+		pendingToolCalls: new Set&lt;string&gt;(),
+		errorMessage: undefined,
+	};
+}</pre>
+
+<p>The state fields fall into two groups. One group is <strong>configuration</strong> (<code>systemPrompt</code>, <code>model</code>, <code>thinkingLevel</code>, <code>tools</code>, <code>messages</code>), set by the caller; the other is <strong>runtime</strong> (<code>isStreaming</code>, <code>streamingMessage</code>, <code>pendingToolCalls</code>, <code>errorMessage</code>), maintained by <code>Agent</code> itself during a run and read-only from the outside.</p>
+
+<p>Why do the setters copy with <code>slice()</code>? It is a lightweight form of defensive immutability: after the caller writes <code>agent.state.messages = someArray</code>, later mutations of <code>someArray</code> do not affect the copy <code>Agent</code> holds internally. It only copies the top-level array (no deep copy of the message objects), striking a balance between "keeping the external array from being accidentally mutated" and "copy cost". Note that the <em>appends</em> to messages inside the loop (<code>context.messages.push(...)</code>) operate on the snapshot copied by <code>createContextSnapshot()</code>, not on this state array itself — as seen in Chapter 3, the loop receives <code>messages.slice()</code>.</p>
+
+<h3><code>processEvents</code>: The Event Reducer</h3>
+
+<p>Chapter 3 said the loop emits <code>AgentEvent</code>s via <code>emit</code>. The <code>Agent</code> class <strong>reduces</strong> those events into its own state. <code>processEvents</code> is that reducer:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">private async processEvents(event: AgentEvent): Promise&lt;void&gt; {
+	switch (event.type) {
+		case "message_start":
+			this._state.streamingMessage = event.message;
+			break;
+		case "message_update":
+			this._state.streamingMessage = event.message;
+			break;
+		case "message_end":
+			this._state.streamingMessage = undefined;
+			this._state.messages.push(event.message);
+			break;
+		case "tool_execution_start": {
+			const pendingToolCalls = new Set(this._state.pendingToolCalls);
+			pendingToolCalls.add(event.toolCallId);
+			this._state.pendingToolCalls = pendingToolCalls;
+			break;
+		}
+		case "tool_execution_end": {
+			const pendingToolCalls = new Set(this._state.pendingToolCalls);
+			pendingToolCalls.delete(event.toolCallId);
+			this._state.pendingToolCalls = pendingToolCalls;
+			break;
+		}
+		case "turn_end":
+			if (event.message.role === "assistant" &amp;&amp; event.message.errorMessage) {
+				this._state.errorMessage = event.message.errorMessage;
+			}
+			break;
+		case "agent_end":
+			this._state.streamingMessage = undefined;
+			break;
+	}
+
+	const signal = this.activeRun?.abortController.signal;
+	for (const listener of this.listeners) {
+		await listener(event, signal);
+	}
+}</pre>
+
+<p>Two things are worth noting. First, a message is formally pushed into the <code>messages</code> array only at <code>message_end</code> — during <code>message_start</code>/<code>message_update</code> it exists solely in <code>streamingMessage</code>, the temporary "being generated" field. This way <code>state.messages</code> always holds "finished messages" while <code>streamingMessage</code> holds "the one in progress", and the UI can render them separately. Second, <code>pendingToolCalls</code> is updated by <strong>copying the entire Set and reassigning</strong> (<code>new Set(...)</code> then <code>add</code>/<code>delete</code>) rather than mutating in place — so any logic watching <code>pendingToolCalls</code> can detect updates through reference comparison.</p>
+
+<p>After reducing the state, <code>processEvents</code> <code>await</code>s each listener in subscription order. The listeners are where the product layer (<code>AgentSession</code>) hooks in — it translates <code>AgentEvent</code>s into the higher-level <code>AgentSessionEvent</code>s. Chapter 9 covers this in detail.</p>
+
+<h3>Failure Is Also a Normal Event Sequence</h3>
+
+<p><code>Agent.prompt()</code> wraps each run with <code>runWithLifecycle</code>. If the executor throws unexpectedly (note: normally the loop does not throw, because every collaborator promises "never to throw" — this is the safety net), <code>handleRunFailure</code> converts the error <strong>into a normal event sequence</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">private async handleRunFailure(error: unknown, aborted: boolean): Promise&lt;void&gt; {
+	const failureMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: this._state.model.api,
+		provider: this._state.model.provider,
+		model: this._state.model.id,
+		usage: EMPTY_USAGE,
+		stopReason: aborted ? "aborted" : "error",
+		errorMessage: error instanceof Error ? error.message : String(error),
+		timestamp: Date.now(),
+	} satisfies AgentMessage;
+	await this.processEvents({ type: "message_start", message: failureMessage });
+	await this.processEvents({ type: "message_end", message: failureMessage });
+	await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
+	await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+}</pre>
+
+<p>Even when an unexpected exception occurs, listeners still see a complete, well-formed event sequence (<code>message_start</code> → <code>message_end</code> → <code>turn_end</code> → <code>agent_end</code>), not a half-aborted mess with inconsistent state. This is the last line of defense for the "event stream contract": consumers can always receive <code>agent_end</code> and always reduce their state to a consistent point.</p>
+
+<h3>Reentrancy Guard and Two Queues</h3>
+
+<p><code>Agent.prompt()</code> begins with a reentrancy guard:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">async prompt(input, images?) {
+	if (this.activeRun) {
+		throw new Error(
+			"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+		);
+	}
+	// ...
+}</pre>
+
+<p>There can only be one active run at a time. Want to inject messages during a run? Use <code>steer()</code> or <code>followUp()</code> — they place messages into two <code>PendingMessageQueue</code>s:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent.ts">class PendingMessageQueue {
+	private messages: AgentMessage[] = [];
+	public mode: QueueMode; // "all" | "one-at-a-time"
+
+	drain(): AgentMessage[] {
+		if (this.mode === "all") {
+			const drained = this.messages.slice();
+			this.messages = [];
+			return drained;
+		}
+		const first = this.messages[0];
+		if (!first) return [];
+		this.messages = this.messages.slice(1);
+		return [first];
+	}
+}</pre>
+
+<p><code>QueueMode</code> controls what <code>drain()</code> does: <code>"all"</code> drains every queued message in one go, <code>"one-at-a-time"</code> takes exactly one per call (the default). Recall from Chapter 3: <code>createLoopConfig</code> wires <code>steeringQueue.drain</code> to <code>getSteeringMessages</code> and <code>followUpQueue.drain</code> to <code>getFollowUpMessages</code>. So the two experiences — "the user interjecting while the agent works" and "queuing the next task" — are implemented through these two queues plus two callback slots. <code>one-at-a-time</code> mode gives each interjection its own independent turn instead of piling them together.</p>
+
+<hr class="sep">
+
+<h2 id="messages">Layer Two: Messages and the Bridge</h2>
+
+<h3>The Extensible Message Union</h3>
+
+<p>The message type flowing through the loop is <code>AgentMessage</code> (<code>packages/agent/src/types.ts</code>), a union type that <strong>can be extended via declaration merging</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface CustomAgentMessages {} // 通过声明合并扩展
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];</pre>
+
+<p><code>Message</code> (from <code>pi-ai</code>) covers the standard <code>user | assistant | toolResult</code>. But a product can stuff its own message types into the <code>CustomAgentMessages</code> interface — the Harness layer extends it with types such as <code>bashExecution</code>, <code>custom</code>, <code>branchSummary</code>, and <code>compactionSummary</code>. These custom messages matter for the UI and for persistence (say, showing a compaction summary in the terminal), but the model neither needs nor understands them.</p>
+
+<h3><code>convertToLlm</code>: Internal Representation ≠ Wire Representation</h3>
+
+<p>This brings us to the bridge mentioned in Chapter 3. The default converter does exactly one thing — filtering:</p>
+
+<pre class="code" data-lang="ts">function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
+	return messages.filter(
+		(message) =&gt; message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+	);
+}</pre>
+
+<p>It filters out every custom message (whose <code>role</code> is not one of those three), keeping only what the provider understands. The product layer uses a <code>convertToLlmWithBlockImages</code> variant (in <code>packages/coding-agent/src/core/messages.ts</code>) that additionally handles image blocking.</p>
+
+<p>The elegance of this design: <strong>the transcript may hold any kind of message, but what is sent to the model is always a clean subset.</strong> UI messages, compaction summaries, branch summaries, bash execution records — they all live in the transcript, get persisted, get rendered, but are filtered or converted away by the <code>convertToLlm</code> bridge before every model call. Separating the internal representation from the wire representation lets Pi Agent extend message types freely without polluting the provider protocol. The <code>AgentLoopConfig</code> docs even give an example: converting <code>custom</code> messages into <code>user</code> messages and filtering out <code>notification</code> messages.</p>
+
+<p><code>convertToLlm</code> also carries a "must not throw" contract — it must return a safe fallback, because throwing would "interrupt the underlying loop without producing a normal event sequence". Once again, contract discipline guards the loop's simplicity.</p>
+
+<hr class="sep">
+
+<h2 id="session-tree">Layer Three: The Session Tree</h2>
+
+<p>Now for the centerpiece of this chapter. In-memory state handles "this one run", but the agent also needs memory that spans runs — session persistence. Most agents store the transcript as a flat array of messages. Pi Agent does not. It models the transcript as <strong>an appendable, forkable tree of immutable entries</strong>.</p>
+
+<h3>Why Not an Array</h3>
+
+<p>Consider a few real needs:</p>
+
+<ul>
+<li>The user wants to "go back three steps and ask again from a different angle" — an array cannot do this short of copying the whole array.</li>
+<li>The user wants to "fork this session so two branches explore independently" — an array requires a full copy.</li>
+<li>The context is too long and needs compaction, but "compaction" should not actually delete history (the user may want to look back) — in an array, deletion is deletion.</li>
+</ul>
+
+<p>The tree structure makes all of these natural: history is a set of immutable nodes, and the "current position" is just a pointer to some node (the <code>leaf</code>). Going back = moving the pointer; forking = growing a new branch from some node; compacting = inserting a summary node rather than deleting old ones.</p>
+
+<h3>Entries: The Nodes of the Tree</h3>
+
+<p>The nodes of the session tree are <code>SessionTreeEntry</code> (<code>packages/agent/src/harness/types.ts</code>), a union of 11 types:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export type SessionTreeEntry =
+	| MessageEntry            // 一条消息（user/assistant/toolResult/自定义）
+	| ThinkingLevelChangeEntry // thinking 级别变更
+	| ModelChangeEntry         // 模型变更
+	| ActiveToolsChangeEntry   // 激活工具集变更
+	| CompactionEntry          // 压缩摘要
+	| BranchSummaryEntry       // 分支摘要
+	| CustomEntry              // 自定义条目
+	| CustomMessageEntry       // 自定义消息条目
+	| LabelEntry               // 标签
+	| SessionInfoEntry         // 会话信息（如名称）
+	| LeafEntry;               // 叶指针：记录当前活跃叶</pre>
+
+<p>Every entry has an <code>id</code>, a <code>parentId</code> (the edge of the tree), a <code>timestamp</code>, and a <code>type</code>. Note that this stores more than messages — model switches, thinking-level changes, and tool-set changes are all entries. That means the "complete history of a session" includes <em>configuration changes</em>, not just conversation content. Looking back at a session, you can see things like "the user switched to a stronger model at turn 5".</p>
+
+<p><code>LeafEntry</code> is special: it carries no content — it is just a <strong>navigation marker</strong> recording "which entry is the currently active leaf". The session's "current position" is wherever the leaf points.</p>
+
+<h3>Branching: Moving the Leaf</h3>
+
+<p>The <code>Session</code> class (<code>packages/agent/src/harness/session/session.ts</code>) wraps operations on the storage. <code>appendMessage</code> appends a message entry (returning the new entry's id); <code>moveTo(entryId, summary?)</code> repoints the leaf:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">async moveTo(entryId, summary?): Promise&lt;...&gt; {
+	// 把 leaf 重新指向 entryId，实现分支/回溯
+}</pre>
+
+<p><code>moveTo</code> deletes nothing — it simply moves the leaf pointer to another entry. If that entry is a node on some old branch, subsequent <code>appendMessage</code> calls grow a new branch from there. That is how "go back three steps and try a different angle" works: <code>moveTo</code> the node from three steps ago, then keep appending. The old branch still lives in the tree, ready to be <code>moveTo</code>'d back to at any time.</p>
+
+<p><code>getBranch(fromId?)</code> returns the path from the leaf (or a given node) to the root — that is, every entry on "the current branch":</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">async getBranch(fromId?: string): Promise&lt;SessionTreeEntry[]&gt; {
+	// 返回 getPathToRootOrCompaction(leafId)
+}</pre>
+
+<h3>From Tree to Context: <code>buildSessionContext</code></h3>
+
+<p>The model does not need a tree — it needs a linear sequence of messages. <code>buildSessionContext</code> folds "the path of the current branch" into a <code>SessionContext</code>:</p>
+
+<pre class="code" data-lang="ts">export interface SessionContext {
+	messages: AgentMessage[];
+	thinkingLevel: string;
+	model: { provider: string; modelId: string } | null;
+	activeToolNames: string[] | null;
+}</pre>
+
+<p>The folding does two things: first, it derives the current model, thinking level, and active tools from the <code>ModelChangeEntry</code>/<code>ThinkingLevelChangeEntry</code>/<code>ActiveToolsChangeEntry</code> entries in the path (configuration "accumulates along the path"); second, it projects <code>MessageEntry</code>s and friends into an <code>AgentMessage[]</code>.</p>
+
+<h3>Compaction Takes Effect at Context-Build Time</h3>
+
+<p>The most crucial part is how compaction is handled. Recall from Chapter 1: Pi Agent's compaction does not delete history. So how does compaction reduce the tokens sent to the model? The answer is in <code>defaultContextEntryTransform</code> (<code>packages/agent/src/harness/session/session.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/session/session.ts">export function defaultContextEntryTransform(pathEntries: readonly SessionTreeEntry[]): SessionTreeEntry[] {
+	// 找到路径里最后一个 compaction 条目
+	let compaction: CompactionEntry | null = null;
+	for (const entry of pathEntries) {
+		if (entry.type === "compaction") compaction = entry;
+	}
+	if (!compaction) return [...pathEntries]; // 没有压缩，原样返回
+
+	// 有压缩：上下文 = [压缩摘要] + 保留的尾部
+	const entries: SessionTreeEntry[] = [compaction];
+	const compactionIdx = pathEntries.findIndex((e) =&gt; e.type === "compaction" &amp;&amp; e.id === compaction.id);
+	if (compaction.retainedTail) {
+		for (let i = compactionIdx + 1; i &lt; pathEntries.length; i++) entries.push(pathEntries[i]!);
+		return entries;
+	}
+	if (compaction.firstKeptEntryId) {
+		// 从 firstKeptEntryId 开始保留压缩点之前的部分
+		// ...
+	}
+	for (let i = compactionIdx + 1; i &lt; pathEntries.length; i++) entries.push(pathEntries[i]!);
+	return entries;
+}</pre>
+
+<p>The logic: if a <code>compaction</code> entry exists in the path, the context sent to the model becomes "<strong>compaction summary + the retained tail after the compaction point</strong>". The raw history before the compaction point is not deleted — it is still in the tree — it is simply replaced by the summary when the context is built.</p>
+
+<p>This is an elegant separation: <strong>the storage layer keeps the full history, and the context-building layer decides what goes to the model.</strong> Compaction is a property of the "context view", not of "storage". So a user can <code>moveTo</code> back before the compaction point and re-expand that history — compaction is a reversible view transformation, not irreversible data deletion. Chapter 7 details how compaction summaries are generated.</p>
+
+<h3>The Storage Interface: <code>SessionStorage</code></h3>
+
+<p>Persistence of the session tree is abstracted behind the <code>SessionStorage</code> interface (<code>packages/agent/src/harness/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export interface SessionStorage&lt;TMetadata extends SessionMetadata = SessionMetadata&gt; {
+	getMetadata(): Promise&lt;TMetadata&gt;;
+	getLeafId(): Promise&lt;string | null&gt;;
+	setLeafId(leafId: string | null): Promise&lt;LeafEntry&gt;;
+	createEntryId(): Promise&lt;string&gt;;
+	appendEntry(entry: SessionTreeEntry): Promise&lt;void&gt;;
+	getEntry(id: string): Promise&lt;SessionTreeEntry | undefined&gt;;
+	findEntries&lt;TType extends SessionTreeEntry["type"]&gt;(type: TType): Promise&lt;Array&lt;Extract&lt;SessionTreeEntry, { type: TType }&gt;&gt;&gt;;
+	getLabel(id: string): Promise&lt;string | undefined&gt;;
+	getSessionName(): Promise&lt;string | undefined&gt;;
+	getSessionStats(): Promise&lt;SessionStats&gt;;
+	getPathToRootOrCompaction(leafId: string | null): Promise&lt;SessionTreeEntry[]&gt;;
+	getEntries(options?: SessionEntryCursorOptions): Promise&lt;SessionTreeEntry[]&gt;;
+}</pre>
+
+<p>The core operations are <code>appendEntry</code> (append an immutable entry), <code>setLeafId</code> (move the leaf, i.e., branch), and <code>getPathToRootOrCompaction</code> (get the current branch path, stopping at the compaction point or the root). This interface is the key to pluggable storage backends — the core defines "what operations the session tree needs", and how they are actually stored is the backend's business.</p>
+
+<hr class="sep">
+
+<h2 id="storage">Layer Four: Storage Backends</h2>
+
+<p><code>SessionStorage</code> has three implementations, showing a progression "from simple to powerful".</p>
+
+<h3>JSONL: The Default Lightweight Backend</h3>
+
+<p>The default backend is JSONL (one JSON object per line). The Harness layer of <code>pi-agent-core</code> provides <code>JsonlSessionStorage</code> (<code>packages/agent/src/harness/session/jsonl-storage.ts</code>), and the product layer <code>pi-coding-agent</code> has its own <code>SessionManager</code> (<code>packages/coding-agent/src/core/session-manager.ts</code>) built on JSONL:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/session-manager.ts">export class SessionManager {
+	static create(cwd, sessionDir?, options?);
+	static forkFrom(sourcePath, cwd, sessionDir?, options?);
+	appendMessage(message): string;
+	appendModelChange(provider, modelId);
+	appendThinkingLevelChange(level);
+	getBranch(fromId?): SessionEntry[];
+	buildSessionContext(): SessionContext;
+	// ...
+}</pre>
+
+<p>A session is a JSONL file: one <code>SessionHeader</code> plus a series of typed entries. Appending is appending a line — simple, append-only, human-readable, easy to back up and version-control. Forking a session (<code>forkFrom</code>) means copying the file and setting <code>parentSessionPath</code>. For a single-user local CLI, JSONL is exactly the right choice — no database dependency, no migration burden.</p>
+
+<h3>SQLite: The Optional Power Backend</h3>
+
+<p>When sessions multiply and full-text search and fast opening are needed, JSONL's "replay the whole file on every open" becomes a bottleneck. <code>pi-storage-sqlite-node</code> (<code>packages/storage/sqlite-node</code>) offers a SQLite backend, <code>SqliteSessionStorage</code>, implementing the same <code>SessionStorage</code> interface.</p>
+
+<p>Its database schema (<code>packages/storage/sqlite-node/src/sqlite/migrations/001_initial.sql</code>) stores the session tree as relational tables:</p>
+
+<ul>
+<li><code>sessions</code>: session metadata + <code>active_leaf_id</code></li>
+<li><code>session_entries</code>: primary key <code>(session_id, id)</code>, with <code>entry_seq</code> (monotonically increasing), <code>parent_id</code> (the tree edge), <code>type</code>, <code>payload</code> (JSON)</li>
+<li><code>branch_entries</code>: materialized branch membership</li>
+<li><code>session_materialized</code> / <code>entry_materialized</code>: precomputed aggregate state</li>
+</ul>
+
+<p>Two optimizations are worth noting. First, <strong>materialized aggregates</strong>: <code>SessionMaterializedState</code> caches <code>messageCount</code>, token counts, total cost, the current model, and so on. Each <code>appendEntry</code> updates these aggregates incrementally (<code>applyEntryToMaterializedState</code>), so opening a session does not require replaying every entry — just read the materialized state. Second, <strong>FTS5 full-text search</strong>: <code>createSqliteSessionSearch</code> builds a search index with SQLite's FTS5 (trigram tokenizer), and <code>search()</code> runs a <code>MATCH</code> query ranked by <code>bm25()</code>. This makes "search for that auth bug across all my sessions" possible.</p>
+
+<p>The key point: the SQLite backend and the JSONL backend implement <strong>the same interface</strong>. The core code (the <code>Session</code> class, <code>buildSessionContext</code>) has no idea whether the backing store is a file or a database. That is the value of interface abstraction — storage backends are genuinely pluggable.</p>
+
+<h3>InMemory: Testing and Throwaway Use</h3>
+
+<p>There is also <code>InMemorySessionStorage</code> (<code>packages/agent/src/harness/session/memory-storage.ts</code>), which keeps entries in memory. It serves testing (evals use <code>SettingsManager.inMemory()</code> and throwaway sessions) and temporary scenarios that need no persistence.</p>
+
+<hr class="sep">
+
+<h2 id="walkthrough">Walkthrough: The Lifecycle of a Session</h2>
+
+<p>Let's tie the layers together. You run <code>pi</code>, type a few prompts, switch models midway, and then fork the session.</p>
+
+<ol>
+<li><strong>Startup</strong>: <code>SessionManager.create(cwd)</code> creates a JSONL file and writes a <code>SessionHeader</code>. The leaf is empty.</li>
+<li><strong>First message</strong>: <code>appendMessage(userMessage)</code> appends a <code>MessageEntry</code> (its <code>parentId</code> points at the root), and the leaf moves to it.</li>
+<li><strong>Assistant reply + tools</strong>: the assistant and <code>toolResult</code> messages produced by the loop are <code>appendMessage</code>'d one after another, each entry's <code>parentId</code> pointing at the previous one, forming a chain.</li>
+<li><strong>Model switch</strong>: you switch to a stronger model with <code>/model</code>. <code>appendModelChange(provider, modelId)</code> appends a <code>ModelChangeEntry</code>. From then on, <code>buildSessionContext</code> derives "the current model has changed" from it.</li>
+<li><strong>Compaction</strong>: the context is nearly full. The compaction logic generates a summary, and <code>appendCompaction(...)</code> appends a <code>CompactionEntry</code>. History is not deleted — but from now on, <code>defaultContextEntryTransform</code> replaces everything before the compaction point with "summary + tail".</li>
+<li><strong>Fork</strong>: you want a different angle. <code>moveTo(the entryId from three steps ago)</code> moves the leaf back (appending a <code>LeafEntry</code> to record the new position), then <code>appendMessage(new user message)</code> grows a new branch from there. The old branch is intact, and the <code>/tree</code> command shows the whole tree.</li>
+</ol>
+
+<p>Throughout, the in-memory <code>Agent.state.messages</code> holds "the linear transcript of the current run", while the persistent session tree holds "the complete, forkable history". The two are projected into each other via <code>buildSessionContext</code> (tree → linear context) and <code>appendMessage</code> (linear messages → tree entries).</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's state design offers four transferable patterns for "how to manage an agent's state and history".</p>
+
+<p><strong>Separate in-memory state from persistent state.</strong> In-memory state (the current transcript, runtime flags) uses mutable objects with accessor properties, favoring lightweight reads/writes and defensive copying; persistent state (session history) uses an immutable entry tree, favoring forkability and compaction. The problem it solves: one mechanism serving two access patterns ends up uncomfortable for both. Two layers of state correspond to two lifecycles and two needs.</p>
+
+<p><strong>Reduce events rather than mutating state directly.</strong> The loop emits events, <code>Agent</code> reduces them into state, and listeners consume the events. The problem it solves: state mutations scattered everywhere and UI coupled to logic. When every state change flows through the same event stream, you get "any consumer can rebuild the state" for free — TUI, print, and RPC are all different projections of the same reduction.</p>
+
+<p><strong>Internal representation ≠ wire representation; connect them with a bridge.</strong> The transcript may hold arbitrary custom message types, but what goes to the model is always the clean filtered/converted subset. The problem it solves: stuffing things into messages for the UI or persistence ends up polluting the provider protocol. When <code>convertToLlm</code> is the only exit, the internals can extend freely without affecting the outside.</p>
+
+<p><strong>Model history as an immutable tree and the "current position" as a pointer.</strong> Going back = moving the pointer, forking = growing a new branch, compacting = inserting a summary node instead of deleting. The problem it solves: under a flat array, "going back", "branch exploration", and "reversible compaction" all require full copies or irreversible deletion. When history is immutable and the position is a pointer, these operations all degrade into pointer operations. The cost is somewhat more complex storage and context building — but for an interactive agent where users constantly experiment, backtrack, and fork, that cost is well worth it.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's state is organized in four layers. In memory, <code>Agent</code> holds the current transcript in accessor properties with defensive copying, reduces <code>AgentEvent</code>s into state via <code>processEvents</code>, and even converts failures into normal event sequences. At the message layer, the extensible <code>AgentMessage</code> union lets the transcript hold arbitrary custom types, and <code>convertToLlm</code> filters out a clean subset at the model boundary. At the persistence layer, a session is modeled as an appendable, forkable tree of 11 kinds of immutable entries, the leaf pointer marks the current position, and compaction takes effect at context-build time instead of deleting history. At the storage layer, the <code>SessionStorage</code> interface makes three backends — JSONL, SQLite, and InMemory — pluggable.</p>
+
+<p>The deepest insight is the tree structure. It is not "another way to store messages" but a redefinition of "what a session is": a session is not a line but a tree of exploration, where the user can fork, go back, and compact at any node. Understand that, and you understand why Pi Agent supports fork, <code>/tree</code>, and reversible compaction so gracefully — features that are extremely awkward in the flat-array model.</p>
+
+<p>Next chapter, we leave the core runtime and enter the Harness layer of <code>pi-agent-core</code> — to see how it builds an out-of-the-box persistent orchestrator on top of the minimal core.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>

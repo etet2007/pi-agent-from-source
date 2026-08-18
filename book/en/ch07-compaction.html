@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 7 · Context Compaction and Branch Summaries | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch07">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part III · Persistent Orchestration</p>
+  <h1>Chapter 7: Context Compaction and Branch Summaries</h1>
+  <p class="chapter-sub">Compaction doesn't delete history: it inserts a summary node into the session tree, letting a finite window hold an unbounded task</p>
+</header>
+
+<h2 id="window">A finite window, an unbounded task</h2>
+
+<p>Every model has a context window: the token limit it can "see" at once. But real coding tasks tend to be long: reading dozens of files, running dozens of commands, going back and forth for dozens of turns. The transcript grows, and sooner or later it hits that wall. What happens then?</p>
+
+<p>The monolithic approach answers with "four-layer compaction": snip, microcompact, collapse, autocompact, triggered progressively from light to heavy, plus a circuit breaker to prevent infinite retries. That is a submarine-grade complex system.</p>
+
+<p>Pi Agent's answer is far simpler, yet it carries a distinctive twist: <strong>compaction does not delete history.</strong> Recall Chapter 5: the transcript is an immutable tree. Compaction does not remove nodes from the tree; it <em>inserts</em> a summary node (<code>CompactionEntry</code>) into it. The original history stays on the tree intact; compaction only changes the "context view sent to the model". That makes compaction a <strong>reversible view transformation</strong>: the user can move back before the compaction point and re-expand that stretch of history.</p>
+
+<p>This chapter dissects the mechanism: when to compact, where to cut, how the summary is written, and how it all meshes with the tree.</p>
+
+<hr class="sep">
+
+<h2 id="when">When to compact: threshold and estimation</h2>
+
+<p>The compaction trigger is a simple inequality. <code>shouldCompact</code> (<code>packages/agent/src/harness/compaction/compaction.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens &gt; contextWindow - settings.reserveTokens;
+}</pre>
+
+<p>When the estimated context token count exceeds "window size minus reserved space", it's time to compact. The defaults (<code>DEFAULT_COMPACTION_SETTINGS</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+	enabled: true,
+	reserveTokens: 16384,   // 为摘要提示词和输出预留
+	keepRecentTokens: 20000, // 压缩后大约保留多少近期 token
+};</pre>
+
+<ul>
+<li><code>reserveTokens</code> (16,384): space reserved at the top of the window for the summary-generation model call, also serving as a safety margin.</li>
+<li><code>keepRecentTokens</code> (20,000): the amount of recent context to keep after compaction, with cut-point selection revolving around this budget.</li>
+</ul>
+
+<h3 id="estimate">Token estimation: anchored on authoritative usage</h3>
+
+<p>Deciding "how many tokens are there right now" is itself a hard problem: you can't send the entire transcript to the model every time for an exact count. <code>estimateContextTokens</code> uses a clever hybrid strategy:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);
+	if (!usageInfo) {
+		// 没有任何权威用量：全部用启发式估算
+		let estimated = 0;
+		for (const message of messages) estimated += estimateTokens(message);
+		return { tokens: estimated, usageTokens: 0, trailingTokens: estimated, lastUsageIndex: null };
+	}
+	// 有权威用量：用它做锚，只估算锚点之后的新增消息
+	const usageTokens = calculateContextTokens(usageInfo.usage);
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i &lt; messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+	return { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, lastUsageIndex: usageInfo.index };
+}</pre>
+
+<p>The key insight: the <code>usage</code> field of the most recent assistant response is <strong>authoritative</strong> — it is the token count the provider actually reported for the entire context up to and including that message. The estimate therefore becomes "authoritative anchor + heuristic increment after the anchor". The error is confined to "what's new since the last turn" rather than accumulating across the whole conversation. That is far more accurate than estimating the entire transcript from scratch.</p>
+
+<p>When no anchor exists (for example, at the very start of a session), it falls back to the pure heuristic <code>estimateTokens</code>: a conservative "characters / 4" estimate, with images counted as <code>ESTIMATED_IMAGE_CHARS = 4800</code> characters:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function estimateTokens(message: AgentMessage): number {
+	let chars = 0;
+	switch (message.role) {
+		case "user":
+			chars = estimateTextAndImageContentChars(message.content);
+			return Math.ceil(chars / 4);
+		case "assistant":
+			// 累加 text、thinking、toolCall（名字 + 参数 JSON）的字符
+			return Math.ceil(chars / 4);
+		// ... toolResult, bashExecution, branchSummary, compactionSummary
+	}
+	return 0;
+}</pre>
+
+<p><code>calculateContextTokens(usage)</code> takes the total from the authoritative usage: <code>usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite</code>.</p>
+
+<hr class="sep">
+
+<h2 id="cut">Where to cut: choosing the cut point</h2>
+
+<p>Once we've decided to compact, the next question is: where to cut? Everything before the cut goes into the summary; everything after it stays verbatim. <code>findCutPoint</code> makes this decision, aiming to <strong>keep roughly <code>keepRecentTokens</code> of recent context</strong>.</p>
+
+<h3 id="valid-cuts">Valid cut points</h3>
+
+<p>Not just any position can serve as a cut. <code>findValidCutPoints</code> filters out the valid ones:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
+	const cutPoints: number[] = [];
+	for (let i = startIndex; i &lt; endIndex; i++) {
+		const entry = entries[i];
+		switch (entry.type) {
+			case "message": {
+				const role = entry.message.role;
+				switch (role) {
+					case "bashExecution":
+					case "custom":
+					case "branchSummary":
+					case "compactionSummary":
+					case "user":
+					case "assistant":
+						cutPoints.push(i); // 这些消息边界可以切
+						break;
+					case "toolResult":
+						break; // 工具结果不能作为切点
+				}
+				break;
+			}
+			// 配置变更条目（model_change 等）不是切点
+		}
+		if (entry.type === "branch_summary" || entry.type === "custom_message") cutPoints.push(i);
+	}
+	return cutPoints;
+}</pre>
+
+<p>Note that <code>toolResult</code> <strong>cannot</strong> be a cut point. Why? Because the protocol requires every <code>tool_use</code> to be followed by its matching <code>tool_result</code> (the "orphaned tool result" problem from Chapter 3). If you cut between a tool call and its result, the retained second half would begin with an orphaned <code>toolResult</code>, and the provider would reject it. Restricting cut points to message boundaries such as user/assistant guarantees that both halves of the cut are each a valid conversation fragment.</p>
+
+<h3 id="backward-budget">Working the budget backward from the tail</h3>
+
+<p><code>findCutPoint</code> accumulates tokens from the tail backward until it reaches the <code>keepRecentTokens</code> budget, then picks the nearest valid cut point after that position:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function findCutPoint(entries, startIndex, endIndex, keepRecentTokens): CutPointResult {
+	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
+	if (cutPoints.length === 0) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+	}
+	let accumulatedTokens = 0;
+	let cutIndex = cutPoints[0];
+
+	// 从尾部往前累积，直到达到 keepRecentTokens
+	for (let i = endIndex - 1; i &gt;= startIndex; i--) {
+		const entry = entries[i];
+		if (entry.type !== "message") continue;
+		accumulatedTokens += estimateTokens(entry.message);
+		if (accumulatedTokens &gt;= keepRecentTokens) {
+			// 找到这个位置之后最近的合法切点
+			for (let c = 0; c &lt; cutPoints.length; c++) {
+				if (cutPoints[c] &gt;= i) { cutIndex = cutPoints[c]; break; }
+			}
+			break;
+		}
+	}
+	// 往前微调，避免切在 compaction 或 message 之前的"空档"
+	while (cutIndex &gt; startIndex) {
+		const prevEntry = entries[cutIndex - 1];
+		if (prevEntry.type === "compaction" || prevEntry.type === "message") break;
+		cutIndex--;
+	}
+	const cutEntry = entries[cutIndex];
+	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+	};
+}</pre>
+
+<p>The logic: count backward from the newest message until about 20,000 tokens have accumulated, then align to the nearest valid cut point. The retained tail is thus roughly <code>keepRecentTokens</code> in size, and everything before the cut goes into the summary.</p>
+
+<h3 id="split-turn">Split turn: cutting mid-turn</h3>
+
+<p>There's a subtle case: the cut point can land <strong>in the middle of a turn</strong>; say a single user request triggers ten tool calls, and the cut happens to fall right after the fifth. The "retained tail" after the cut would then begin with a tool result that has no context, leaving the model confused.</p>
+
+<p><code>findCutPoint</code> detects this via the <code>isSplitTurn</code> flag: if the cut point isn't a user message, it uses <code>findTurnStartIndex</code> to walk back to the start of that turn (the user message that began it). <code>isSplitTurn: true</code> means "the cut has split a turn in two".</p>
+
+<p>This case needs special handling: the retained tail (the second half of a turn) needs an extra note about "what happened in the first half". We'll see shortly how <code>compact</code> resolves it with a dedicated "turn prefix" summary.</p>
+
+<hr class="sep">
+
+<h2 id="prepare">Preparation: <code>prepareCompaction</code></h2>
+
+<p><code>prepareCompaction</code> turns the cut-point decision into a <code>CompactionPreparation</code> holding everything compaction needs as input:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export function prepareCompaction(pathEntries, settings): Result&lt;CompactionPreparation | undefined, CompactionError&gt; {
+	// 如果路径为空，或最后一个条目已经是 compaction，无需压缩
+	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
+		return ok(undefined);
+	}
+
+	// 找到上一个 compaction（用于迭代更新摘要）
+	let prevCompactionIndex = -1;
+	for (let i = pathEntries.length - 1; i &gt;= 0; i--) {
+		if (pathEntries[i].type === "compaction") { prevCompactionIndex = i; break; }
+	}
+	let previousSummary: string | undefined;
+	let boundaryStart = 0;
+	if (prevCompactionIndex &gt;= 0) {
+		previousSummary = (pathEntries[prevCompactionIndex] as CompactionEntry).summary;
+		// 边界从上次压缩的 firstKeptEntry 开始
+		// ...
+	}
+
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, pathEntries.length, settings.keepRecentTokens);
+	const firstKeptEntryId = pathEntries[cutPoint.firstKeptEntryIndex].id;
+
+	// 三段消息：
+	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
+	const messagesToSummarize = []; // 边界 → historyEnd：进主摘要
+	const turnPrefixMessages = [];  // turnStart → 切点：split-turn 的前半，单独摘要
+	const retainedTail = [];        // 切点 → 末尾：保留原文
+
+	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
+
+	return ok({ firstKeptEntryId, messagesToSummarize, turnPrefixMessages, retainedTail, isSplitTurn, tokensBefore, previousSummary, fileOps, settings });
+}</pre>
+
+<p>It slices the path into three segments:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="segments" data-w="1020" data-h="440"></canvas></div>
+  <figcaption>Figure 1: When preparing compaction, the path is sliced into three segments: the main summary, the split-turn prefix summary, and the retained tail.</figcaption>
+</figure>
+
+<ul>
+<li><strong><code>messagesToSummarize</code></strong>: the messages from the boundary to the cut point (or the split turn's starting point), which will be compacted into the main summary.</li>
+<li><strong><code>turnPrefixMessages</code></strong>: only present on a split turn: the first half of the cut turn, which needs its own summary.</li>
+<li><strong><code>retainedTail</code></strong>: the recent messages after the cut point, kept verbatim and stored directly on the compaction entry.</li>
+</ul>
+
+<p>Note <code>previousSummary</code>: if compaction has already happened, this run doesn't start from scratch; it <strong>incrementally updates on top of the previous summary</strong>. That's an important optimization, as we'll see below.</p>
+
+<p><code>fileOps</code>, meanwhile, extracts the files that were read or modified within this stretch of history (<code>extractFileOperations</code>) and stores them in the compaction entry's <code>details</code>. The post-compaction context thus still "remembers" which files were touched: <code>CompactionDetails { readFiles, modifiedFiles }</code>.</p>
+
+<hr class="sep">
+
+<h2 id="summarizing">How the summary is written: a structured prompt</h2>
+
+<p>The quality of the summary decides whether the agent can keep working after compaction. Pi Agent constrains the summary format with a highly structured prompt. The system prompt (<code>SUMMARIZATION_SYSTEM_PROMPT</code>) first pins the model into a "summary-only" role:</p>
+
+<blockquote>
+<p>You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.</p>
+<p>Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.</p>
+</blockquote>
+
+<p>Then the user prompt (<code>SUMMARIZATION_PROMPT</code>) dictates the exact output format:</p>
+
+<pre class="code" data-lang="text">## Goal
+[What is the user trying to accomplish?]
+
+## Constraints &amp; Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+### In Progress
+- [ ] [Current work]
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.</pre>
+
+<p>The format is carefully designed. It doesn't "compress the conversation into a paragraph"; it <strong>reconstructs the conversation as a handoff document</strong>: goal, constraints, progress (done / in progress / blocked), key decisions, next steps, critical context. The closing line, "Preserve exact file paths, function names, and error messages", matters most: a summary may lose wording, but it must not lose exact identifiers, because the work ahead depends on them.</p>
+
+<h3 id="iterative-update">Iterative updates: <code>UPDATE_SUMMARIZATION_PROMPT</code></h3>
+
+<p>If a <code>previousSummary</code> already exists (compaction has happened before), <code>UPDATE_SUMMARIZATION_PROMPT</code> is used instead. It places the old summary inside a <code>&lt;previous-summary&gt;</code> tag and asks the model to <strong>update incrementally</strong> rather than rewrite:</p>
+
+<blockquote>
+<p>Update the existing structured summary with new information. RULES:</p>
+<p>- PRESERVE all existing information from the previous summary</p>
+<p>- ADD new progress, decisions, and context from the new messages</p>
+<p>- UPDATE the Progress section: move items from "In Progress" to "Done" when completed</p>
+<p>- PRESERVE exact file paths, function names, and error messages</p>
+</blockquote>
+
+<p>This avoids the waste of "re-summarizing the entire history on every compaction". On the second compaction, the model only needs to read "the previous summary plus the messages added since", not "the full original history". Compaction cost therefore doesn't grow linearly with session length.</p>
+
+<h3 id="generation">Generation: <code>generateSummaryWithUsage</code></h3>
+
+<p>The actual generation call (<code>generateSummaryWithUsage</code>) has a few details:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">const maxTokens = Math.min(
+	Math.floor(0.8 * reserveTokens),
+	model.maxTokens &gt; 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+);
+// ...
+const response = await completeSimpleWithRetries(models, model, {
+	systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+	messages: summarizationMessages,
+}, completionOptions, retry, callbacks);</pre>
+
+<ul>
+<li><strong>Output cap</strong>: <code>maxTokens</code> is the smaller of <code>0.8 * reserveTokens</code> and the model's own limit; summary output stays within the reserved space and can't blow up the window on its own.</li>
+<li><strong>Isolated request</strong>: <code>completeSimpleWithRetries</code> gives the summary call a brand-new <code>sessionId</code> and <code>cacheRetention: "none"</code>:</li>
+</ul>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export async function completeSimpleWithRetries(models, model, context, options, retry?, callbacks?) {
+	// 摘要是独立请求：隔离路由，避免写入无法复用的缓存
+	const requestOptions = { ...options, cacheRetention: "none", sessionId: uuidv7() };
+	return retryAssistantCall(() =&gt; models.completeSimple(model, context, requestOptions), retry, requestOptions.signal, callbacks);
+}</pre>
+
+<p>Why isolate it? Because the summary request's content (serialized history + the summarization prompt) differs completely from a normal conversation's prompt prefix, so writing a prompt cache for it is wasteful: that cache would never be reused. A fresh sessionId with no cache avoids polluting the main conversation's cache statistics. It's also wrapped in <code>retryAssistantCall</code> (the assistant-level retry from Chapter 2), making summary generation resilient to transient failures.</p>
+
+<hr class="sep">
+
+<h2 id="compact">Putting it together: <code>compact</code> and split turns</h2>
+
+<p><code>compact</code> wires preparation and generation together and produces the final <code>CompactionResult</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/compaction/compaction.ts">export async function compact(preparation, models, model, customInstructions?, signal?, thinkingLevel?, retry?, callbacks?): Promise&lt;Result&lt;CompactionResult, CompactionError&gt;&gt; {
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, retainedTail, isSplitTurn, tokensBefore, previousSummary, fileOps, settings } = preparation;
+
+	let summary: string;
+	let summaryUsage: Usage;
+
+	if (isSplitTurn &amp;&amp; turnPrefixMessages.length &gt; 0) {
+		// split-turn：先摘要历史，再单独摘要这一轮的前半
+		let historyText = "No prior history.";
+		if (messagesToSummarize.length &gt; 0) {
+			const historyResult = await generateSummaryWithUsage(messagesToSummarize, ...);
+			if (!historyResult.ok) return err(historyResult.error);
+			historyText = historyResult.value.text;
+		}
+		const turnPrefixResult = await generateTurnPrefixSummary(turnPrefixMessages, ...);
+		if (!turnPrefixResult.ok) return err(turnPrefixResult.error);
+		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value.text}`;
+		summaryUsage = combineUsage(...);
+	} else {
+		// 普通情况：一次摘要
+		const summaryResult = await generateSummaryWithUsage(messagesToSummarize, ...);
+		if (!summaryResult.ok) return err(summaryResult.error);
+		summary = summaryResult.value.text;
+		summaryUsage = summaryResult.value.usage;
+	}
+	// 返回 { summary, firstKeptEntryId, tokensBefore, usage, retainedTail, details: fileOps }
+}</pre>
+
+<p>The split-turn handling is the highlight: when the cut splits a turn in two, <code>compact</code> runs <strong>two</strong> summaries: one regular history summary (<code>SUMMARIZATION_PROMPT</code>), and one dedicated "turn prefix summary" (<code>TURN_PREFIX_SUMMARIZATION_PROMPT</code>) that uses a different format:</p>
+
+<blockquote>
+<p>This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.</p>
+<p>## Original Request / ## Early Progress / ## Context for Suffix</p>
+</blockquote>
+
+<p>The two pieces are then joined. That way the retained tail (the second half of a turn) gets an account of "what happened in the first half", and the model never sees a headless tool result.</p>
+
+<p><code>CompactionResult</code> carries <code>summary</code>, <code>firstKeptEntryId</code> (where the retained history begins), <code>tokensBefore</code>, <code>usage</code>, <code>retainedTail</code> (the retained tail messages), and <code>details</code> (the file operations).</p>
+
+<hr class="sep">
+
+<h2 id="tree">Meshing with the tree: how compaction takes effect</h2>
+
+<p>The result produced by <code>compact</code> is ultimately written by <code>AgentHarness</code> (or the product layer) as a <code>CompactionEntry</code> appended to the session tree. Recall <code>defaultContextEntryTransform</code> from Chapter 5: on every subsequent context build, if this <code>compaction</code> entry is on the path, the context becomes "<code>[compaction]</code> + retained tail".</p>
+
+<p>The whole compaction pipeline thus closes the loop:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="pipeline" data-w="780" data-h="950"></canvas></div>
+  <figcaption>Figure 2: The compaction loop. From estimation and cut-point selection to appending the CompactionEntry to the tree; afterward, context builds replace everything before the compaction point with "summary + tail".</figcaption>
+</figure>
+
+<p>And the original history (the entries behind <code>messagesToSummarize</code>) is <strong>never deleted</strong>. It stays on the tree. When the user <code>moveTo</code>s back before the compaction point, <code>defaultContextEntryTransform</code> no longer sees that <code>compaction</code> entry (it lies off the path), and the original history re-expands. Compaction is reversible.</p>
+
+<p>This is the fundamental difference between Pi Agent and "deletive compaction". Deletive compaction (splicing old messages out of an array) is simple but irreversible, and it forfeits the ability to "look back at history". Pi Agent uses the tree to separate "storage" from "view"; the cost is one more layer of abstraction, and the payoff is that compaction, branching, and backtracking all become natural and reversible.</p>
+
+<hr class="sep">
+
+<h2 id="branch">Branch summaries: the handoff when switching branches</h2>
+
+<p>Besides compaction, there's another kind of summary: branch summarization (<code>packages/agent/src/harness/compaction/branch-summarization.ts</code>).</p>
+
+<p>Recall Chapter 5: the user can <code>moveTo</code> another branch on the session tree. When you switch from branch A to branch B, what happened on branch A may be useful context for the work ahead on branch B ("I just tried plan X on another branch; it didn't work"). <code>generateBranchSummary</code> generates a summary (<code>BranchSummaryEntry</code>) for a branch as you leave it, so that the essence of that exploration isn't lost when you switch away and back.</p>
+
+<p><code>collectEntriesForBranchSummary</code> gathers the branch entries to summarize, and <code>generateBranchSummary</code> produces the summary with a similar structured prompt. It shares compaction's philosophy of "reconstructing the conversation as a structured handoff document"; only the trigger differs: compaction fires on "context is too full", branch summarization on "I'm leaving this branch".</p>
+
+<p><code>AgentHarness.navigateTree</code> (Chapter 6) triggers it during branch navigation: the phase switches to <code>branch_summary</code>, and the <code>session_before_tree</code>/<code>session_tree</code> hooks fire.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's compaction offers four transferable patterns for "managing an agent's finite context".</p>
+
+<p><strong>Anchor on authoritative usage; estimate only the increment.</strong> Use the real token count reported by the provider in the latest response as the anchor, and apply heuristic estimation only to the messages added after it. The problem it solves: heuristic estimation over the whole transcript accumulates error, while exact counting is too expensive. The anchor method confines the error to "the most recent turn", balancing cost against accuracy.</p>
+
+<p><strong>Align cut points to protocol-legal boundaries.</strong> A cut point must not fall between a tool call and its result, or the retained second half would start with an orphaned result. The problem it solves: a naive "cut by token count" can produce protocol-illegal fragments. Constraining cut points to legal boundaries (user/assistant) guarantees both halves are valid on their own.</p>
+
+<p><strong>Write the summary as a structured handoff document, not an abbreviation.</strong> Constrain the summary with a fixed format (goal / constraints / progress / decisions / next steps / critical context) and force exact identifiers to be preserved. The problem it solves: free-form summaries lose the precise details needed to continue working (file paths, function names, error messages). The structured format turns the summary into a usable handoff document rather than a vague recap.</p>
+
+<p><strong>Compaction is a view transformation, not data deletion.</strong> Separate "storing the full history" from "what gets sent to the model": compaction inserts a summary node, the original history is retained, and context builds substitute on demand. The problem it solves: deletive compaction is irreversible and loses the ability to look back and backtrack. When compaction is reversible, the user can freely toggle between "saving tokens" and "reviewing history". The cost is needing a tree-shaped storage model; once again, Chapter 5's tree structure pays off here.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's compaction is a mechanism designed around the "tree-shaped transcript": <code>shouldCompact</code> judges the timing with "authoritative anchor + incremental estimation", <code>findCutPoint</code> retains roughly <code>keepRecentTokens</code> of recent context at protocol-legal boundaries (and detects split turns), <code>prepareCompaction</code> slices the path into three segments, <code>generateSummary</code> reconstructs the history into a handoff document using a structured prompt (supporting iterative updates and the split-turn's two-part summary), and finally the <code>CompactionEntry</code> produced by <code>compact</code> is appended to the tree: the original history is never deleted; compaction is only a reversible replacement of the context view. Branch summarization, meanwhile, preserves the essence of exploration when switching branches.</p>
+
+<p>It is an order of magnitude simpler than the monolithic approach's "four-layer compaction", yet it sacrifices none of the core capabilities, because the tree absorbs the complexity. Once you understand Chapter 5's tree, the compaction here almost writes itself. That is the value of a good low-level abstraction: it makes the features above it simple.</p>
+
+<p>Next chapter, we leave <code>pi-agent-core</code> and enter the product layer <code>pi-coding-agent</code>: to see how the <code>pi</code> command starts from a single <code>cli.ts</code> and assembles a complete Agent along the way.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("segments", function (d) {
+  d.box({ id: "A", x: 30, y: 190, w: 180, h: 70, title: "Prev compaction / start", tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 260, y: 190, w: 230, h: 70, title: "messagesToSummarize", lines: ["→ main summary"], tone: "teal", titleSize: 13 });
+  d.box({ id: "C", x: 540, y: 190, w: 160, h: 70, title: "split-turn?", tone: "gold", titleSize: 13 });
+  d.box({ id: "D", x: 760, y: 60, w: 230, h: 70, title: "turnPrefixMessages", lines: ["→ own summary"], tone: "violet", titleSize: 13 });
+  d.box({ id: "E", x: 760, y: 300, w: 230, h: 70, title: "retainedTail", lines: ["→ kept verbatim"], tone: "slate", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "right", to: "left" });
+  d.arrow("B", "C", { from: "right", to: "left" });
+  d.arrow("C", "D", { from: "top", to: "left", label: "yes" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("C", "E", { from: "bottom", to: "left", label: "no" });
+});
+
+PB.fig("pipeline", function (d) {
+  d.box({ id: "A", x: 140, y: 30, w: 420, h: 84, title: "estimateContextTokens", lines: ["Estimate current tokens"], tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 140, y: 144, w: 420, h: 84, title: "shouldCompact?", lines: ["Over window − reserve"], tone: "gold", titleSize: 13 });
+  d.box({ id: "Z", x: 600, y: 144, w: 150, h: 84, title: "No compaction", tone: "slate", titleSize: 13 });
+  d.box({ id: "C", x: 140, y: 258, w: 420, h: 84, title: "findCutPoint", lines: ["Pick cut (keep keepRecentTokens)"], tone: "teal", titleSize: 13 });
+  d.box({ id: "D", x: 140, y: 372, w: 420, h: 84, title: "prepareCompaction", lines: ["Slice into 3 segments"], tone: "teal", titleSize: 13 });
+  d.box({ id: "E", x: 140, y: 486, w: 420, h: 84, title: "generateSummary", lines: ["Structured summary (iterative)"], tone: "violet", titleSize: 13 });
+  d.box({ id: "F", x: 140, y: 600, w: 420, h: 84, title: "compact", lines: ["Handle split-turn, emit result"], tone: "violet", titleSize: 13 });
+  d.box({ id: "G", x: 140, y: 714, w: 420, h: 84, title: "Append CompactionEntry to tree", tone: "gold", titleSize: 13 });
+  d.box({ id: "H", x: 140, y: 828, w: 420, h: 84, title: "Later: buildSessionContext", lines: ["Summary+tail replaces pre-cut"], tone: "accent", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top", label: "yes" });
+  d.arrow("B", "Z", { from: "right", to: "left", label: "no" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "F", { from: "bottom", to: "top" });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "H", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

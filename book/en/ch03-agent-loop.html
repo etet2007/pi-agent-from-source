@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 3 · Agent Loop: Two Nested Loops | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch03">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part II · Agent Core</p>
+  <h1>Chapter 3: Agent Loop — Two Nested Loops</h1>
+  <p class="chapter-sub">Two nested loops, ten lifecycle events, and the "contract discipline" that pushes compaction, stopping, and resumption entirely outside the loop</p>
+</header>
+
+<h2 id="heart">The Beating Heart</h2>
+
+<p>Chapter 2 showed how <code>pi-ai</code> hides roughly 38 providers behind one unified streaming API — <code>StreamFn</code> goes in, <code>AssistantMessageEventStream</code> comes out, and failures are encoded into the stream. But a single model call is not an agent. An agent is a loop: call the model, execute tools, feed the results back, call the model again — until the work is done.</p>
+
+<p>Every system has a center of gravity. In a database it's the storage engine; in a compiler it's the intermediate representation. In Pi Agent, it's <code>packages/agent/src/agent-loop.ts</code> — the core loop that drives every interaction, from the first keystroke in the REPL to the last tool call of a headless <code>-p</code> invocation.</p>
+
+<p>If you've read <code>query.ts</code> from Claude Code in the companion book — that 1,730-line "submarine" with four layers of compaction, five kinds of error recovery, and ten terminal states — Pi Agent's loop will come as a relief. The <code>runLoop</code> function at the heart of <code>agent-loop.ts</code> is a <strong>two-level nested <code>while</code> loop</strong>: no compaction maze, no recovery ladder. Its complexity lives not inside the loop but in what it pushes <em>outward</em>: compaction goes to the <code>transformContext</code> callback, error recovery to <code>pi-ai</code>'s two-layer retry, and stopping decisions to the <code>shouldStopAfterTurn</code> hook.</p>
+
+<p>This chapter traces the loop from start to finish. By the end, you'll understand why it's so clean — and what that cleanliness costs.</p>
+
+<hr class="sep">
+
+<h2 id="shape">The Shape of the Loop: Event Stream + emit Callback</h2>
+
+<p>The first architectural question: how does the loop tell the outside world about its progress?</p>
+
+<p>Pi Agent's answer is to split the "pure loop logic" from the "observable wrapper" into two layers. At the bottom is an <code>emit</code> callback:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">export type AgentEventSink = (event: AgentEvent) =&gt; Promise&lt;void&gt; | void;
+
+export async function runAgentLoop(
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise&lt;AgentMessage[]&gt;</pre>
+
+<p><code>runAgentLoop</code> takes an <code>emit</code> function, invokes it every time the loop makes progress, and finally returns all the new messages from this run. It is a pure "run a round" function — it doesn't care who is listening.</p>
+
+<p>On top of that, <code>agentLoop</code> provides an observable wrapper that returns the <code>EventStream</code> you saw in Chapter 2:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">export function agentLoop(
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): EventStream&lt;AgentEvent, AgentMessage[]&gt; {
+	const stream = createAgentStream();
+	void runAgentLoop(prompts, context, config, async (event) =&gt; {
+		stream.push(event);
+	}, signal, streamFn).then((messages) =&gt; {
+		stream.end(messages);
+	});
+	return stream;
+}</pre>
+
+<p>Notice how thin the wrapper is: it just bridges <code>emit</code> to <code>stream.push</code> and the return value to <code>stream.end</code>. The <code>EventStream</code> created by <code>createAgentStream()</code> completes on the <code>agent_end</code> event, extracting <code>messages</code> from it as the final result.</p>
+
+<p>This contrasts with the choice Claude Code made in the companion book. Claude Code uses an async generator (yielding messages, returning a <code>Terminal</code> union type) as the shape of its loop. Pi Agent uses <code>EventStream</code> + <code>emit</code> callbacks. Both provide backpressure and composability, but Pi's separation has an extra benefit: <strong>the core <code>runLoop</code> depends on no streaming abstraction at all</strong> — it only knows one <code>emit</code> function. That lets any orchestrator (the core <code>Agent</code>, the Harness, or the product-layer <code>AgentSession</code>) drive the loop however it likes. Chapter 6 will show the Harness driving <code>runAgentLoop</code> directly, and Chapter 9 will show the product layer driving it indirectly through the core <code>Agent</code>.</p>
+
+<p>There's also a pair of "continuation" variants, <code>runAgentLoopContinue</code> / <code>agentLoopContinue</code>, for retry scenarios — when the context already holds user messages or tool results, so no new messages need to be appended. They carry one precondition check: the last message must not be <code>assistant</code> (otherwise the provider rejects the request).</p>
+
+<hr class="sep">
+
+<h2 id="contracts">The Contract That Keeps the Loop Simple: Never Throw</h2>
+
+<p>Before tracing the loop body, you have to understand why it can be so lean. The secret lives in each callback of <code>AgentLoopConfig</code>. Open <code>packages/agent/src/types.ts</code> and you'll find the same sentence repeated in the docs of every callback:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface AgentLoopConfig extends SimpleStreamOptions {
+	model: Model&lt;any&gt;;
+
+	// Contract: must not throw or reject. Return a safe fallback value instead.
+	convertToLlm: (messages: AgentMessage[]) =&gt; Message[] | Promise&lt;Message[]&gt;;
+
+	// Contract: must not throw or reject. Return the original messages or another
+	// safe fallback value instead.
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) =&gt; Promise&lt;AgentMessage[]&gt;;
+
+	// Contract: must not throw or reject. Return undefined when no key is available.
+	getApiKey?: (provider: string) =&gt; Promise&lt;string | undefined&gt; | string | undefined;
+
+	// Contract: must not throw or reject.
+	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) =&gt; boolean | Promise&lt;boolean&gt;;
+
+	prepareNextTurn?: (context: PrepareNextTurnContext) =&gt; AgentLoopTurnUpdate | undefined | Promise&lt;...&gt;;
+
+	// Contract: must not throw or reject. Return [] when no steering messages are available.
+	getSteeringMessages?: () =&gt; Promise&lt;AgentMessage[]&gt;;
+
+	// Contract: must not throw or reject. Return [] when no follow-up messages are available.
+	getFollowUpMessages?: () =&gt; Promise&lt;AgentMessage[]&gt;;
+
+	toolExecution?: ToolExecutionMode; // 默认 "parallel"
+	// ... beforeToolCall / afterToolCall / toolExecution 等
+}</pre>
+
+<p><code>convertToLlm</code>, <code>transformContext</code>, <code>getApiKey</code>, <code>shouldStopAfterTurn</code>, <code>getSteeringMessages</code>, <code>getFollowUpMessages</code> — each one says <strong>"must not throw or reject"</strong>. Combined with <code>StreamFn</code>'s never-throw contract from Chapter 2, every collaborator of the loop promises: failure is a return value, not an exception.</p>
+
+<p>That's why there is almost no <code>try/catch</code> inside the loop. It doesn't need to defensively wrap every callback, because the contract has ruled out the exception path. The complexity didn't vanish — it moved to the contract's <em>implementors</em> (<code>pi-ai</code> encodes failures into the stream; <code>convertToLlm</code> returns a safe fallback value). It's a trade of "contract discipline" for "loop simplicity," and Pi Agent considers it a good deal.</p>
+
+<p>The <code>AgentLoopConfig</code> callbacks are also the loop's entire seam with the outside world. Compaction? That's <code>transformContext</code>'s job. Stop policy? That's <code>shouldStopAfterTurn</code>'s job. Switching models between turns? That's <code>prepareNextTurn</code>'s job. The loop itself knows nothing about any of this — it just invokes these callbacks at fixed points. The compaction of Chapter 7 and the product orchestration of Chapter 9 are both implemented by plugging callbacks into these slots.</p>
+
+<hr class="sep">
+
+<h2 id="nested-loop">The Loop Body: Two Levels of Nesting</h2>
+
+<p>Now for the core. <code>runLoop</code> is the heartbeat of the whole system; here's its skeleton (some details omitted for clarity):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">async function runLoop(
+	initialContext: AgentContext,
+	newMessages: AgentMessage[],
+	initialConfig: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: StreamFn,
+): Promise&lt;void&gt; {
+	let currentContext = initialContext;
+	let config = initialConfig;
+	let firstTurn = true;
+	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	// 外层循环：当 agent 本应停止后又有 follow-up 消息到达时继续
+	while (true) {
+		let hasMoreToolCalls = true;
+
+		// 内层循环：处理工具调用与 steering 消息
+		while (hasMoreToolCalls || pendingMessages.length &gt; 0) {
+			if (!firstTurn) await emit({ type: "turn_start" });
+			else firstTurn = false;
+
+			// 1. 注入待处理消息（steering）
+			if (pendingMessages.length &gt; 0) {
+				for (const message of pendingMessages) {
+					await emit({ type: "message_start", message });
+					await emit({ type: "message_end", message });
+					currentContext.messages.push(message);
+					newMessages.push(message);
+				}
+				pendingMessages = [];
+			}
+
+			// 2. 流式获取助手响应
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			newMessages.push(message);
+
+			// 3. 错误/中止 → 立即终止
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			// 4. 执行工具调用
+			const toolCalls = message.content.filter((c) =&gt; c.type === "toolCall");
+			const toolResults: ToolResultMessage[] = [];
+			hasMoreToolCalls = false;
+			if (toolCalls.length &gt; 0) {
+				const executedToolBatch =
+					message.stopReason === "length"
+						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+						: await executeToolCalls(currentContext, message, config, signal, emit);
+				toolResults.push(...executedToolBatch.messages);
+				hasMoreToolCalls = !executedToolBatch.terminate;
+				for (const result of toolResults) {
+					currentContext.messages.push(result);
+					newMessages.push(result);
+				}
+			}
+
+			await emit({ type: "turn_end", message, toolResults });
+
+			// 5. 轮间准备：可替换 context / model / thinking
+			const nextTurnSnapshot = await config.prepareNextTurn?.({ message, toolResults, context: currentContext, newMessages });
+			if (nextTurnSnapshot) {
+				currentContext = nextTurnSnapshot.context ?? currentContext;
+				config = { ...config, model: nextTurnSnapshot.model ?? config.model, /* thinking... */ };
+			}
+
+			// 6. 停止检查
+			if (await config.shouldStopAfterTurn?.({ message, toolResults, context: currentContext, newMessages })) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			// 7. 轮询 steering 消息
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+		}
+
+		// 内层结束：agent 本应停止。检查 follow-up 消息。
+		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (followUpMessages.length &gt; 0) {
+			pendingMessages = followUpMessages;
+			continue; // 外层循环继续
+		}
+		break; // 真的结束了
+	}
+
+	await emit({ type: "agent_end", messages: newMessages });
+}</pre>
+
+<p>That's the whole loop. Let's dissect its structure.</p>
+
+<h3>Inner loop: tool calls and steering</h3>
+
+<p>The inner <code>while (hasMoreToolCalls || pendingMessages.length &gt; 0)</code> is the classic agent-loop shape: keep going as long as there are tool calls to handle. Each iteration:</p>
+
+<ol>
+<li>Emit <code>turn_start</code> (except on the first turn)</li>
+<li>Inject any pending steering messages</li>
+<li>Stream the assistant response</li>
+<li>If the response errors or aborts, terminate the whole agent</li>
+<li>Extract and execute tool calls, appending the results to the context</li>
+<li>Emit <code>turn_end</code></li>
+<li>Call <code>prepareNextTurn</code> (may swap model/context)</li>
+<li>Call <code>shouldStopAfterTurn</code> (may stop gracefully)</li>
+<li>Poll for new steering messages</li>
+</ol>
+
+<p>The update of <code>hasMoreToolCalls</code> is the key: it equals <code>!executedToolBatch.terminate</code>. In other words, as long as no tool call in the batch carries a "terminate" signal, the loop continues. The model doesn't need to explicitly say "I want to keep going" — as long as it issues tool calls, the loop continues by default; the moment it stops issuing tool calls, <code>hasMoreToolCalls</code> becomes <code>false</code> and the inner loop ends.</p>
+
+<h3>Outer loop: follow-up</h3>
+
+<p>The outer <code>while (true)</code> handles one special case: the agent has no more tool calls and no steering messages, so it <em>should have stopped</em> — yet follow-up messages may be waiting in the queue.</p>
+
+<p>The difference between steering and follow-up is timing: <strong>steering</strong> means "interjecting while the agent is still working" (polled at the end of every inner-loop turn), while <strong>follow-up</strong> means "saying the next thing once the agent has finished" (polled by the outer loop after the inner loop ends). This two-level structure lets the product layer implement both "the user typed a clarification while the agent was working" (steering) and "the user queued the next task" (follow-up). Chapter 9 will show how <code>AgentSession</code> drives these two callbacks with two queues.</p>
+
+<h3>Continuation and stopping: all the decision points</h3>
+
+<p>Lay out the loop's exit paths in a table and you'll find there are surprisingly few:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Decision point</th><th>Condition</th><th>Outcome</th></tr></thead>
+<tbody>
+<tr><td>Model failure</td><td><code>stopReason === "error" | "aborted"</code></td><td>Emit <code>agent_end</code>, return</td></tr>
+<tr><td>Tool termination</td><td>The tool batch returns <code>terminate: true</code></td><td><code>hasMoreToolCalls = false</code>, inner loop ends</td></tr>
+<tr><td>No tool calls</td><td>Assistant message has no <code>toolCall</code> block</td><td><code>hasMoreToolCalls = false</code>, inner loop ends</td></tr>
+<tr><td>Graceful stop</td><td><code>shouldStopAfterTurn()</code> returns true</td><td>Emit <code>agent_end</code>, return</td></tr>
+<tr><td>Follow-up arrives</td><td><code>getFollowUpMessages()</code> is non-empty</td><td>Outer loop continues</td></tr>
+<tr><td>Natural completion</td><td>No tools, no steering, no follow-up</td><td><code>break</code>, emit <code>agent_end</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>No "four layers of compaction," no "escalation ladder," no discriminated union of ten terminal states. The loop's termination reasons have been pushed outward: compaction failures and token limits are handled in <code>transformContext</code> or <code>pi-ai</code>, and ultimately arrive at decision point 3 as <code>stopReason: "error"</code>. This is the minimization philosophy made concrete inside the loop.</p>
+
+<hr class="sep">
+
+<h2 id="stream-assistant-response"><code>streamAssistantResponse</code>: the LLM boundary</h2>
+
+<p>The only place in the loop that talks to the model is <code>streamAssistantResponse</code>. Its comment hits the nail on the head:</p>
+
+<blockquote>
+<p>This is where AgentMessage[] gets transformed to Message[] for the LLM.</p>
+</blockquote>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">async function streamAssistantResponse(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: StreamFn,
+): Promise&lt;AssistantMessage&gt; {
+	// 1. 可选的上下文变换（AgentMessage[] → AgentMessage[]）
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	// 2. 转换成 LLM 消息（AgentMessage[] → Message[]）
+	const llmMessages = await config.convertToLlm(messages);
+
+	// 3. 构建 LLM 上下文
+	const llmContext: Context = {
+		systemPrompt: context.systemPrompt,
+		messages: llmMessages,
+		tools: context.tools,
+	};
+
+	// 4. 解析 API key（对会过期的 token 很重要）
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	// 5. 调用 StreamFn，迭代事件流
+	const response = await streamFunction(config.model, llmContext, { ...config, apiKey: resolvedApiKey, signal });
+
+	let partialMessage: AssistantMessage | null = null;
+	let addedPartial = false;
+	for await (const event of response) {
+		switch (event.type) {
+			case "start":
+				partialMessage = event.partial;
+				context.messages.push(partialMessage);
+				addedPartial = true;
+				await emit({ type: "message_start", message: { ...partialMessage } });
+				break;
+			case "text_delta": /* ...各类 delta... */
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({ type: "message_update", assistantMessageEvent: event, message: { ...partialMessage } });
+				}
+				break;
+			case "done":
+			case "error": {
+				const finalMessage = await response.result();
+				context.messages[context.messages.length - 1] = finalMessage;
+				await emit({ type: "message_end", message: finalMessage });
+				return finalMessage;
+			}
+		}
+	}
+	// ...
+}</pre>
+
+<p>A few designs here are worth noting.</p>
+
+<p><strong>Two message conversions, each with a clear responsibility.</strong> <code>transformContext</code> works at the <code>AgentMessage</code> level (trimming old messages, injecting external context), while <code>convertToLlm</code> translates <code>AgentMessage[]</code> into the provider's <code>Message[]</code> (filtering out UI-only custom messages). Chapter 7's compaction hangs off <code>transformContext</code>; Chapter 5's custom-message filtering hangs off <code>convertToLlm</code>. Two slots, two concerns.</p>
+
+<p><strong>In-place updates of the partial message.</strong> When streaming starts, the <code>start</code> event brings a <code>partial</code> message that gets pushed into <code>context.messages</code>; each subsequent delta event <strong>replaces the last element of the array</strong> with the new <code>partial</code> (<code>context.messages[context.messages.length - 1] = partialMessage</code>). So the context always holds exactly one "in-progress" assistant message rather than one per delta. On <code>done</code>/<code>error</code>, it is replaced by the final message from <code>response.result()</code>.</p>
+
+<p><strong><code>getApiKey</code> is resolved on every call.</strong> The comment explains why: short-lived OAuth tokens, like GitHub Copilot's, can expire during a long tool-execution phase. Re-resolving the key before every model call avoids requesting with stale credentials.</p>
+
+<p><strong><code>done</code> and <code>error</code> take the same path.</strong> Because <code>EventStream</code>'s <code>result()</code> also resolves on error (resolving to the <code>stopReason: "error"</code> message), there's no need to distinguish success from failure here — just take the final message, emit <code>message_end</code>, and return. Failure handling is deferred to step 3 of the loop body (checking <code>stopReason</code>).</p>
+
+<hr class="sep">
+
+<h2 id="truncation">Truncation Protection: When Output Is Cut Off by the Token Limit</h2>
+
+<p>One piece of defensive code in the loop sits behind a real trap. When an assistant response has <code>stopReason === "length"</code> (output cut off by the token limit), the tool calls it emitted may carry <strong>truncated arguments</strong>.</p>
+
+<p>The problem: streaming tool-call arguments are parsed incrementally by a "best-effort JSON salvager." A truncated tool call's arguments might happen to parse and validate, yet be silently incomplete — say, a file path cut off halfway. Executing such a tool call is dangerous.</p>
+
+<p>The loop's response is to fail every tool call in the batch outright:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">const executedToolBatch =
+	message.stopReason === "length"
+		? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+		: await executeToolCalls(currentContext, message, config, signal, emit);</pre>
+
+<p><code>failToolCallsFromTruncatedMessage</code> produces an error result for each tool call, telling the model:</p>
+
+<blockquote>
+<p>Tool call "X" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.</p>
+</blockquote>
+
+<p>The model will then re-issue complete tool calls. It's a safety choice of "rather fail than execute a suspect call" — and since the failure results are fed back into the context, the loop naturally continues, giving the model a chance to retry.</p>
+
+<hr class="sep">
+
+<h2 id="prepare-next-turn"><code>prepareNextTurn</code>: the between-turns makeover</h2>
+
+<p><code>prepareNextTurn</code> is an easily overlooked but powerful hook. Called after each <code>turn_end</code>, it can return a new <code>context</code>, <code>model</code>, or <code>thinkingLevel</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/agent-loop.ts">const nextTurnSnapshot = await config.prepareNextTurn?.({ message, toolResults, context: currentContext, newMessages });
+if (nextTurnSnapshot) {
+	currentContext = nextTurnSnapshot.context ?? currentContext;
+	config = {
+		...config,
+		model: nextTurnSnapshot.model ?? config.model,
+		reasoning: nextTurnSnapshot.thinkingLevel === undefined ? config.reasoning : /* ... */,
+	};
+}</pre>
+
+<p>Note that what it replaces are the loop's <strong>local variables</strong>, <code>currentContext</code> and <code>config</code> — the next turn uses the new values. This lets the product layer switch models mid-conversation (e.g., "use a stronger model for this task"), re-read the session tree to pick up changes made while it runs, or adjust the thinking level. Chapter 9 will show how <code>AgentSession</code> uses this hook to rebuild the context from the session tree between turns.</p>
+
+<hr class="sep">
+
+<h2 id="agent-event"><code>AgentEvent</code>: the language of the loop</h2>
+
+<p>The loop says nothing but <code>AgentEvent</code>. This discriminated union (<code>packages/agent/src/types.ts</code>) is the loop's only language for talking to the outside world:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export type AgentEvent =
+	// Agent 生命周期
+	| { type: "agent_start" }
+	| { type: "agent_end"; messages: AgentMessage[] }
+	// 轮次生命周期 - 一个轮次 = 一次助手响应 + 其工具调用/结果
+	| { type: "turn_start" }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	// 消息生命周期 - user、assistant、toolResult 都会发
+	| { type: "message_start"; message: AgentMessage }
+	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+	| { type: "message_end"; message: AgentMessage }
+	// 工具执行生命周期
+	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };</pre>
+
+<p>Ten events cover the lifecycles of four layers: agent, turn, message, and tool. <code>message_update</code> fires only while an assistant message is streaming, carrying the raw <code>AssistantMessageEvent</code> (from <code>pi-ai</code>) so consumers can render incrementally.</p>
+
+<p>The core <code>Agent</code> class (<code>packages/agent/src/agent.ts</code>) plays the role of a <strong>reducer</strong> over this event stream. Its <code>processEvents(event)</code> method updates its mutable state according to event type — <code>message_end</code> appends a message to <code>messages</code>, <code>tool_execution_start/end</code> add or remove entries in the <code>pendingToolCalls</code> set — and then dispatches the events to all subscribers. Chapter 5 will detail <code>Agent</code>'s state management.</p>
+
+<p>This "the loop emits events, upper layers reduce" architecture lets a single loop serve completely different consumers: the TUI renders events into pixels, print mode writes them out as text or JSON, and RPC mode serializes them across a pipe. They all subscribe to the same <code>AgentEvent</code> stream, differing only in how they reduce it. Chapter 11 will show how the three operating modes consume this stream.</p>
+
+<hr class="sep">
+
+<h2 id="walkthrough">A Worked Example: "Fix the Bug in auth.ts"</h2>
+
+<p>Let's make the loop concrete. We'll trace three turns of a real interaction.</p>
+
+<p><strong>User input:</strong> <code>Fix the null pointer bug in src/auth/validate.ts</code></p>
+
+<p><strong>Turn 1: the model reads the file.</strong> <code>runAgentLoop</code> emits <code>agent_start</code> and <code>turn_start</code>, then emits <code>message_start</code>/<code>message_end</code> for the user message. First pass through the inner loop: <code>streamAssistantResponse</code> calls the model, which streams back "let me take a look at this file" plus one <code>toolCall</code>: <code>read({ path: "src/auth/validate.ts" })</code>. <code>stopReason</code> is <code>toolUse</code>, not error, so we continue. One tool call is extracted, and <code>executeToolCalls</code> runs it (read is concurrency-safe; Chapter 4 goes into detail), with the file content appended to the context as a <code>toolResult</code>. <code>hasMoreToolCalls = true</code> (no terminate). <code>turn_end</code>. <code>shouldStopAfterTurn</code> returns false. Poll steering — none. The inner loop continues.</p>
+
+<p><strong>Turn 2: the model edits the file.</strong> <code>turn_start</code>. The model streams back "there's a bug at line 42 — <code>userId</code> could be null" plus one <code>toolCall</code>: <code>edit({ path: ..., old_string: ..., new_string: ... })</code>. edit isn't concurrency-safe, but this batch has only one tool, so it runs serially. The edit applies cleanly; the <code>toolResult</code> is appended. <code>turn_end</code>. Continue.</p>
+
+<p><strong>Turn 3: the model declares done.</strong> <code>turn_start</code>. The model streams back "I added a guard clause that fixes the null pointer bug." No <code>toolCall</code> block. <code>toolCalls.length === 0</code>, so <code>hasMoreToolCalls</code> stays <code>false</code>. <code>turn_end</code>. <code>shouldStopAfterTurn</code> returns false. Poll steering — none. The inner-loop condition <code>hasMoreToolCalls || pendingMessages.length &gt; 0</code> is false, so we exit the inner loop. The outer loop polls for follow-up — none. <code>break</code>. Emit <code>agent_end</code>.</p>
+
+<p>In total: three model calls, two tool executions, zero permission prompts (Pi Agent has no per-tool approval; see Chapter 1). The entire flow completes within the same two-level <code>while</code> structure, with not a single special-case branch.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's loop offers four transferable patterns for "how to design an agent's main loop."</p>
+
+<p><strong>Trade contract discipline for loop simplicity.</strong> Make every collaborator of the loop — model calls, message conversion, stop decisions, message queues — promise "never throw; failure is a return value." The problem it solves: <code>try/catch</code> scattered throughout the loop, error handling entangled with the normal flow. Once the exception path is excluded by contract, the loop degenerates into a plain sequence of steps. The cost is that you must implement these contracts seriously — but the complexity is pushed to the boundaries instead of pervading the core.</p>
+
+<p><strong>Separate loop logic from the observable wrapper.</strong> The core loop knows only one <code>emit</code> callback; the <code>EventStream</code> wrapper is a paper-thin bridge. The problem it solves: a loop locked into a single consumption style. When <code>runLoop</code> depends on no streaming abstraction, any orchestrator can drive it however it likes — an in-memory Agent, a persistent Harness, a product session — all reusing the same loop.</p>
+
+<p><strong>Use nested loops to express events with different timing.</strong> The inner loop handles "interjections during work" (steering); the outer loop handles "continuations after work" (follow-up). The problem it solves: conflating the two timings, so either interjections get ignored or continuations fire too early. With two loops, two queues, and two callback slots, the timing semantics become clear.</p>
+
+<p><strong>Be skeptical of results that look successful but are actually suspect.</strong> A truncated tool call's arguments may parse yet be incomplete — better to fail them and let the model re-issue than to execute a suspect call. The problem it solves: the "best-effort" nature of incremental streaming parsing quietly produces half-baked data. In agent systems, "it parses" does not equal "it's safe," and paranoia about edge cases is worth it.</p>
+
+<p>If you were starting from scratch, the minimal loop skeleton would be:</p>
+
+<pre class="code" data-lang="text">async function runLoop(context, config, emit, streamFn) {
+  while (true) {
+    let hasMore = true;
+    while (hasMore || pending.length) {
+      inject(pending); pending = [];
+      const msg = await streamAssistantResponse(context, config, streamFn);
+      if (msg.stopReason === "error" || msg.stopReason === "aborted") return end();
+      const calls = toolCalls(msg);
+      hasMore = calls.length ? !execute(calls).terminate : false;
+      if (await config.shouldStopAfterTurn?.()) return end();
+      pending = await config.getSteeringMessages?.() || [];
+    }
+    const followUp = await config.getFollowUpMessages?.() || [];
+    if (followUp.length) { pending = followUp; continue; }
+    break;
+  }
+  return end();
+}</pre>
+
+<p>Every detail in Pi Agent's loop is a refinement of this skeleton: <code>streamAssistantResponse</code> refines the model call, <code>failToolCallsFromTruncatedMessage</code> refines tool execution, and <code>prepareNextTurn</code> refines the between-turn transition. Start from the skeleton, and add a refinement only when you actually encounter the problem it solves.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's core loop is a two-level nested <code>while</code>: the inner level handles tool calls and steering, the outer level handles follow-up. It emits ten kinds of <code>AgentEvent</code> through the <code>emit</code> callback, meets the model world through <code>StreamFn</code>, and pushes compaction, stopping, resumption, and between-turn transitions entirely outward through a set of never-throw callback slots (<code>transformContext</code>, <code>convertToLlm</code>, <code>shouldStopAfterTurn</code>, <code>prepareNextTurn</code>, <code>getSteeringMessages</code>, <code>getFollowUpMessages</code>).</p>
+
+<p>It is clean not because agents are simple, but because the complexity has been deliberately pushed outside the loop. Understand that, and you grasp Pi Agent's most fundamental disagreement with the all-in-one route: it's not about who does more, but about where each one places its complexity.</p>
+
+<p>In the next chapter, we zoom in on the <code>executeToolCalls</code> that the loop glossed over — how tools are defined, validated, and executed, and how concurrency happens safely.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+</body>
+</html>

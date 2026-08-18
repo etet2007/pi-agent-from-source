@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 13 · Input, Keybindings, and the Editor | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch13">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part V · Terminal UI</p>
+  <h1>Chapter 13: Input, Keybindings, and the Editor</h1>
+  <p class="chapter-sub">The complete journey of a keystroke from process.stdin to the focused component: raw mode, protocol negotiation, sequence reassembly, key parsing and keybinding, and that 2,352-line Emacs-style editor</p>
+</header>
+
+<h2 id="hook">The Underestimated Problem</h2>
+
+<p>If rendering is "writing strings to the terminal," then input is "reading strings from the terminal." Both sound easy, but anyone who has written a terminal application knows that input is a swamp.</p>
+
+<p>Terminal keyboard input carries a heavy burden of legacy. When a keystroke reaches your program, it may be a single byte (<code>a</code>), a legacy escape sequence (the arrow key <code>\x1b[A</code>), a modifyOtherKeys sequence (<code>Ctrl+Shift+p</code>), or a Kitty protocol sequence (with modifiers, press/release, and base layout keys). Is <code>Ctrl+C</code> <code>\x03</code> or <code>\x1b[99;5u</code>? Is <code>Shift+Tab</code> <code>\x1b[Z</code> or something else? How do you tell pasted multi-line text apart from keyboard input arriving byte by byte? The Windows console is yet another set of rules.</p>
+
+<p><code>pi-tui</code>'s input stack exists to tame this swamp. This chapter follows a keystroke on its complete journey from <code>process.stdin</code> to the focused component's <code>handleInput</code>, and shows how Pi Agent makes sound engineering decisions at each layer: protocol negotiation, sequence reassembly, key parsing, and keybinding. Finally we look at the 2,352-line <code>Editor</code>, an Emacs-style multi-line editor and the input stack's heaviest consumer.</p>
+
+<hr class="sep">
+
+<h2 id="journey">The Journey of Input</h2>
+
+<p>The full pipeline for a single keystroke:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="input-pipeline" data-w="900" data-h="420"></canvas></div>
+  <figcaption>Figure 1: The seven-stage pipeline of a keystroke. Starting from process.stdin in raw mode, through sequence reassembly and terminal protocol handling, the input is finally consumed by the focused component, which requests a re-render.</figcaption>
+</figure>
+
+<p>Each stage solves one problem: <code>StdinBuffer</code> handles "how to split the byte stream into complete sequences," <code>ProcessTerminal</code> handles "how terminal protocols are negotiated," <code>keys.ts</code> handles "how sequences map to semantic keys," and <code>keybindings.ts</code> handles "how semantic keys bind to actions." Let's work from the bottom up.</p>
+
+<hr class="sep">
+
+<h2 id="terminal">Terminal Setup: Raw Mode and Protocol Negotiation</h2>
+
+<p><code>ProcessTerminal.start</code> (<code>packages/tui/src/terminal.ts</code>) is where input begins. It does several things:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/terminal.ts">// 1. 进入 raw mode：按键逐字节到达，不等回车、不回显
+process.stdin.setRawMode(true);
+process.stdin.setEncoding("utf8");
+process.stdin.resume();
+
+// 2. 启用 bracketed paste：粘贴内容被特殊序列包裹
+process.stdout.write("\x1b[?2004h");
+
+// 3. Windows：加载原生 addon 启用 VT 输入
+this.enableWindowsVTInput();
+
+// 4. 协商键盘协议
+this.queryAndEnableKittyProtocol();</pre>
+
+<p><strong>Raw mode</strong> is the prerequisite: by default the terminal is in "line mode": input is buffered until Enter and echoed automatically. Raw mode turns both off, letting every keystroke arrive immediately and untouched. It is the foundation of any interactive TUI.</p>
+
+<p><strong>Bracketed paste</strong> (<code>\x1b[?2004h</code>) makes the terminal wrap pasted content in <code>\x1b[200~</code> ... <code>\x1b[201~</code>. This lets the program distinguish "the user pasted a block of code" from "the user typed a burst of keys"; the former is handled as a whole (even collapsed into a paste marker), the latter key by key. Without it, pasted multi-line text would be mistaken for a series of commands.</p>
+
+<h3 id="kitty">Negotiating the Kitty Keyboard Protocol</h3>
+
+<p>The most ingenious part is keyboard protocol negotiation. The legacy terminal keyboard protocol is riddled with ambiguities: <code>Ctrl+Shift+p</code> and <code>Ctrl+p</code> may emit the same sequence; key releases have no events; many combinations cannot be expressed at all. The <a href="https://sw.kovidgoyal.net/kitty/keyboard-protocol/">Kitty keyboard protocol</a> is a modern solution: it reports every key, modifier, and press/release unambiguously. But not every terminal supports it.</p>
+
+<p><code>pi-tui</code>'s negotiation strategy (<code>packages/tui/src/terminal.ts:220</code>) is clever:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/terminal.ts">const KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1b[&gt;${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1b[?u\x1b[c`;</pre>
+
+<p>This single line writes three sequences:</p>
+
+<ol>
+<li><code>\x1b[&gt;Nu</code>: requests enabling the Kitty protocol, with flags <code>N = 1|2|4</code> (disambiguation + event types + alternate keys)</li>
+<li><code>\x1b[?u</code>: queries the current Kitty protocol state</li>
+<li><code>\x1b[c</code>: requests Device Attributes (DA), a <strong>sentinel</strong></li>
+</ol>
+
+<p>Then it watches how the terminal responds:</p>
+
+<ul>
+<li>If the terminal supports Kitty, it reports back non-zero Kitty flags → activate the Kitty protocol</li>
+<li>If the terminal doesn't support Kitty but does support DA, it replies with a DA response (not Kitty flags) → the sentinel fires, <strong>falling back to xterm's modifyOtherKeys</strong> (<code>\x1b[&gt;4;2m</code>)</li>
+</ul>
+
+<p>The "DA sentinel" design solves a classic problem: how do you know a terminal doesn't support Kitty? Unsupported terminals <strong>don't respond</strong> to the Kitty query; if you wait naively, you hang. But if you immediately follow with a DA query, terminals that support Kitty reply with DA and so do terminals that don't, so receiving a DA tells you "Kitty is out; use modifyOtherKeys." <strong>No timeout needed</strong>: the sentinel sequence turns "no response" into "a different kind of response." It is a neat trick that converts asynchronous probing into a deterministic branch.</p>
+
+<h3 id="windows">Special Handling for Windows</h3>
+
+<p>The Windows console does not emit standard VT sequences by default. <code>enableWindowsVTInput</code> (<code>:338</code>) loads a precompiled native addon (<code>native/win32/.../win32-console-mode.node</code>), sets the <code>ENABLE_VIRTUAL_TERMINAL_INPUT</code> flag, and makes <code>Shift+Tab</code> arrive correctly as <code>\x1b[Z</code>. This is a microcosm of <code>pi-tui</code>'s extensive terminal-specific engineering: there is also a native addon for macOS under <code>native/darwin/</code>.</p>
+
+<hr class="sep">
+
+<h2 id="stdin-buffer">StdinBuffer: Reassembling Fragmented Sequences</h2>
+
+<p>Bytes arrive fragmented. A <code>\x1b[A</code> (arrow key) may arrive in three pieces: <code>\x1b</code>, <code>[</code>, <code>A</code>. Processing byte by byte would mistake one escape sequence for three independent inputs. <code>StdinBuffer</code> (<code>packages/tui/src/stdin-buffer.ts</code>) handles the reassembly:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/stdin-buffer.ts">export class StdinBuffer extends EventEmitter&lt;StdinBufferEventMap&gt; {
+	public process(data: string | Buffer): void {
+		// 累积字节，分离 bracketed paste，提取完整序列
+	}
+}
+
+function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
+	// 用 isCompleteSequence 判断每个候选序列是否完整
+}
+
+function isCompleteSequence(data: string): "complete" | "incomplete" | "not-escape" {
+	// 处理 CSI/OSC/DCS/APC/SS3 框架，SGR 鼠标 &lt;B;X;Y[Mm]
+}</pre>
+
+<p><code>process</code> accumulates incoming bytes into a buffer, and <code>extractCompleteSequences</code> uses <code>isCompleteSequence</code> to decide whether each sequence is complete. <code>isCompleteSequence</code> understands the framing of every kind of escape sequence: CSI (<code>\x1b[...</code>), OSC (<code>\x1b]...</code>), DCS, APC, SS3, and SGR mouse sequences (<code>\x1b[&lt;B;X;YM</code>). Complete sequences are cut out, while the incomplete tail stays in the buffer waiting for the next batch of bytes.</p>
+
+<p>What about the incomplete tail? <code>StdinBuffer</code> sets a 10ms timeout: if no further bytes arrive within 10ms, it flushes the tail as ordinary characters. This handles the case where "the user really pressed ESC" (ESC itself is <code>\x1b</code>, which is also the start of an escape sequence; if nothing follows within 10ms, it was a lone ESC).</p>
+
+<p><code>StdinBuffer</code> also handles bracketed paste specially: it recognizes the <code>\x1b[200~</code> ... <code>\x1b[201~</code> boundaries and emits the pasted content as a single <code>paste</code> event instead of splitting it into a stream of <code>data</code> events. It even handles terminal quirks, such as WezTerm splitting ESC from Kitty release sequences, and de-duplicating repeated Kitty printable characters.</p>
+
+<p><code>StdinBuffer</code> emits two kinds of events: <code>data</code> (a single complete sequence) and <code>paste</code> (a pasted body). This layer turns the "raw byte stream" into "structured input events."</p>
+
+<hr class="sep">
+
+<h2 id="keys">Key Parsing: keys.ts</h2>
+
+<p>Complete sequences reach <code>keys.ts</code> (<code>packages/tui/src/keys.ts</code>), where they are mapped to a <strong>semantic key</strong>. One design choice here deserves praise: key ids are <strong>type-safe</strong>.</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/keys.ts">type ModifiedKeyId&lt;Key extends string, RemainingModifiers extends ModifierName = ModifierName&gt; = {
+	[M in RemainingModifiers]: `${M}+${Key}` | `${M}+${ModifiedKeyId&lt;Key, Exclude&lt;RemainingModifiers, M&gt;&gt;}`;
+}[RemainingModifiers];
+
+export type KeyId = BaseKey | ModifiedKeyId&lt;BaseKey&gt;;</pre>
+
+<p><code>KeyId</code> is a template literal type: strings like <code>"ctrl+c"</code>, <code>"ctrl+shift+p"</code>, and <code>"escape"</code> are themselves types. A <code>Key</code> helper object (<code>:163</code>) builds them with factory methods: <code>Key.ctrl("c")</code>, <code>Key.ctrlShift("p")</code>, <code>Key.escape</code>. So when binding keybindings, a misspelled key name fails at <strong>compile time</strong> instead of silently breaking at runtime.</p>
+
+<p>The core API is two functions:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/keys.ts">export function matchesKey(data: string, keyId: KeyId): boolean; // :820
+export function parseKey(data: string): string | undefined;      // :1251</pre>
+
+<p><code>matchesKey</code> decides whether a raw sequence matches a semantic key. Internally it must dispatch across several protocols:</p>
+
+<ul>
+<li><strong>Kitty CSI-u</strong>: the <code>\x1b[99;5u</code> form, with modifiers, shift/base layout keys, arrow keys, function keys, and event types</li>
+<li><strong>modifyOtherKeys</strong>: the <code>\x1b[27;mod;keycode~</code> form</li>
+<li><strong>Legacy sequence tables</strong>: <code>LEGACY_KEY_SEQUENCES</code>, <code>LEGACY_SHIFT_SEQUENCES</code>, <code>LEGACY_CTRL_SEQUENCES</code></li>
+<li><strong>Raw control characters</strong>: <code>code &amp; 0x1f</code> (<code>Ctrl+a</code> = the codepoint of <code>a</code> &amp; 0x1f = <code>\x01</code>)</li>
+</ul>
+
+<p>The complexity of this dispatch is a direct map of the terminal keyboard's historical baggage: the same <code>Ctrl+C</code> can be four different byte sequences depending on the terminal and protocol. <code>matchesKey</code> has to recognize them all.</p>
+
+<p>There is also careful handling of non-Latin layouts: the Kitty protocol reports both the "base layout key" and the "shifted key," and <code>pi-tui</code> only falls back to the base layout key when the codepoint is not a recognizable Latin letter or symbol, avoiding misreads on French and German keyboards. And there is handling of the Windows Terminal backspace ambiguity. These are scars left by real-world terminal fragmentation.</p>
+
+<p>The event-type helpers <code>isKeyRelease(data)</code>/<code>isKeyRepeat(data)</code> scan for the <code>:3u</code>/<code>:2u</code> markers in a sequence: the Kitty protocol can distinguish press, repeat, and release. By default, release events are filtered out (unless a component sets <code>wantsKeyRelease</code>), because most components only care about presses.</p>
+
+<hr class="sep">
+
+<h2 id="keybindings">Keybindings: Semantic Actions, Configurable</h2>
+
+<p>Parsed semantic keys are bound to <strong>actions</strong> through <code>keybindings.ts</code> (<code>packages/tui/src/keybindings.ts</code>). The design here is "action id + default key + user override":</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/keybindings.ts">// 语义动作 id（可通过声明合并扩展）
+export interface Keybindings {
+	"tui.editor.cursorWordLeft": ...;
+	"tui.input.submit": ...;
+	"tui.altScreen.pageUp": ...;
+	// ...
+}
+
+// 默认绑定
+export const TUI_KEYBINDINGS = {
+	"tui.editor.deleteToLineEnd": { defaultKeys: "ctrl+k" },
+	// ...
+};
+
+export class KeybindingsManager {
+	// 解析用户覆盖、检测冲突、matches(data, keybinding)
+}</pre>
+
+<p>Each action has a semantic id (<code>tui.editor.deleteToLineEnd</code>) and a default key (<code>ctrl+k</code>). <code>KeybindingsManager</code> parses user overrides, detects conflicts, and provides <code>matches(data, keybinding)</code>. A global singleton is accessed via <code>getKeybindings()</code>/<code>setKeybindings()</code>.</p>
+
+<p>This design echoes a rule of the Pi Agent project. <code>AGENTS.md</code> states it explicitly:</p>
+
+<blockquote>
+<p>Never hardcode key checks (e.g. <code>matchesKey(keyData, "ctrl+x")</code>). Add defaults to <code>DEFAULT_EDITOR_KEYBINDINGS</code> or <code>DEFAULT_APP_KEYBINDINGS</code> so they stay configurable.</p>
+</blockquote>
+
+<p>In other words, the code must never hardcode "if Ctrl+X, do something"; it must register a semantic action through the keybinding system instead. This guarantees that <strong>all keybindings are configurable</strong>: users can rebind any action to any key. Separating "which key" from "which action" is the foundation of accessibility and personalization.</p>
+
+<hr class="sep">
+
+<h2 id="focus">Focus and Overlays</h2>
+
+<p>When input reaches <code>TuiBase.handleTerminalInput</code>, it first passes through the registered input listeners (each can <code>consume</code> the input or rewrite <code>data</code>), handles the global debug key (<code>shift+ctrl+d</code>), filters key-release events, then routes to the focused component's <code>handleInput</code>, and finally calls <code>requestRender()</code>.</p>
+
+<p><code>setFocus(component)</code> switches focus: it sets the <code>focused</code> flag on a <code>Focusable</code> component (which is why the component emits <code>CURSOR_MARKER</code> in <code>render</code>, Chapter 12).</p>
+
+<p>There is also an overlay focus stack (<code>overlayStack</code>) that manages modal focus: when a picker pops up (say, model selection or trust confirmation), focus is captured by the overlay; when it closes, focus returns to the previous component. This state machine handles <code>preFocus</code> restoration, <code>nonCapturing</code> overlays, and the "blocked/eligible" focus restoration strategy. The pickers popped up by <code>/model</code> and <code>/trust</code> in interactive mode (Chapter 11) all rely on this overlay system for focus management.</p>
+
+<hr class="sep">
+
+<h2 id="editor">Editor: A 2,352-Line Emacs-Style Editor</h2>
+
+<p>The input stack's heaviest consumer is the <code>Editor</code> (<code>packages/tui/src/components/editor.ts</code>, roughly 2,352 lines), the multi-line editor where users type prompts in interactive mode. It implements <code>Component</code> and <code>Focusable</code> and provides:</p>
+
+<ul>
+<li><strong>Multi-line editing with word wrap</strong> (<code>wordWrapLine</code>) and vertical scrolling</li>
+<li><strong>Autocomplete</strong> (<code>autocomplete.ts</code>): slash-command completion and file-path completion (<code>CombinedAutocompleteProvider</code>)</li>
+<li><strong>Kill ring</strong> (<code>kill-ring.ts</code>): an Emacs-style cut/paste ring: <code>Ctrl+K</code> kills to end of line into the ring, <code>Ctrl+Y</code> yanks it back, and repeated yanks cycle through history</li>
+<li><strong>Undo stack</strong> (<code>undo-stack.ts</code>): edit snapshots</li>
+<li><strong>Word navigation</strong> (<code>word-navigation.ts</code>): <code>Ctrl+Left/Right</code> jumps by word</li>
+<li><strong>Paste markers</strong>: large pastes are collapsed into a single marker instead of flooding the editor</li>
+<li><strong>History</strong>: the up/down arrow keys browse past inputs</li>
+</ul>
+
+<p><code>Editor</code> is not standalone; it is supported by several dedicated modules: <code>kill-ring.ts</code>, <code>undo-stack.ts</code>, <code>word-navigation.ts</code>, <code>autocomplete.ts</code>, and <code>fuzzy.ts</code> (fuzzy matching). This "heavy component + dedicated submodules" organization keeps a 2,352-line component maintainable: every editing feature has its own module.</p>
+
+<p><code>Editor</code> is also an implementation of the <code>EditorComponent</code> interface (<code>packages/tui/src/editor-component.ts</code>), the contract for "custom editors," which lets the product layer replace or extend editor behavior.</p>
+
+<p>Why does a coding agent need such a heavy editor? Because users write multi-line prompts, paste code snippets, and edit with keybindings inside it; the input experience directly determines how usable the product is. <code>Editor</code>'s Emacs-style keybindings (kill ring, word navigation, undo) let terminal-savvy users edit efficiently without a mouse. This is the investment a "product for humans" makes at the input layer.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>pi-tui</code>'s input stack offers four transferable patterns for "how to handle terminal input," each one born from real fights with terminal fragmentation.</p>
+
+<p><strong>Use a sentinel sequence to turn "no response" into "a different response."</strong> The Kitty protocol query is immediately followed by a DA query as the sentinel: receiving a DA tells you Kitty is unsupported, with no timeout wait. The problem it solves: when probing an optional capability, "not supported" manifests as "no response," which either hangs you or forces a fragile timeout. When a sentinel sequence converts silence into a definite signal, asynchronous probing becomes a deterministic branch.</p>
+
+<p><strong>Reassemble first, parse second.</strong> <code>StdinBuffer</code> reassembles the fragmented byte stream into complete sequences and separates pastes before handing them to key parsing. The problem it solves: escape sequences arrive in multiple batches, and byte-by-byte processing misjudges them. Once input is cut at the right granularity, "complete sequences," the layers above can parse correctly. Framing and parsing are two layers; don't mix them together.</p>
+
+<p><strong>Make key ids type-safe, and keybindings semantic and configurable.</strong> Key ids are template literal types (a typo fails to compile), actions have a semantic id + default key + user override, and hardcoded key checks are banned. The problems it solves: misspelled key names only surface at runtime, and keybindings cannot be reconfigured. When keys are types, actions are semantic, and bindings are overridable, both correctness and accessibility are guaranteed.</p>
+
+<p><strong>Split heavy components into dedicated submodules.</strong> The 2,352-line <code>Editor</code> is supported by independent modules: the kill ring, undo stack, word navigation, and autocomplete. The problem it solves: a single large component that kneads every feature together becomes impossible to test and maintain. When each editing feature is its own module, even a heavy component stays maintainable.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>pi-tui</code>'s input stack is four layers from the bottom up: <code>ProcessTerminal</code> enters raw mode, enables bracketed paste, negotiates the Kitty keyboard protocol with a "DA sentinel" (falling back to modifyOtherKeys), and loads a native addon on Windows; <code>StdinBuffer</code> reassembles the fragmented byte stream into complete sequences and separates pastes; <code>keys.ts</code> maps sequences to semantic keys with the type-safe <code>KeyId</code> and <code>matchesKey</code>, dispatching across four protocols: Kitty, modifyOtherKeys, legacy, and raw control characters; <code>keybindings.ts</code> wires keys to actions through semantic action ids and configurable bindings. The focus system routes input to the focused component, and the overlay stack manages modal focus. The heaviest consumer is the 2,352-line Emacs-style <code>Editor</code>, supported by dedicated modules for the kill ring, undo stack, word navigation, and autocomplete.</p>
+
+<p>Like the rendering layer, it embodies a "close to the metal" engineering taste: rather than depending on a high-level framework, it faces terminal protocol fragmentation head-on and handles each layer correctly. Each of the seemingly excessive details (the DA sentinel, the 10ms timeout, the non-Latin layout fallback, the Windows VT addon) is the fix for a real bug in some real terminal.</p>
+
+<p>In the next part, we leave the TUI and see how Pi Agent reaches outward: how the extension system gives the minimal core unlimited capability, and how remote control lets the agent run inside a daemon.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("input-pipeline", function (d) {
+  d.box({ id: "A", x: 30, y: 56, w: 172, h: 88, title: "process.stdin", lines: ["(raw mode)"], tone: "accent", titleSize: 13 });
+  d.box({ id: "B", x: 238, y: 56, w: 172, h: 88, title: "StdinBuffer", lines: ["Reassemble sequences", "Separate pastes"], tone: "teal", titleSize: 13 });
+  d.box({ id: "C", x: 446, y: 56, w: 172, h: 88, title: "ProcessTerminal", lines: ["Input handler"], tone: "teal", titleSize: 13 });
+  d.box({ id: "D", x: 654, y: 56, w: 172, h: 88, title: "TuiBase", lines: ["handleTerminalInput"], tone: "gold", titleSize: 13 });
+  d.box({ id: "E", x: 30, y: 280, w: 172, h: 88, title: "Input listeners", lines: ["(may consume/rewrite)"], tone: "violet", titleSize: 13 });
+  d.box({ id: "F", x: 238, y: 280, w: 172, h: 88, title: "Focused component", lines: ["handleInput(data)"], tone: "violet", titleSize: 13 });
+  d.box({ id: "G", x: 446, y: 280, w: 172, h: 88, title: "requestRender()", tone: "slate", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "right", to: "left" });
+  d.arrow("B", "C", { from: "right", to: "left" });
+  d.arrow("C", "D", { from: "right", to: "left" });
+  d.path([[740, 144], [740, 212], [116, 212], [116, 280]]);
+  d.arrow("E", "F", { from: "right", to: "left" });
+  d.arrow("F", "G", { from: "right", to: "left" });
+
+  d.text("Seven-stage pipeline: each stage solves one problem; the focused component is the final consumer", 450, 398, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

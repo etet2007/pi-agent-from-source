@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 1 · Architecture Overview: The Design Philosophy of a Minimal Agent | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch01">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part I · Foundations</p>
+  <h1>Chapter 1: Architecture Overview — The Design Philosophy of a Minimal Agent</h1>
+  <p class="chapter-sub">Nine packages with strictly one-way dependencies, a pure two-layer loop, and an organizing philosophy that keeps complexity out of the core</p>
+</header>
+
+<h2 id="hook">What You Are Up Against</h2>
+
+<p>A traditional CLI is a function: it takes arguments, performs a task, and exits. <code>grep</code> will never take it upon itself to run <code>sed</code>. The contract is simple and deterministic — one command, one action.</p>
+
+<p>An agentic CLI breaks that contract. It takes a natural-language prompt, decides on its own which tools to call, executes them in whatever order it chooses, evaluates the results, and keeps looping until the task is done or the user stops it. A "program" is no longer a fixed set of instructions but a loop around a language model — the model dynamically generates its own instruction sequence at runtime. Tool calls are the side effects; the model's reasoning is the control flow.</p>
+
+<p>The industry has two typical answers to this inherent complexity.</p>
+
+<p>One is the <strong>monolith route</strong>: build in every capability that might ever be needed. A permission system, dozens of tools, context compaction, lifecycle hooks, a homegrown renderer — all packed into one enormous monolith. Claude Code is the representative of this route — nearly two thousand files, and behind every <code>if</code> branch stands a real failure that once happened. This complexity is "submarine-like": you cannot remove any single compartment, because seawater once leaked in through that exact spot.</p>
+
+<p>Pi Agent offers another answer. Its <code>CONTRIBUTING.md</code> opens with a declaration:</p>
+
+<blockquote>
+<p><strong>pi's core is minimal.</strong> If your feature does not belong in the core, it should be an extension.</p>
+<p>Pi's core exists to be minimal and to be extensible so that it can be influenced and manipulated by extensions.</p>
+</blockquote>
+
+<p>This is not polite boilerplate in the docs; it is an organizing principle that runs through the entire codebase. The task of this chapter is to show you how that principle shapes every layer of the system — from the package boundaries, to the shape of the loop, to the security model, to the extension mechanism.</p>
+
+<hr class="sep">
+
+<h2 id="conservation">The Law of Conservation of Complexity</h2>
+
+<p>Before we go into details, let's establish a core observation that runs through the whole book.</p>
+
+<p>The complexity a production-grade agent must handle is <strong>conserved</strong>: multi-provider adapters, streaming parsers, tool execution, concurrency safety, context bloat, persistence, error recovery, terminal rendering, extensibility — these hard problems do not vanish just because you don't write them. The monolith route absorbs all of them into the core; the minimalist route tries to <strong>push them to the edge</strong> — into extensions, into containers, into an optional daemon, into the caller's responsibility.</p>
+
+<p>Pi Agent's key "push-outs":</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Complexity</th><th>What the monolith route does</th><th>Where Pi Agent pushes it out</th></tr></thead>
+<tbody>
+<tr><td>Permissions &amp; security</td><td>Seven built-in permission modes + per-tool approval dialogs</td><td><strong>Containers/sandboxes</strong> + a one-time "project trust" decision</td></tr>
+<tr><td>Tool ecosystem</td><td>40+ built-in tools</td><td>7 built-in tools + <strong>extensions register custom tools</strong></td></tr>
+<tr><td>Lifecycle hooks</td><td>27 runtime hook events</td><td>Strongly typed <code>ExtensionAPI</code> (33 events)</td></tr>
+<tr><td>External tool protocols</td><td>Built-in MCP (8 transports)</td><td><strong>Not provided</strong>; extensions integrate it themselves</td></tr>
+<tr><td>Remote control</td><td>Built-in bridge / cloud execution</td><td>Standalone optional packages <code>pi-server</code> / <code>pi-protocol</code></td></tr>
+<tr><td>Session storage backend</td><td>Built-in</td><td>Abstract interface + pluggable backends (JSONL / SQLite)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Each push-out makes the core a little smaller while handing the choice of "whether to take on this complexity" to the user. Once you understand this, you can explain almost every seemingly "missing" feature of Pi Agent — they weren't skipped; they were deliberately placed outside the core.</p>
+
+<hr class="sep">
+
+<h2 id="packages">Nine Packages: The Dependency Stack Is the Architecture</h2>
+
+<p>Pi Agent is not a file tree; it is a monorepo. Its architecture shows up first in the <strong>package boundaries</strong>. Understanding the responsibility and dependency direction of each of the nine packages is understanding half the system.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="packages" data-w="900" data-h="620"></canvas></div>
+  <figcaption>Figure 1: Dependencies among the nine packages. Dependencies are strictly one-way — model layer → runtime layer → product layer — with persistence &amp; connectivity and quality as independent side branches.</figcaption>
+</figure>
+
+<p>This diagram has several features worth noting.</p>
+
+<p><strong>Dependencies are strictly one-way.</strong> <code>pi-ai</code> depends on no sibling package; <code>pi-agent-core</code> depends only on <code>pi-ai</code>; <code>pi-coding-agent</code> depends on <code>pi-agent-core</code>, <code>pi-ai</code>, and <code>pi-tui</code>. There are no circular dependencies. This means every layer can be lifted out and reused on its own — you could write an LLM application with no agent in it using <code>pi-ai</code>, or a terminal tool with no LLM in it using <code>pi-tui</code>.</p>
+
+<p><strong><code>pi-tui</code> has nothing to do with LLMs.</strong> The terminal UI library depends on neither <code>pi-ai</code> nor <code>pi-agent-core</code>. It is a standalone, general-purpose diff-rendering library. Fully decoupling the UI from agent logic is one of the key differences between Pi Agent and agents where "UI and logic are tangled together." As we'll see in Chapter 12, the library isn't even built on React/Ink — it's entirely homegrown.</p>
+
+<p><strong>Remote capability is an independent side branch.</strong> <code>pi-protocol</code> and <code>pi-client</code> form a separate remote-session channel, while <code>pi-server</code> is a daemon that supervises headless agent subprocesses. They all depend on the product layer, but the product layer does not depend on them — installing the <code>pi</code> command itself needs no remote components at all. As we'll see in Chapter 15, there are actually <strong>two</strong> distinct remote-control designs hiding here.</p>
+
+<p><strong>Storage is pluggable.</strong> <code>pi-storage-sqlite-node</code> implements the storage interface defined by <code>pi-agent-core</code>, but the core does not depend on it. The default session storage is plain JSONL files (implemented in the product layer); SQLite is an optional backend with full-text search.</p>
+
+<p>This arrangement is itself the first manifestation of "minimalism": <strong>the core is small because it has cut a large amount of responsibility out into separate packages.</strong></p>
+
+<hr class="sep">
+
+<h2 id="abstracts">Six Core Abstractions</h2>
+
+<p>If the monolith route is defined by six built-in subsystems, Pi Agent is defined by six <strong>interface abstractions</strong>. Everything else — the nine packages, dozens of files — exists to implement or consume these six abstractions.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="abstracts" data-w="860" data-h="540"></canvas></div>
+  <figcaption>Figure 2: The six core abstractions organized around the agent loop. The loop knows only interfaces, never concrete implementations.</figcaption>
+</figure>
+
+<p><strong>1. <code>StreamFn</code> — the LLM boundary</strong> (<code>packages/agent/src/types.ts</code>). This is the only seam between the core loop and the model world:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export type StreamFn = (
+	model: Model&lt;Api&gt;,
+	context: Context,
+	options?: SimpleStreamOptions,
+) =&gt; AssistantMessageEventStream | Promise&lt;AssistantMessageEventStream&gt;;</pre>
+
+<p>The <code>AssistantMessageEventStream</code> it returns is an event stream that must end with either <code>done</code> or <code>error</code>, and both termination events carry the same <code>AssistantMessage</code> (<code>packages/ai/src/types.ts</code>, excerpt):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";
+
+export interface AssistantMessage {
+	role: "assistant";
+	content: (TextContent | ThinkingContent | ToolCall)[];
+	// ... api / provider / model / usage 等元数据字段
+	stopReason: StopReason;
+	errorMessage?: string;
+	// ...
+}
+
+export type AssistantMessageEvent =
+	// ... 中间的 text_delta / thinking_delta 等增量事件
+	| { type: "done"; reason: Extract&lt;StopReason, "stop" | "length" | "toolUse"&gt;; message: AssistantMessage }
+	| { type: "error"; reason: Extract&lt;StopReason, "aborted" | "error"&gt;; error: AssistantMessage };</pre>
+
+<p>There is one crucial convention in <code>StreamFn</code>'s contract: <strong>it never throws</strong>. Failed requests, model errors, network outages — none of these may surface as exceptions; they must be encoded into the <code>error</code> event at the end of the stream. The <code>AssistantMessage</code> it carries marks the failure with <code>stopReason: "error" | "aborted"</code> and puts the details in <code>errorMessage</code>. This single convention makes the loop's error handling trivially simple — it never needs to <code>try/catch</code> a model call, only to inspect the stream's result. <code>pi-ai</code>'s <code>Models.streamSimple</code> satisfies this shape; Chapter 2 will show how the entire <code>pi-ai</code> package is organized around the principle of "encoding failure into the stream."</p>
+
+<p><strong>2. <code>AgentEvent</code> — the loop's output</strong> (<code>packages/agent/src/types.ts</code>). The loop doesn't return one big object; it emits a sequence of lifecycle events:</p>
+
+<pre class="code" data-lang="text">agent_start | agent_end
+turn_start  | turn_end
+message_start | message_update | message_end
+tool_execution_start | tool_execution_update | tool_execution_end</pre>
+
+<p>A "turn" = one assistant response plus its tool calls and their results. Every consumer — the TUI REPL, headless print mode, RPC mode — works by subscribing to this event stream. Chapter 11 will show that the essential difference between the three run modes is merely "how they render the same event stream."</p>
+
+<p><strong>3. <code>AgentTool</code> — the self-describing tool</strong> (<code>packages/agent/src/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface AgentTool&lt;TParameters extends TSchema = TSchema, TDetails = any&gt;
+	extends Tool&lt;TParameters&gt; {
+	label: string;
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParameters&gt;;
+	execute: (
+		toolCallId: string,
+		params: Static&lt;TParameters&gt;,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback&lt;TDetails&gt;,
+	) =&gt; Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	executionMode?: ToolExecutionMode; // "sequential" | "parallel"
+}</pre>
+
+<p>A tool is not just a function. It carries its own parameter schema (TypeBox), execution logic, concurrency declaration (<code>executionMode</code>), and progress-reporting callback (<code>onUpdate</code>). The loop knows nothing about a tool's internals — it only knows "validate against the schema, call execute, collect the result." Adding the N+1th tool requires no change to a single line of the loop. Detailed in Chapter 4.</p>
+
+<p><strong>4. <code>AgentMessage</code> and <code>convertToLlm</code> — the message bridge</strong> (<code>packages/agent/src/types.ts</code>, <code>agent-loop.ts</code>). Internally the loop uses an extensible message union type:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface CustomAgentMessages {} // 通过声明合并扩展
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];</pre>
+
+<p><code>Message</code> (from <code>pi-ai</code>) covers <code>user | assistant | toolResult</code>. But the product can stuff custom message types into the transcript — compaction summaries, branch summaries, bash execution records — which are meaningful to the UI yet should never be sent to the model. <code>convertToLlm</code> is the bridge: before every model call, it filters and converts the internal <code>AgentMessage[]</code> into a <code>Message[]</code> the provider can understand. This separation of "internal representation ≠ wire representation" is the key to Pi Agent accommodating custom message types without polluting the protocol.</p>
+
+<p><strong>5. The session tree — the persistent transcript</strong> (<code>packages/agent/src/harness/session/session.ts</code>). The transcript is not a flat array but an <strong>appendable, forkable tree of immutable entries</strong>. Every entry has an <code>id</code>, <code>parentId</code>, and <code>timestamp</code>; a <code>leaf</code> marker points at the "current position." <code>moveTo(entryId)</code> can repoint the leaf, enabling branching and backtracking; compaction doesn't delete history, it inserts a <code>compaction</code> entry. This design makes "fork a session" and "go back three steps and try another approach" first-class citizens. Detailed in Chapter 5.</p>
+
+<p><strong>6. <code>ExtensionAPI</code> — the typed extension surface</strong> (<code>packages/coding-agent/src/core/extensions/types.ts</code>). This is the most direct product of the minimalist philosophy. Pi Agent has no runtime hook strings and no MCP; it concentrates extensibility into one strongly typed interface:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export type ExtensionFactory = (pi: ExtensionAPI) =&gt; void | Promise&lt;void&gt;;</pre>
+
+<p>An extension receives a <code>pi</code> object and can <code>on(event, handler)</code> to subscribe to 33 events, <code>registerTool(...)</code> to register tools, <code>registerCommand(...)</code> to register slash commands, <code>registerShortcut(...)</code> to register keybindings, and <code>registerFlag(...)</code> to register CLI flags. Because everything is TypeScript types, extensions get full compile-time type checking and autocompletion. Detailed in Chapter 14.</p>
+
+<hr class="sep">
+
+<h2 id="core-harness">Core and Harness: Two Layers in One Package</h2>
+
+<p>Inside the <code>pi-agent-core</code> package hides the key cut for understanding Pi Agent's design philosophy. It actually contains <strong>two layers</strong>:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="core-harness" data-w="820" data-h="430"></canvas></div>
+  <figcaption>Figure 3: The core/harness split inside the <code>pi-agent-core</code> package. The product layer bypasses the harness and builds its own orchestration directly on the minimal core.</figcaption>
+</figure>
+
+<p><strong>The core runtime</strong> (<code>src/agent.ts</code>, <code>src/agent-loop.ts</code>, <code>src/types.ts</code>) is a stateful <code>Agent</code> class wrapping a pure, event-emitting loop. It only maintains the in-memory transcript; it never touches the filesystem and does no persistence. This is "the minimal core" taken literally — it is small enough to run in any environment, including a browser.</p>
+
+<p><strong>The harness layer</strong> (<code>src/harness/**</code>) builds on top of the core, adding persistent session-tree storage, context compaction, branch summaries, skills, prompt templates, and the built-in file/Shell tools. It is the optional layer for "if you want a ready-to-use, persistable agent."</p>
+
+<p>The key insight: <strong>the product layer <code>pi-coding-agent</code> does not use the harness layer's <code>AgentHarness</code> class.</strong> In <code>packages/coding-agent/src/core/sdk.ts</code> it instantiates the core <code>Agent</code> directly:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/sdk.ts">import { Agent, type AgentMessage, setDefaultStreamFn } from "@earendil-works/pi-agent-core";
+// ...
+agent = new Agent({
+	initialState: { systemPrompt: "", model, thinkingLevel, tools: [] },
+	convertToLlm: convertToLlmWithBlockImages,
+	streamFn: async (model, context, options) =&gt; modelRuntime.streamSimple(model, context, { ... }),
+	// ...
+});</pre>
+
+<p>The product layer then builds <strong>its own</strong> orchestrator <code>AgentSession</code> (3,333 lines) and <strong>its own</strong> JSONL session management <code>SessionManager</code> on top of the core <code>Agent</code>.</p>
+
+<p>Why? Because the orchestration logic the product layer needs (the extension system, project trust, three run modes, slash commands, the model-switching UI) does not overlap with the concerns of the generic harness. <code>pi-agent-core</code> offers you both "a pure minimal loop" and "one generic persistence scheme," but it <strong>does not force</strong> you to use the latter — the product layer proves you can build a fully custom, product-specific orchestration layer on top of the minimal core alone.</p>
+
+<p>This is the second manifestation of "minimalism": <strong>even inside a single package, the core stays pure and leaves the freedom of "how to orchestrate" to the layer above.</strong> Chapter 6 goes deep into the harness layer; Chapter 9 goes deep into the product layer's own <code>AgentSession</code>.</p>
+
+<hr class="sep">
+
+<h2 id="golden">The Golden Path: From Keystroke to Output</h2>
+
+<p>Now let's trace the complete flow of a single request. You type "add error handling to the login function" and press Enter.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="golden" data-w="920" data-h="760"></canvas></div>
+  <figcaption>Figure 4: The golden path of a single prompt. Model calls never throw, the loop is an event stream, and tool execution is orthogonal to the model boundary.</figcaption>
+</figure>
+
+<p>Three points about this path are worth noting, each mapping to a later chapter.</p>
+
+<p><strong>The loop is an event stream, not a callback chain.</strong> Inside <code>Agent.prompt()</code> drives <code>runLoop</code>, which emits <code>AgentEvent</code>s through an <code>emit</code> callback. The <code>Agent</code> class reduces these events into its own mutable state and then dispatches them to subscribers. Consumers process events at their own pace — the TUI renders, print mode writes to stdout, RPC mode serializes to JSON. Chapter 3 will show that the loop itself is a clean two-layer nested state machine, with none of the thousand-line error-recovery mazes of the monolith route.</p>
+
+<p><strong>Model calls never throw.</strong> Because of <code>StreamFn</code>'s contract, checking <code>message.stopReason === "error" | "aborted"</code> in the loop suffices to handle every model-layer failure. The complexity of error recovery is pushed out to <code>pi-ai</code> (two-layer retries) and to extensions (which can hook <code>before_provider_request</code>).</p>
+
+<p><strong>Tool execution is orthogonal to the model boundary.</strong> The loop doesn't know whether a tool reads files or runs a shell, nor whether it runs in parallel or sequentially — that information is cohesive inside <code>AgentTool</code>'s own <code>executionMode</code> field. Chapter 4 will show that the concurrency strategy is just reading this field and choosing <code>Promise.all</code> or a <code>for</code> loop — nothing more.</p>
+
+<hr class="sep">
+
+<h2 id="trust">The Security Model: Project Trust, Not Per-Tool Approval</h2>
+
+<p>This is the most glaring divergence between Pi Agent and the monolith route, and the most thorough expression of the minimalist philosophy.</p>
+
+<p>The monolith route ships an elaborate permission system: multiple permission modes, an approval dialog before every tool call, and an LLM classifier that evaluates the transcript. Pi Agent's <code>README.md</code> simply forgoes all of it:</p>
+
+<blockquote>
+<p>Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.</p>
+<p>If you need stronger boundaries, containerize or sandbox Pi.</p>
+</blockquote>
+
+<p>It pushes <strong>isolation</strong> out to the operating system and containers (the README lists three containerization options: the Gondolin micro-VM, plain Docker, and the OpenShell sandbox).</p>
+
+<p>But that doesn't mean Pi Agent does nothing about security. It narrows the security concern down to <strong>one</strong> question: <em>do you trust the resources in the current project directory?</em> Because the project directory may contain <code>AGENTS.md</code>, custom extensions, and skills — all of which influence the agent's behavior and may come from untrusted third-party repositories.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="trust" data-w="820" data-h="520"></canvas></div>
+  <figcaption>Figure 5: The project-trust decision flow. A trust decision is only entered when the project contains resources that need trust; otherwise it runs directly.</figcaption>
+</figure>
+
+<p>This decision is persisted by <code>ProjectTrustStore</code> in <code>packages/coding-agent/src/core/trust-manager.ts</code> (recorded per cwd), resolved by <code>resolveProjectTrusted(...)</code> in <code>project-trust.ts</code>, mapped to the <code>--approve/-a</code> and <code>--no-approve/-na</code> flags on the CLI, and to the <code>/trust</code> command plus a <code>trust-selector</code> component in interactive mode. Extensions can even hook the <code>project_trust</code> event to participate in the decision.</p>
+
+<p>Tool-level "security" is expressed through <strong>allow/deny lists</strong> rather than approval dialogs: <code>--tools</code>, <code>--exclude-tools</code>, <code>--no-tools</code>, <code>--no-builtin-tools</code>, plus a "read-only tool group" (<code>grep</code>/<code>find</code>/<code>ls</code> are off by default).</p>
+
+<p>This is a fundamentally different security posture: instead of a gate before every action, it makes <strong>one decision at the boundary and then makes the execution environment itself safe</strong>. The complexity of "judging each tool call for safety" is pushed out to containers and the user's trust decision. Chapter 14 will return to this model when discussing extensions.</p>
+
+<hr class="sep">
+
+<h2 id="providers">Many Providers: Few Protocols, Many Endpoints</h2>
+
+<p>Pi Agent supports about 38 LLM providers (OpenAI, Anthropic, Google, Bedrock, Vertex, OpenRouter, Groq, xAI, DeepSeek…). Writing a bespoke adapter for each provider would be an enormous maintenance burden. <code>pi-ai</code>'s solution introduces <strong>two layers</strong>:</p>
+
+<ul>
+<li><strong><code>Api</code> (wire protocol)</strong>: how to talk to a <em>family</em> of servers. About 10 of them: <code>openai-completions</code>, <code>openai-responses</code>, <code>anthropic-messages</code>, <code>google-generative-ai</code>, <code>bedrock-converse-stream</code>, <code>mistral-conversations</code>, and more.</li>
+<li><strong><code>Provider</code> (a configured endpoint)</strong>: one concrete runtime endpoint (id, baseUrl, auth, model catalog, which <code>Api</code>s it binds to). About 38 of them.</li>
+</ul>
+
+<p>The key point: <strong>many providers reuse the same <code>Api</code>.</strong> OpenRouter, Groq, Together, and xAI all speak <code>openai-completions</code>/<code>openai-responses</code>. So about 10 protocol adapters unify about 38 vendors — few protocols, many endpoints. Adding a provider that "speaks OpenAI's dialect" takes little more than a factory function and a model-catalog file. Detailed in Chapter 2.</p>
+
+<hr class="sep">
+
+<h2 id="wiring">How the Pieces Connect</h2>
+
+<p>Put the six abstractions and nine packages together, and the system's dependencies and data flow look like this:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="wiring" data-w="900" data-h="560"></canvas></div>
+  <figcaption>Figure 6: How the pieces connect. <code>AgentSession</code> is the product-layer hub; the circular dependency between the core loop and the tool system is wrapped inside clean interfaces.</figcaption>
+</figure>
+
+<p><code>AgentSession</code> is the product-layer hub: it holds the core <code>Agent</code>, turns user input into <code>prompt()</code> calls, translates the <code>AgentEvent</code>s emitted by the <code>Agent</code> into higher-level <code>AgentSessionEvent</code>s dispatched to the run modes, and also owns persistence, compaction, model switching, and extension binding. The circular dependency between the core loop and the tool system — the model generates tool calls, tools produce results, results feed back in, the model decides again — is still the heartbeat of the system, only now it is wrapped inside the clean <code>StreamFn</code>/<code>AgentEvent</code> interfaces.</p>
+
+<p>Relationship to later chapters: Chapter 2 zooms into <code>pi-ai</code> (the implementation of <code>StreamFn</code>). Chapters 3–5 zoom into the core loop, tools, and state. Chapters 6–7 zoom into the optional harness and compaction. Chapters 8–11 zoom into how the product layer assembles all of this. Chapters 12–13 zoom into <code>pi-tui</code>. Chapters 14–15 zoom into extensions and remote. Chapter 16 looks at how evals verify that all of it actually works.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>If you're building an agent system, Pi Agent's architecture offers five transferable patterns.</p>
+
+<p><strong>Use the dependency stack as a firewall.</strong> Split the system into layers with strictly one-way dependencies (model layer → runtime layer → product layer), with each layer depending only on the abstract interfaces of the layer below. The problem it solves: complexity spreading freely inside a monolith. When <code>pi-tui</code> doesn't even depend on <code>pi-ai</code>, you know the UI's complexity can never leak into agent logic. Layer boundaries are the firewalls of complexity.</p>
+
+<p><strong>Make "whether to take on complexity" a choice.</strong> Permissions, remote, storage backends, extensions — none of these are forced into the core; they are optional packages or pushed-out responsibilities. The problem it solves: the core being held hostage by every edge-case requirement. When the core stays minimal, an SDK user who only wants to run an in-memory agent doesn't have to drag along an entire persistence and remote infrastructure.</p>
+
+<p><strong>Separate core from orchestration without forcing a binding.</strong> The same runtime package offers both a pure minimal loop and an optional persistable harness, but the product can use neither and build its own orchestration. The problem it solves: frameworks imposing their own orchestration assumptions on every user. Separate the "mechanism" (the loop) from the "policy" (how to orchestrate, how to persist), and policy can vary by product.</p>
+
+<p><strong>Encode failure into the stream instead of throwing.</strong> <code>StreamFn</code>'s convention is to never throw; failure is a terminal event at the end of the stream. The problem it solves: <code>try/catch</code> scattered throughout an async streaming pipeline, with consumers unsure when to disconnect. When failure is data rather than control flow, error handling reduces to a single field check.</p>
+
+<p><strong>Put the security decision at the boundary, not before every action.</strong> Don't pop a dialog before each tool call; make one trust decision when entering the project, then make the execution environment itself (the container) safe. The problem it solves: approval fatigue and the maintenance burden of permission systems. Of course, this pattern presupposes you actually control the execution environment — if your agent runs directly on the user's host and can't be containerized, per-action approval may still be necessary. The minimalist security model has its limits; understanding those limits matters more than imitating it.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's architecture is an argument for restraint. It splits the system into nine packages with one-way dependencies, narrows the core to a pure two-layer loop, hands permissions to containers, extensions to a typed API, and storage to pluggable backends. It hasn't "done less" than the monolith route — it has simply placed every piece of extra complexity outside the core, letting users take it on as needed.</p>
+
+<p>This design is not without cost. Delegating isolation to containers means a bare <code>pi</code> running on the host genuinely has all of the user's permissions; not providing MCP means people who want to plug into the external tool ecosystem must write their own extensions. The rest of this book will not shy away from these trade-offs. But once you grasp the "conservation of complexity" thread, you can see the deliberate trade-off behind every seemingly missing feature of Pi Agent.</p>
+
+<p>Next chapter, we start at the bottom of the dependency stack: how <code>pi-ai</code> hides about 38 LLM providers behind a single unified streaming API using about 10 protocol adapters.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("packages", function (d) {
+  var LY = { size: 11, color: d.theme.faint, align: "left" };
+
+  d.box({ id: "AI", x: 350, y: 40, w: 200, h: 58, title: "pi-ai", lines: ["Unified multi-provider LLM API"], tone: "accent", titleSize: 13 });
+  d.box({ id: "AGENT", x: 100, y: 150, w: 200, h: 58, title: "pi-agent-core", lines: ["Agent loop + tool execution"], tone: "teal", titleSize: 13 });
+  d.box({ id: "TUI", x: 600, y: 150, w: 200, h: 58, title: "pi-tui", lines: ["Terminal UI library"], tone: "teal", titleSize: 13 });
+  d.box({ id: "CA", x: 350, y: 260, w: 200, h: 58, title: "pi-coding-agent", lines: ["CLI product (pi command)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "STORAGE", x: 60, y: 400, w: 190, h: 58, title: "pi-storage-sqlite-node", lines: ["SQLite session storage + FTS"], tone: "violet", titleSize: 12, size: 11.5 });
+  d.box({ id: "SERVER", x: 350, y: 400, w: 190, h: 58, title: "pi-server", lines: ["Daemon / supervisor"], tone: "violet", titleSize: 13 });
+  d.box({ id: "EVALS", x: 640, y: 400, w: 190, h: 58, title: "pi-evals", lines: ["Behavioral evals"], tone: "slate", titleSize: 13 });
+  d.box({ id: "PROTO", x: 60, y: 510, w: 190, h: 58, title: "pi-protocol", lines: ["CBOR remote protocol"], tone: "violet", titleSize: 13 });
+  d.box({ id: "CLIENT", x: 350, y: 510, w: 190, h: 58, title: "pi-client", lines: ["Remote client"], tone: "violet", titleSize: 13 });
+
+  d.text("Foundation layer", 12, 69, LY);
+  d.text("Runtime layer", 12, 179, LY);
+  d.text("Product layer", 12, 289, LY);
+  d.text("Persistence & connectivity", 12, 429, LY);
+  d.text("Quality", 12, 539, LY);
+
+  d.arrow("AI", "AGENT", { from: "bottom", to: "top" });
+  d.path([[350, 98], [350, 122], [30, 122], [30, 400], [60, 400]]);
+  d.arrow("AGENT", "CA", { from: "bottom", to: "top" });
+  d.arrow("TUI", "CA", { from: "bottom", to: "top" });
+  d.path([[200, 208], [200, 230], [150, 230], [150, 400]]);
+  d.arrow("CA", "SERVER", { from: "bottom", to: "top" });
+  d.arrow("CA", "EVALS", { from: "right", to: "left", bend: -30 });
+  d.path([[550, 69], [580, 69], [580, 112], [840, 112], [840, 360], [760, 360], [760, 400]]);
+  d.arrow("PROTO", "CLIENT", { from: "right", to: "left" });
+
+  d.text("Dependencies strictly one-way: model → runtime → product", 450, 610, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("abstracts", function (d) {
+  d.box({ id: "streamfn", x: 60, y: 60, w: 180, h: 64, title: "StreamFn", lines: ["LLM boundary", "Model → event stream"], tone: "accent", titleSize: 13 });
+  d.box({ id: "loop", x: 330, y: 220, w: 200, h: 80, title: "Agent loop", lines: ["Two nested loops"], tone: "gold", titleSize: 13.5 });
+  d.box({ id: "event", x: 620, y: 60, w: 180, h: 64, title: "AgentEvent", lines: ["The loop's output", "10 lifecycle events"], tone: "teal", titleSize: 13 });
+  d.box({ id: "tool", x: 620, y: 220, w: 180, h: 64, title: "AgentTool", lines: ["Self-describing tool", "schema + execute + concurrency"], tone: "teal", titleSize: 13 });
+  d.box({ id: "msg", x: 620, y: 380, w: 180, h: 64, title: "AgentMessage", lines: ["Extensible messages", "+ convertToLlm bridge"], tone: "teal", titleSize: 13 });
+  d.box({ id: "session", x: 60, y: 380, w: 180, h: 64, title: "Session tree", lines: ["Appendable, forkable", "persistent transcript"], tone: "violet", titleSize: 13 });
+  d.box({ id: "ext", x: 60, y: 220, w: 180, h: 64, title: "ExtensionAPI", lines: ["Typed extension surface", "33 events"], tone: "slate", titleSize: 13 });
+
+  d.arrow("streamfn", "loop", { from: "bottom", to: "top" });
+  d.arrow("loop", "event", { from: "right", to: "left" });
+  d.arrow("loop", "tool", { from: "right", to: "left", label: "Execute" });
+  d.arrow("tool", "loop", { from: "left", to: "right", label: "Results" });
+  d.arrow("loop", "msg", { from: "right", to: "left" });
+  d.arrow("msg", "session", { from: "left", to: "right" });
+  d.arrow("ext", "loop", { from: "top", to: "bottom", dashed: true, label: "Register tools/commands" });
+});
+
+PB.fig("core-harness", function (d) {
+  d.group({ x: 40, y: 60, w: 740, h: 160, label: "pi-agent-core", tone: "gold", fill: d.theme.panel });
+  d.box({ id: "core", x: 80, y: 100, w: 300, h: 90, title: "Core runtime", lines: ["agent.ts / agent-loop.ts / types.ts", "Pure event-stream loop, in-memory transcript"], tone: "teal", titleSize: 13, align: "left" });
+  d.box({ id: "harness", x: 440, y: 100, w: 300, h: 90, title: "Harness layer", lines: ["harness/**", "Persistent session tree, compaction, branch summaries", "skills, built-in file/Shell tools"], tone: "accent", titleSize: 13, align: "left" });
+  d.arrow("core", "harness", { from: "right", to: "left" });
+
+  d.box({ id: "sdk", x: 80, y: 320, w: 300, h: 64, title: "SDK consumers", lines: ["Can use core Agent directly"], tone: "slate", titleSize: 13 });
+  d.box({ id: "prod", x: 440, y: 320, w: 300, h: 64, title: "pi-coding-agent", lines: ["Own AgentSession orchestration"], tone: "gold", titleSize: 13 });
+  d.arrow("core", "sdk", { from: "bottom", to: "top" });
+  d.arrow("core", "prod", { from: "bottom", to: "top" });
+  d.arrow("harness", "sdk", { from: "bottom", to: "right", dashed: true, label: "Optional reuse" });
+});
+
+PB.fig("golden", function (d) {
+  d.sequence({
+    x: 30, y: 16, w: 860, rowH: 38, tailPad: 8,
+    participants: [
+      { id: "U", label: "User / TUI", tone: "accent" },
+      { id: "IM", label: "InteractiveMode", tone: "slate" },
+      { id: "AS", label: "AgentSession", tone: "teal" },
+      { id: "A", label: "Agent (runLoop)", tone: "gold" },
+      { id: "AI", label: "pi-ai", tone: "violet" },
+      { id: "T", label: "Tools", tone: "slate" }
+    ],
+    steps: [
+      { from: "U", to: "IM", label: "Type prompt, Enter" },
+      { from: "IM", to: "AS", label: "prompt(text)" },
+      { from: "AS", to: "AS", kind: "self", label: "Expand skills/templates, check compaction" },
+      { from: "AS", to: "A", label: "agent.prompt(messages)" },
+      { from: "A", to: "A", kind: "self", label: "convertToLlm: AgentMessage[] → Message[]" },
+      { from: "A", to: "AI", label: "streamFn(model, context)" },
+      { from: "AI", to: "A", kind: "return", label: "Streaming events (text_delta…)" },
+      { from: "A", to: "AS", kind: "return", label: "AgentEvent (message_update)" },
+      { from: "AS", to: "IM", kind: "return", label: "Forward events" },
+      { from: "IM", to: "U", kind: "return", label: "Incremental render" },
+      { kind: "note", label: "Assistant emits toolCall" },
+      { from: "A", to: "T", label: "executeToolCalls (parallel/serial)" },
+      { from: "T", to: "A", kind: "return", label: "ToolResultMessage" },
+      { from: "A", to: "AI", label: "Stream again with results" },
+      { kind: "note", label: "No more toolCall → stop" },
+      { from: "A", to: "AS", kind: "return", label: "agent_end" },
+      { from: "AS", to: "AS", kind: "self", label: "Persist into session tree" },
+      { from: "IM", to: "U", kind: "return", label: "Render final result" }
+    ]
+  });
+});
+
+PB.fig("trust", function (d) {
+  d.box({ id: "a", x: 270, y: 30, w: 280, h: 60, title: "Launch pi, enter a project directory", tone: "accent", titleSize: 13 });
+  d.box({ id: "b", x: 270, y: 150, w: 280, h: 80, title: "Project has resources needing trust?", lines: ["(extensions / skills / AGENTS.md)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "c", x: 40, y: 290, w: 200, h: 60, title: "Run directly", tone: "teal", titleSize: 13 });
+  d.box({ id: "dd", x: 270, y: 290, w: 280, h: 80, title: "Trust decision", lines: ["--approve / --no-approve / ask"], tone: "gold", titleSize: 13 });
+  d.box({ id: "e", x: 40, y: 420, w: 200, h: 60, title: "Load project resources", tone: "teal", titleSize: 13 });
+  d.box({ id: "f", x: 580, y: 420, w: 200, h: 60, title: "Ignore project resources", tone: "slate", titleSize: 13 });
+  d.box({ id: "g", x: 270, y: 420, w: 280, h: 60, title: "Interactive trust-selector", tone: "violet", titleSize: 13 });
+
+  d.arrow("a", "b", { from: "bottom", to: "top" });
+  d.arrow("b", "c", { from: "left", to: "top", label: "No" });
+  d.arrow("b", "dd", { from: "bottom", to: "top", label: "Yes" });
+  d.arrow("dd", "e", { from: "left", to: "top", label: "--approve / trusted" });
+  d.arrow("dd", "f", { from: "right", to: "top", label: "--no-approve / not trusted" });
+  d.arrow("dd", "g", { from: "bottom", to: "top", label: "Ask" });
+  d.arrow("g", "e", { from: "left", to: "right" });
+  d.arrow("g", "f", { from: "right", to: "left" });
+});
+
+PB.fig("wiring", function (d) {
+  d.box({ id: "user", x: 390, y: 20, w: 140, h: 50, title: "User", tone: "accent", titleSize: 13 });
+  d.box({ id: "mode", x: 360, y: 110, w: 200, h: 64, title: "Run modes", lines: ["Interactive / Print / RPC"], tone: "slate", titleSize: 13 });
+  d.box({ id: "as", x: 360, y: 220, w: 200, h: 64, title: "AgentSession", lines: ["Product orchestrator"], tone: "teal", titleSize: 13 });
+  d.box({ id: "agent", x: 60, y: 220, w: 220, h: 64, title: "Agent (core loop)", tone: "gold", titleSize: 13 });
+  d.box({ id: "ai", x: 60, y: 110, w: 220, h: 64, title: "pi-ai", lines: ["ModelRuntime"], tone: "accent", titleSize: 13 });
+  d.box({ id: "tools", x: 60, y: 330, w: 220, h: 64, title: "AgentTool[]", tone: "violet", titleSize: 13 });
+  d.box({ id: "tui", x: 640, y: 110, w: 200, h: 64, title: "pi-tui", tone: "teal", titleSize: 13 });
+  d.box({ id: "tree", x: 640, y: 330, w: 220, h: 64, title: "Session tree", lines: ["JSONL / SQLite"], tone: "violet", titleSize: 13 });
+  d.box({ id: "ext", x: 640, y: 440, w: 220, h: 64, title: "ExtensionAPI", lines: ["Extensions"], tone: "slate", titleSize: 13 });
+
+  d.arrow("user", "mode", { from: "bottom", to: "top" });
+  d.arrow("mode", "as", { from: "bottom", to: "top" });
+  d.arrow("as", "agent", { from: "left", to: "right", label: "prompt", labelDy: -8 });
+  d.arrow("agent", "as", { from: "right", to: "left", label: "AgentEvent", labelDy: 10 });
+  d.arrow("agent", "ai", { from: "top", to: "bottom", label: "StreamFn", labelDy: -8 });
+  d.arrow("ai", "agent", { from: "bottom", to: "top", label: "AssistantMessageEvent", labelDy: 10 });
+  d.arrow("agent", "tools", { from: "bottom", to: "top", label: "execute" });
+  d.arrow("tools", "agent", { from: "top", to: "bottom", label: "ToolResultMessage" });
+  d.arrow("as", "mode", { from: "top", to: "bottom", label: "AgentSessionEvent" });
+  d.arrow("mode", "tui", { from: "right", to: "left", label: "render" });
+  d.arrow("tui", "user", { from: "left", to: "right" });
+  d.arrow("as", "tree", { from: "right", to: "left", label: "Persist" });
+  d.arrow("ext", "as", { from: "top", to: "right", dashed: true, label: "Register tools/commands/hooks" });
+  d.arrow("tree", "agent", { from: "bottom", to: "right", dashed: true, label: "buildContext" });
+});
+</script>
+</body>
+</html>

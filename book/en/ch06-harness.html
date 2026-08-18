@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 6 · AgentHarness: A Persistable Orchestrator | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch06">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part III · Persistent Orchestration</p>
+  <h1>Chapter 6: AgentHarness — A Persistable Orchestrator</h1>
+  <p class="chapter-sub">A persistable, hook-driven orchestrator: IO dependency inversion, 22 typed hooks, safe-point persistence — and why the product layer ultimately bypassed it</p>
+</header>
+
+<h2 id="hook">The Gap the Core Deliberately Left</h2>
+
+<p>The core loop of Chapter 3 is pure: it only knows an <code>emit</code> callback and a set of "never-throwing" configuration slots. It touches no file system, performs no persistence, and manages no compaction. This is deliberate — but it is also incomplete. A real, usable agent needs to: persist the transcript to disk, compact the context when it grows too long, insert logic before and after tool calls, manage skills and prompt templates, and provide built-in file/Shell tools.</p>
+
+<p><code>pi-agent-core</code> puts these "batteries" in a separate layer: the Harness (<code>packages/agent/src/harness/**</code>). Its centerpiece is the <code>AgentHarness</code> class (<code>packages/agent/src/harness/agent-harness.ts</code>, about 1,186 lines), a <strong>persistable, hook-driven orchestrator</strong> built directly on top of <code>runAgentLoop</code>.</p>
+
+<p>This chapter dissects this layer. But more importantly, we want to answer an architectural question: <strong>why does the same package contain both a minimal core and this fully-loaded Harness?</strong> And a sharper one: <strong>why did the product layer <code>pi-coding-agent</code> ultimately not use it, instead building its own orchestrator?</strong> The answers to these two questions are precisely the finest expression of the "minimal core" philosophy.</p>
+
+<hr class="sep">
+
+<h2 id="additions">What the Harness Adds on Top of the Core</h2>
+
+<p>The core <code>Agent</code> class (Chapter 5) is an in-memory loop wrapper. <code>AgentHarness</code> adds on top of it an entire suite of persistence and orchestration capabilities:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="harness-layers" data-w="860" data-h="520"></canvas></div>
+  <figcaption>Figure 1: AgentHarness adds a full suite of persistence and orchestration capabilities on top of the minimal core. The core loop stays pure — the Harness consumes the core rather than modifying it.</figcaption>
+</figure>
+
+<p>Item by item:</p>
+
+<ul>
+<li><strong>Persistent session tree</strong>: the Harness holds a <code>Session</code> (the tree from Chapter 5) and persists each turn's messages into it.</li>
+<li><strong>Hook system</strong>: 22 typed hook events let external code insert logic at key nodes of the loop.</li>
+<li><strong>Compaction and branch summaries</strong>: automatically generates summaries when the context grows too long, and branch summaries when switching branches.</li>
+<li><strong>Built-in tools</strong>: <code>bash</code>, <code>read</code>, <code>edit</code>, <code>write</code>, built on the <code>ExecutionEnv</code> abstraction.</li>
+<li><strong>Skills and prompt templates</strong>: loads <code>SKILL.md</code>, formats prompt templates.</li>
+<li><strong>Phase state machine</strong>: tracks what the harness is currently doing (idle/turn/compaction/...).</li>
+</ul>
+
+<p>The key point: these capabilities are <strong>not in the core loop</strong>. The core loop stays pure — the Harness achieves all of this by stuffing callbacks into the core's configuration slots and subscribing to the core's event stream. The Harness is a <em>consumer</em> of the core, not a <em>modifier</em> of it.</p>
+
+<hr class="sep">
+
+<h2 id="exec-env"><code>ExecutionEnv</code>: Inverting IO Outward</h2>
+
+<p>The Harness's built-in tools need to read and write files and execute commands. But it doesn't use <code>node:fs</code> and <code>node:child_process</code> directly — that would bind it to the Node environment. It defines an IO abstraction, <code>ExecutionEnv</code> (<code>packages/agent/src/harness/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export interface ExecutionEnv extends FileSystem, Shell {}</pre>
+
+<p><code>FileSystem</code> is a set of file operations, each returning a <code>Result</code> rather than throwing:</p>
+
+<pre class="code" data-lang="ts">export interface FileSystem {
+	cwd: string;
+	absolutePath(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	readTextFile(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	readTextLines(path, options?): Promise&lt;Result&lt;string[], FileError&gt;&gt;;
+	readBinaryFile(path, abortSignal?): Promise&lt;Result&lt;Uint8Array, FileError&gt;&gt;;
+	writeFile(path, content, abortSignal?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	appendFile(path, content, abortSignal?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	listDir(path, abortSignal?): Promise&lt;Result&lt;FileInfo[], FileError&gt;&gt;;
+	canonicalPath(path, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	exists(path, abortSignal?): Promise&lt;Result&lt;boolean, FileError&gt;&gt;;
+	createDir(path, options?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	remove(path, options?): Promise&lt;Result&lt;void, FileError&gt;&gt;;
+	createTempDir(prefix?, abortSignal?): Promise&lt;Result&lt;string, FileError&gt;&gt;;
+	cleanup(): Promise&lt;void&gt;; // 必须尽力而为，且不得抛出
+}
+
+export interface Shell {
+	exec(command, options?): Promise&lt;Result&lt;{ stdout: string; stderr: string; exitCode: number }, ExecutionError&gt;&gt;;
+	cleanup(): Promise&lt;void&gt;;
+}</pre>
+
+<p>Two design decisions here are worth noting.</p>
+
+<p><strong>First, the <code>Result</code> type replaces exceptions.</strong> <code>Result&lt;TValue, TError&gt;</code> is a simple discriminated union:</p>
+
+<pre class="code" data-lang="ts">export type Result&lt;TValue, TError&gt; = { ok: true; value: TValue } | { ok: false; error: TError };</pre>
+
+<p>The documentation of <code>FileSystem</code> and <code>Shell</code> makes the requirement explicit: <strong>all failures are encoded into the returned <code>Result</code>, and implementations must uphold this invariant — never throw.</strong> This is the Chapter 3 "failure is data" contract continued at the IO layer. Tool execution logic can therefore be written as straightforward <code>if (result.ok) ... else ...</code>, without wrapping every file operation in <code>try/catch</code>. <code>cleanup()</code> even requires "best effort, and must not throw" — resource release can never blow up.</p>
+
+<p><strong>Second, dependency inversion makes tools portable across environments.</strong> Because tools depend on the <code>ExecutionEnv</code> interface rather than a concrete implementation, the same <code>createBashTool</code> can run on different environments. The Node environment uses <code>NodeExecutionEnv</code> (<code>packages/agent/src/harness/env/nodejs.ts</code>, based on <code>node:fs</code>/<code>node:child_process</code>); but in principle you could provide an implementation that forwards operations to a remote SSH host, a container, or a browser. The pluggable <code>operations</code> of tools mentioned in Chapter 4 (delegating file IO to a remote system) are built exactly on this abstraction.</p>
+
+<p><code>withFileMutationQueue</code> (the file mutex from Chapter 4) is also keyed by <code>ExecutionEnv</code> — a <code>WeakMap&lt;ExecutionEnv, ...&gt;</code> — so different execution environments get their own independent mutex queues. The IO abstraction and concurrency safety interlock naturally here.</p>
+
+<hr class="sep">
+
+<h2 id="phase">The Phase State Machine: What the Harness Is Doing Now</h2>
+
+<p><code>AgentHarness</code> tracks its macro-state with a phase field:</p>
+
+<pre class="code" data-lang="ts">export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";</pre>
+
+<ul>
+<li><code>idle</code>: idle, ready to accept new operations</li>
+<li><code>turn</code>: running a conversation turn</li>
+<li><code>compaction</code>: compacting the context</li>
+<li><code>branch_summary</code>: generating a branch summary</li>
+<li><code>retry</code>: retrying</li>
+</ul>
+
+<p>One practical use of this state machine is <strong>mutex protection</strong>. For example, <code>navigateTree</code> (branch navigation) checks at the start:</p>
+
+<pre class="code" data-lang="ts">async navigateTree(...): Promise&lt;NavigateTreeResult&gt; {
+	if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
+	// ...
+}</pre>
+
+<p><code>compact()</code> likewise requires idleness. This avoids the dangerous concurrency of "modifying the session tree while a conversation is running". The phase is not UI state (that is driven by the event stream); it is the harness's own internal ledger of "what am I busy with".</p>
+
+<p>The Harness also uses an <code>activeTasks: Map&lt;Promise, "operation" | "mutation"&gt;</code> to track all in-flight async work, distinguishing "operations" from "mutations", so it can wait for them to finish on shutdown.</p>
+
+<hr class="sep">
+
+<h2 id="turn-state"><code>createTurnState</code>: A Snapshot per Turn</h2>
+
+<p>At the start of each turn, the Harness takes a snapshot, <code>createTurnState()</code> (<code>packages/agent/src/harness/agent-harness.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/agent-harness.ts">private async createTurnState() {
+	// 从会话树构建上下文，快照：
+	// messages, resources, toolContext, streamOptions, sessionId,
+	// systemPrompt, model, thinkingLevel, tools, activeTools
+}</pre>
+
+<p>It rebuilds the context from the <code>Session</code> (<code>buildSessionContext</code>), freezing the current model, thinking level, active tools, system prompt, resources, and more into an immutable per-turn state. That turn runs on this snapshot.</p>
+
+<p>Why re-snapshot every turn? Because state can be modified while running — the user might switch models or change active tools while the agent is working. If the loop kept using the stale state from startup, those changes would never take effect. The snapshot mechanism gives "changes between turns" a well-defined moment to take effect.</p>
+
+<p>This interlocks with the <code>prepareNextTurn</code> hook from Chapter 3. The Harness's <code>createLoopConfig</code> implements it like this:</p>
+
+<pre class="code" data-lang="ts">prepareNextTurn: async () => {
+	await this.flushPendingSessionWrites();      // 先把待写的落盘
+	const nextTurnState = await this.createTurnState(); // 重新从会话树快照
+	setTurnState(nextTurnState);
+	return {
+		context: this.createContext(nextTurnState),
+		model: nextTurnState.model,
+		thinkingLevel: nextTurnState.thinkingLevel,
+	};
+},</pre>
+
+<p>At the end of each turn and before the next one begins: first flush the buffered writes to disk, then rebuild the snapshot from the session tree, and return the fresh context/model/thinkingLevel to the loop. So mid-run modifications like <code>setModel()</code> take effect at the next turn boundary. This is a clean "changes take effect at safe points" model.</p>
+
+<hr class="sep">
+
+<h2 id="loop-config"><code>createLoopConfig</code>: From Core Slots to Harness Hooks</h2>
+
+<p>This is the Harness's most central adaptation work. The core loop has only a handful of configuration slots (<code>transformContext</code>, <code>beforeToolCall</code>, <code>afterToolCall</code>, <code>prepareNextTurn</code>, <code>getSteeringMessages</code>, <code>getFollowUpMessages</code>), while the Harness has a much richer hook system. <code>createLoopConfig</code> is the adapter that maps the former onto the latter:</p>
+
+<pre class="code" data-lang="ts">private createLoopConfig(getTurnState, setTurnState): AgentLoopConfig {
+	const turnState = getTurnState();
+	return {
+		model: turnState.model,
+		reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
+		convertToLlm,
+		// 核心的 transformContext 槽位 → harness 的 "context" hook
+		transformContext: async (messages) => {
+			const result = await this.emitHook({ type: "context", messages: [...messages] });
+			return result?.messages ?? messages;
+		},
+		// 核心的 beforeToolCall 槽位 → harness 的 "tool_call" hook
+		beforeToolCall: async ({ toolCall, args }) => {
+			const result = await this.emitHook({
+				type: "tool_call",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args,
+			});
+			return result ? { block: result.block, reason: result.reason } : undefined;
+		},
+		// 核心的 afterToolCall 槽位 → harness 的 "tool_result" hook
+		afterToolCall: async ({ toolCall, args, result, isError }) => {
+			const patch = await this.emitHook({
+				type: "tool_result",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args,
+				content: result.content,
+				details: result.details,
+				isError,
+				usage: result.usage,
+			});
+			return patch ? { content: patch.content, details: patch.details, isError: patch.isError, usage: patch.usage, terminate: patch.terminate } : undefined;
+		},
+		prepareNextTurn: async () => { /* 如上 */ },
+		getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
+		getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
+	};
+}</pre>
+
+<p>Look at this mapping: the core's <code>transformContext</code> slot is wired to the harness's <code>context</code> hook, the core's <code>beforeToolCall</code> to the <code>tool_call</code> hook, and the core's <code>afterToolCall</code> to the <code>tool_result</code> hook. The core provides the <strong>mechanism</strong> ("here is a slot you can intercept"), and the Harness provides the <strong>policy</strong> ("which hooks fire when intercepted, and how results are aggregated").</p>
+
+<p>This adaptation direction matters: the Harness adapts to the core, not the core to the Harness. The core loop knows nothing about the hook system — it just calls <code>transformContext</code>; whether that callback internally triggers a 22-event hook system is none of its concern. That is what layering is for: the lower layer stays stable, the upper layer evolves freely.</p>
+
+<hr class="sep">
+
+<h2 id="hooks">The Hook System: 22 Typed Events</h2>
+
+<p>The Harness's hook system is defined by <code>AgentHarnessEventResultMap</code> (<code>packages/agent/src/harness/types.ts</code>), listing all hook events and their return types:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/types.ts">export type AgentHarnessEventResultMap = {
+	before_agent_start: BeforeAgentStartResult | undefined;
+	context: ContextResult | undefined;
+	before_provider_request: BeforeProviderRequestResult | undefined;
+	before_provider_payload: BeforeProviderPayloadResult | undefined;
+	after_provider_response: undefined;
+	tool_call: ToolCallResult | undefined;
+	tool_result: ToolResultPatch | undefined;
+	session_before_compact: SessionBeforeCompactResult | undefined;
+	session_compact: undefined;
+	session_before_tree: SessionBeforeTreeResult | undefined;
+	session_tree: undefined;
+	retry_scheduled: undefined;
+	retry_attempt_start: undefined;
+	retry_finished: undefined;
+	model_update: undefined;
+	thinking_level_update: undefined;
+	resources_update: undefined;
+	tools_update: undefined;
+	queue_update: undefined;
+	save_point: undefined;
+	abort: undefined;
+	settled: undefined;
+};</pre>
+
+<p>22 events, in two categories:</p>
+
+<ul>
+<li><strong>Behavior-affecting</strong> (return values other than <code>undefined</code>): <code>before_agent_start</code>, <code>context</code>, <code>before_provider_request</code>, <code>before_provider_payload</code>, <code>tool_call</code>, <code>tool_result</code>, <code>session_before_compact</code>, <code>session_before_tree</code>. Handlers of these hooks can return a result to change behavior — for example, <code>tool_call</code> returning <code>{ block: true }</code> blocks a tool, and <code>context</code> returns a modified message list.</li>
+<li><strong>Notification-only</strong> (return <code>undefined</code>): <code>after_provider_response</code>, <code>session_compact</code>, <code>retry_scheduled</code>, <code>model_update</code>, <code>tools_update</code>, <code>abort</code>, <code>settled</code>, and others. These merely announce "something happened", for external code to record or sync state.</li>
+</ul>
+
+<p><code>emitHook</code> is the trigger:</p>
+
+<pre class="code" data-lang="ts">private async emitHook&lt;TType extends keyof AgentHarnessEventResultMap&gt;(
+	event: { type: TType } &amp; ...,
+): Promise&lt;AgentHarnessEventResultMap[TType]&gt; {
+	// 依次调用注册的处理器，返回最后一个非 undefined 的结果
+}</pre>
+
+<p>It calls handlers in registration order and returns the <strong>last non-<code>undefined</code> result</strong>. This "last-wins" semantics lets multiple handlers stack, with later ones overriding earlier ones.</p>
+
+<p>Note that this hook system is <strong>strongly typed</strong>: the payload and return type of every event are precisely constrained by <code>AgentHarnessEventResultMap</code>. When you register a <code>tool_call</code> handler, you get full type checking at compile time. This stands in sharp contrast to "runtime hook strings" (<code>hooks.on("PreToolUse", ...)</code>) — where you only find out at runtime whether the event name is spelled correctly or what the payload looks like. In Chapter 14 we'll see that the product layer's extension system inherits this "typed extensions" taste.</p>
+
+<hr class="sep">
+
+<h2 id="persistence">Persistence: Writing at Safe Points</h2>
+
+<p>The Harness persists messages into the session tree, but not every message is written to disk immediately — it uses a write buffer, <code>pendingSessionWrites</code>, flushed in one go at safe points.</p>
+
+<p><code>handleAgentEvent</code> is the harness's event handler (the counterpart of the core <code>Agent</code>'s <code>processEvents</code>). On <code>message_end</code> it records the message into the buffer, and on <code>turn_end</code>/<code>agent_end</code> it flushes:</p>
+
+<pre class="code" data-lang="ts">private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise&lt;void&gt; {
+	// message_end → 记入 pendingSessionWrites
+	// turn_end / agent_end → flushPendingSessionWrites()
+}
+
+private async flushPendingSessionWrites(): Promise&lt;void&gt; {
+	while (this.pendingSessionWrites.length &gt; 0) {
+		const write = this.pendingSessionWrites[0]!;
+		if (write.type === "message") {
+			await this.session.appendMessage(write.message);
+		} else if (write.type === "model_change") {
+			// ...
+		}
+		// 出队，继续
+	}
+}</pre>
+
+<p>Why buffer instead of writing immediately? Because changes can occur mid-run (<code>setModel()</code>, <code>setThinkingLevel()</code>); if written into the session tree immediately, they could interleave with the in-flight message stream and produce inconsistent intermediate states. Buffering them and flushing at safe points like <code>turn_end</code>/<code>agent_end</code>/<code>prepareNextTurn</code> guarantees that session tree writes are ordered and atomic.</p>
+
+<p><code>handleAgentEvent</code> also handles failure fallback — just like the core <code>Agent</code>, unexpected errors are converted into a normal failure event sequence (<code>message_start</code> → <code>message_end</code> → <code>turn_end</code> → <code>agent_end</code>) before being handed to <code>handleRunFailure</code> for persistence. The contract "failure is also a normal event sequence" carries through from the core all the way to the Harness.</p>
+
+<hr class="sep">
+
+<h2 id="compaction">Compaction and Branch Navigation</h2>
+
+<p>The Harness exposes the two session-tree operations mentioned in Chapter 5 as methods: <code>compact()</code> and <code>navigateTree()</code>.</p>
+
+<p><code>compact(customInstructions?)</code> (detailed in Chapter 7) triggers context compaction: it generates a summary, appends a <code>CompactionEntry</code>, and subsequent context builds use "summary + tail". It fires the <code>session_before_compact</code> and <code>session_compact</code> hooks around it and switches the phase to <code>compaction</code>.</p>
+
+<p><code>navigateTree(...)</code> navigates the session tree (branching, backtracking): it may generate a branch summary (<code>BranchSummaryEntry</code>) and then <code>moveTo</code> the target node. It fires the <code>session_before_tree</code> and <code>session_tree</code> hooks around it, with the phase switching to <code>branch_summary</code>. Both require the harness to be <code>idle</code> — you can't modify the tree mid-conversation.</p>
+
+<p>These two methods are the capability outlets of the "session tree" design. Because the transcript is a tree rather than an array, compaction is reversible and branching is free — the Harness merely wraps these low-level capabilities into two high-level operations with hooks and phase protection.</p>
+
+<hr class="sep">
+
+<h2 id="why-not">Why the Product Layer Did Not Use It</h2>
+
+<p>Now let's answer the sharp question: since <code>AgentHarness</code> provides such complete persistent orchestration, why doesn't <code>pi-coding-agent</code> use it, instead building its own 3,333-line <code>AgentSession</code>?</p>
+
+<p>The answer lies in a <strong>mismatch of concerns</strong>. <code>AgentHarness</code> is a <em>generic</em> persistent orchestrator — it cares about session trees, compaction, hooks, built-in tools, skills. But the product layer needs far more than that:</p>
+
+<ul>
+<li>Three operating modes (interactive TUI / print / RPC)</li>
+<li>An extension system (~40 events; registering tools/commands/keybindings/flags)</li>
+<li>Project trust decisions</li>
+<li>Slash commands, model-switching UI, theming</li>
+<li>Settings management, authentication, OAuth</li>
+<li>HTML export, session sharing</li>
+</ul>
+
+<p>These product-level concerns don't overlap with <code>AgentHarness</code>'s generic orchestration concerns. If the product layer forced itself onto <code>AgentHarness</code>, it would either stuff product logic into harness hooks (polluting the generic layer) or wrap the harness in yet another layer (making the harness a redundant middleman).</p>
+
+<p>So the product layer made a sober choice: <strong>sit directly on the core <code>Agent</code> and build its own orchestration.</strong> Recall <code>sdk.ts:294</code> from Chapter 1: <code>agent = new Agent({...})</code> — the product layer instantiates the core <code>Agent</code>, not <code>AgentHarness</code>. It reuses the core's loop and event stream, but handles product orchestration with its own <code>AgentSession</code> and persistence with its own <code>SessionManager</code> (JSONL).</p>
+
+<p>This reveals the real intent behind the two-layer design inside <code>pi-agent-core</code>:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="core-strategies" data-w="780" data-h="320"></canvas></div>
+  <figcaption>Figure 2: The core provides mechanisms; AgentHarness and AgentSession are two parallel orchestration strategies, and SDK users can build their own.</figcaption>
+</figure>
+
+<p>The core provides the <strong>mechanism</strong> (loop, event stream, tool execution, message bridging). <code>AgentHarness</code> is an official <strong>strategy</strong> — "if you want a persistent agent out of the box". <code>AgentSession</code> is the product layer's <strong>other strategy</strong> — "if you want to build a full CLI product". SDK users can entirely write <strong>their own strategy</strong>.</p>
+
+<p>The core doesn't force anyone to choose between <code>AgentHarness</code> and <code>AgentSession</code>, because it doesn't even know the two exist — it only exposes mechanisms. This is the full meaning of "minimal core": <strong>the core is small enough to be reused by any orchestration strategy, including ones the maintainers never imagined.</strong></p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>AgentHarness</code>'s relationship with the core offers four transferable patterns for designing extensible frameworks.</p>
+
+<p><strong>Separate mechanism from policy, and keep the mechanism ignorant of the policy.</strong> The core loop provides slots (mechanism); the Harness and the product each stuff their own logic into the slots (policy); the core knows nothing about the policies. The problem it solves: a framework welds one particular usage into the core, forcing every other usage to contort around it. When the core exposes only mechanism, policies can flourish — a generic Harness, a product Session, and custom SDK usages each get what they need.</p>
+
+<p><strong>Isolate the environment with dependency inversion.</strong> The tools' IO depends on the <code>ExecutionEnv</code> interface rather than <code>node:fs</code>, and every operation returns a <code>Result</code> instead of throwing. The problem it solves: business logic bound to one runtime, with <code>try/catch</code> scattered everywhere. When IO is an interface and failure is a <code>Result</code>, the same tools run in Node, remotely, or in containers, and execution logic stays straightforward.</p>
+
+<p><strong>Connect different abstraction layers with an adapter.</strong> <code>createLoopConfig</code> maps the core's few slots onto the Harness's rich hook system, in the direction "upper layer adapts to lower layer". The problem it solves: changing lower-layer interfaces to satisfy upper-layer needs, breaking the lower layer's stability. When the adaptation direction is right, the lower layer (core loop) stays stable for a long time while the upper layer (hook system) evolves freely.</p>
+
+<p><strong>Make changes take effect at safe points.</strong> Mid-run state modifications are buffered and flushed/take effect atomically at turn boundaries (<code>prepareNextTurn</code>) or at run end (<code>turn_end</code>). The problem it solves: mid-run modifications interleaving with in-flight work and producing inconsistent intermediate states. When changes have a well-defined effective moment, state consistency is guaranteed.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>AgentHarness</code> is the "fully-loaded" layer <code>pi-agent-core</code> provides on top of the minimal core: it inverts IO with <code>ExecutionEnv</code>, protects concurrency with the phase state machine, absorbs mid-run changes with per-turn snapshots, adapts core slots to 22 typed hooks via <code>createLoopConfig</code>, persists at safe points with a write buffer, and exposes the session tree's capabilities through <code>compact()</code>/<code>navigateTree()</code>.</p>
+
+<p>But its deepest lesson isn't in itself — it's in the fact that it was <em>not used by the product</em>. The core provides mechanism, <code>AgentHarness</code> is one strategy, and the product's <code>AgentSession</code> is another — the core, small enough to favor no strategy, can be reused by all of them. This is the full circle of the "minimal core" philosophy.</p>
+
+<p>In the next chapter, we go deep into the Harness's compaction and branch summaries — seeing how Pi Agent squeezes an overgrown context back inside the model's window without deleting history.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("harness-layers", function (d) {
+  d.group({ x: 40, y: 320, w: 310, h: 140, label: "Core (agent.ts / agent-loop.ts)", tone: "teal", fill: d.theme.panel });
+  d.box({ id: "LOOP", x: 70, y: 370, w: 250, h: 56, title: "runAgentLoop", lines: ["Pure nested loops"], tone: "teal", titleSize: 13 });
+
+  d.group({ x: 390, y: 60, w: 430, h: 430, label: "Harness (harness/**)", tone: "accent", fill: d.theme.panel });
+  d.box({ id: "HARNESS", x: 405, y: 180, w: 150, h: 170, title: "AgentHarness", lines: ["Persistent orchestrator"], tone: "gold", titleSize: 13 });
+  d.box({ id: "SESSION", x: 590, y: 80, w: 200, h: 52, title: "Session tree", lines: ["Persistent transcript"], tone: "violet", titleSize: 13 });
+  d.box({ id: "HOOKS", x: 590, y: 150, w: 200, h: 52, title: "Hook system", lines: ["22 events"], tone: "violet", titleSize: 13 });
+  d.box({ id: "COMPACT", x: 590, y: 220, w: 200, h: 52, title: "Compaction + branch summaries", tone: "slate", titleSize: 13 });
+  d.box({ id: "TOOLS", x: 590, y: 290, w: 200, h: 52, title: "Built-in tools", lines: ["bash/read/edit/write"], tone: "slate", titleSize: 13 });
+  d.box({ id: "ENV", x: 590, y: 360, w: 200, h: 52, title: "ExecutionEnv", lines: ["IO inversion"], tone: "teal", titleSize: 13 });
+  d.box({ id: "SKILLS", x: 590, y: 430, w: 200, h: 52, title: "Skills + prompt templates", tone: "slate", titleSize: 13 });
+
+  d.arrow("HARNESS", "LOOP", { from: "left", to: "right" });
+  d.arrow("HARNESS", "SESSION", { from: "right", to: "left" });
+  d.arrow("HARNESS", "HOOKS", { from: "right", to: "left" });
+  d.arrow("HARNESS", "COMPACT", { from: "right", to: "left" });
+  d.arrow("HARNESS", "TOOLS", { from: "right", to: "left" });
+  d.arrow("HARNESS", "ENV", { from: "right", to: "left" });
+  d.arrow("HARNESS", "SKILLS", { from: "right", to: "left" });
+  d.arrow("TOOLS", "ENV", { from: "bottom", to: "top" });
+});
+
+PB.fig("core-strategies", function (d) {
+  d.box({ id: "CORE", x: 250, y: 36, w: 280, h: 76, title: "Core Agent + runAgentLoop", lines: ["Mechanism: loop + event stream"], tone: "accent", titleSize: 13.5 });
+  d.box({ id: "HARNESS", x: 30, y: 190, w: 220, h: 86, title: "AgentHarness", lines: ["One strategy: generic persistence"], tone: "gold", titleSize: 13 });
+  d.box({ id: "SESSION", x: 280, y: 190, w: 220, h: 86, title: "AgentSession", lines: ["Another strategy: product-level"], tone: "teal", titleSize: 13 });
+  d.box({ id: "SDKUSER", x: 530, y: 190, w: 220, h: 86, title: "SDK users", lines: ["Your own strategy"], tone: "slate", titleSize: 13 });
+
+  d.arrow("CORE", "HARNESS", { from: "bottom", to: "top" });
+  d.arrow("CORE", "SESSION", { from: "bottom", to: "top" });
+  d.arrow("CORE", "SDKUSER", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

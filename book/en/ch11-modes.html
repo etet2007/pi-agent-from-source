@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 11 · Three Operating Modes | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch11">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part IV · Coding Agent Product</p>
+  <h1>Chapter 11: Three Operating Modes</h1>
+  <p class="chapter-sub">Three projections of the same Agent implementation — interactive TUI, headless print, and RPC — each consuming the same AgentSessionEvent stream</p>
+</header>
+
+<h2 id="hook">One Stream, Three Presentations</h2>
+
+<p>In Chapter 8 we saw <code>resolveAppMode</code> split the <code>pi</code> command into three modes: interactive TUI, headless print, and RPC. In Chapter 9 we saw that all three modes share the same <code>AgentSession</code>, subscribing to the same <code>AgentSessionEvent</code> stream.</p>
+
+<p>This chapter is about where that fork leads: how each mode consumes the event stream. Their core logic is nearly identical — "subscribe to events, drive <code>prompt()</code>, handle results" — but the presentation differs completely: one renders a colored terminal UI for humans, one emits plain text or JSON for scripts, and one serializes to JSON-RPC for IDEs and daemons.</p>
+
+<p>This is the payoff of the "event stream as contract" design. Because <code>AgentSession</code> expresses all progress as events, adding a new "way of consuming" requires touching no Agent logic at all — just writing a new event subscriber. Pi Agent's three modes are three instantiations of this principle.</p>
+
+<hr class="sep">
+
+<h2 id="base">The Shared Foundation</h2>
+
+<p>All three modes start from the same point: <code>AgentSessionRuntime</code> (the runtime host from Chapter 8). It holds an <code>AgentSession</code> and supports rebuilding (reload, switching sessions). A mode obtains the runtime, takes the <code>AgentSession</code> out of it, and then:</p>
+
+<ol>
+<li>Subscribes via <code>session.subscribe(listener)</code> — the listener receives <code>AgentSessionEvent</code>s</li>
+<li>Drives <code>session.prompt(text)</code> (or steer/followUp)</li>
+<li>Handles events in the listener — this is the only point where the three modes diverge</li>
+</ol>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="modes" data-w="880" data-h="560"></canvas></div>
+  <figcaption>Figure 1: Three ways of consuming the same AgentSessionEvent stream — rendered into a TUI for humans, written to stdout for scripts, serialized to JSON-RPC for IDEs and daemons.</figcaption>
+</figure>
+
+<p>Let's look at each one.</p>
+
+<hr class="sep">
+
+<h2 id="interactive">Interactive Mode: <code>InteractiveMode</code></h2>
+
+<p>Interactive mode is the full TUI REPL for humans, implemented in <code>packages/coding-agent/src/modes/interactive/interactive-mode.ts</code> (roughly 6,100 lines — the largest file in the product layer):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/interactive/interactive-mode.ts">export function createInteractiveTui(options: InteractiveTuiOptions): TUI { ... } // :339
+
+export class InteractiveMode {
+	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {})
+	async init(): Promise&lt;void&gt;;
+	async run(): Promise&lt;void&gt;;          // :886 REPL 主循环
+	renderInitialMessages(): void;
+	async getUserInput(): Promise&lt;string&gt;; // :3575
+	stop(): void;
+	private async handleEvent(event: AgentSessionEvent): Promise&lt;void&gt;; // :2910
+	// 大量斜杠命令处理器：handleModelCommand, handleCompactCommand, ...
+}</pre>
+
+<p><code>run()</code> is the REPL main loop, roughly shaped like this:</p>
+
+<pre class="code" data-lang="text">订阅 session 事件 → handleEvent
+渲染初始消息（续接的会话）
+while (true) {
+	const input = await getUserInput()   // 等用户输入
+	if (是斜杠命令) 处理命令
+	else session.prompt(input)           // 驱动对话
+	await session.waitForIdle()          // 等这一轮结束
+}</pre>
+
+<p>The key is <code>handleEvent</code> (<code>:2910</code>) — it translates each <code>AgentSessionEvent</code> into TUI components. This is the core work of interactive mode:</p>
+
+<ul>
+<li><code>message_start</code>/<code>message_update</code> (assistant message) → incrementally render assistant text (Markdown highlighting)</li>
+<li><code>tool_execution_start</code>/<code>update</code>/<code>end</code> → render tool calls (using the Chapter 4 tools' <code>renderCall</code>/<code>renderResult</code>, e.g. edit's colored diff)</li>
+<li><code>compaction_start</code>/<code>end</code> → show compaction progress</li>
+<li><code>auto_retry_start</code> → show "retrying"</li>
+<li><code>queue_update</code> → show queued messages</li>
+<li><code>thinking_level_changed</code>/model change → update the footer</li>
+</ul>
+
+<p><code>createInteractiveTui</code> builds the underlying <code>pi-tui</code> <code>TUI</code> (Chapter 12), and <code>InteractiveMode</code> adds roughly 45 components to it (<code>src/modes/interactive/components/</code>): <code>assistant-message</code>, <code>tool-execution</code>, <code>bash-execution</code>, <code>diff</code>, <code>footer</code>, <code>model-selector</code>, <code>session-selector</code>, <code>trust-selector</code>, <code>compaction-summary-message</code>, and more.</p>
+
+<p>Slash commands are handled here. Once <code>getUserInput</code> has the input, if it is a command like <code>/model</code>, <code>/compact</code>, or <code>/export</code>, the corresponding <code>handleXxxCommand</code> is invoked; otherwise the input goes to <code>session.prompt()</code> (the funnel from Chapter 9 further handles extension commands, skills, and templates).</p>
+
+<p>Interactive mode also manages a host of interaction details: Ctrl+P to cycle models (<code>session.cycleModel</code>), Ctrl+C to abort (<code>session.abort()</code>), image pasting, external editor (<code>external-editor.ts</code>), model search (<code>model-search.ts</code>), themes (<code>theme/</code>). All of these exist only because the mode is "for humans" — they make up most of the product's code, yet not a single line touches the core Agent logic.</p>
+
+<hr class="sep">
+
+<h2 id="print">Print Mode: <code>runPrintMode</code></h2>
+
+<p>Print mode is headless, for scripts and pipes. Implemented in <code>packages/coding-agent/src/modes/print-mode.ts</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/print-mode.ts">export interface PrintModeOptions {
+	/** Output mode: "text" for final response only, "json" for all events */
+	mode: "text" | "json";
+	messages: string[];
+	initialMessage?;
+	initialImages?;
+}
+export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise&lt;number&gt;</pre>
+
+<p>It returns an exit code (<code>Promise&lt;number&gt;</code>) — this is for the shell; <code>pi -p "..." &amp;&amp; echo success</code> depends on it.</p>
+
+<p>Two output modes:</p>
+
+<ul>
+<li><strong><code>text</code></strong>: runs the conversation and outputs only the final assistant text (via <code>session.getLastAssistantText()</code>). This is the default behavior of <code>pi -p "fix the bug"</code> — a clean result, well suited to command substitution like <code>$(pi -p "...")</code>.</li>
+<li><strong><code>json</code></strong>: streams <strong>all</strong> <code>AgentSessionEvent</code>s out as JSON lines (JSON Lines). This is the behavior of <code>--mode json</code> — one JSON line per event, letting machines parse the entire conversation in real time.</li>
+</ul>
+
+<p><code>json</code> mode is especially useful: it serializes the event stream that interactive mode "renders to the screen" into structured data, verbatim. External programs can track tool calls, token usage, and compaction events in real time, without parsing terminal ANSI sequences.</p>
+
+<p>Print mode's event consumption is far simpler than interactive's — it subscribes to events, cares only about the final assistant message in <code>text</code> mode, and writes each event to stdout after <code>JSON.stringify</code> in <code>json</code> mode. No TUI, no components, no keybindings. It demonstrates another benefit of the event stream: <strong>a consumer can care only about the events it needs</strong> and ignore the rest.</p>
+
+<hr class="sep">
+
+<h2 id="rpc">RPC Mode: <code>runRpcMode</code></h2>
+
+<p>RPC mode is for machines — IDE integration, daemons (Chapter 15's <code>pi-server</code> spawns a <code>pi --mode rpc</code> child process). Implemented in <code>packages/coding-agent/src/modes/rpc/rpc-mode.ts</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/rpc/rpc-mode.ts">export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise&lt;never&gt;</pre>
+
+<p>Note the return type <code>Promise&lt;never&gt;</code> — it never returns. RPC mode enters an infinite loop, reading commands from stdin and writing responses and events to stdout, until the peer closes the connection.</p>
+
+<p>The protocol is <strong>JSON Lines over stdin/stdout</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/modes/rpc/rpc-mode.ts">const handleCommand = async (command: RpcCommand): Promise&lt;RpcResponse | undefined&gt; =&gt; { ... }; // :385
+// 读循环：
+parsed = JSON.parse(line);   // :750 每行一个 JSON 命令
+const command = parsed as RpcCommand;</pre>
+
+<p><code>RpcCommand</code> (<code>packages/coding-agent/src/modes/rpc/rpc-types.ts</code>) is the command vocabulary:</p>
+
+<pre class="code" data-lang="text" data-file="packages/coding-agent/src/modes/rpc/rpc-types.ts">prompt, steer, follow_up, abort,
+new_session, get_state, set_model, cycle_model, set_thinking_level,
+compact, bash, switch_session, fork, clone, get_tree, get_messages, set_session_name, ...</pre>
+
+<p>Each command maps to a method on <code>AgentSession</code>. <code>handleCommand</code> is a large dispatcher: a <code>prompt</code> command calls <code>session.prompt()</code>, <code>set_model</code> calls <code>session.setModel()</code>, <code>compact</code> calls <code>session.compact()</code>. Responses (<code>RpcResponse</code>) and events (<code>AgentSessionEvent</code>) are both written back to stdout as JSON lines.</p>
+
+<p>RPC mode also has an <code>extension_ui_request</code>/<code>extension_ui_response</code> mechanism — an extension may need to pop up a picker or an input box inside the IDE (Chapter 14). These UI requests go over RPC to the peer (the IDE), which renders them and sends the user's selection back. This way, extension UI can cross process boundaries too.</p>
+
+<p>RPC mode is the ultimate expression of "event stream as contract": it exposes the entire <code>AgentSession</code>'s capabilities as a set of JSON commands, letting any program that can spawn a process and read/write stdin/stdout drive a full pi Agent. That is exactly what Chapter 15's daemon does.</p>
+
+<hr class="sep">
+
+<h2 id="compare">Comparing the Three Modes</h2>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th>Interactive</th><th>print</th><th>RPC</th></tr></thead>
+<tbody>
+<tr><td>Entry</td><td><code>InteractiveMode.run()</code></td><td><code>runPrintMode()</code></td><td><code>runRpcMode()</code></td></tr>
+<tr><td>Serves</td><td>Humans</td><td>Scripts / pipes</td><td>IDE / daemon</td></tr>
+<tr><td>Triggered by</td><td>Default (dual TTY)</td><td><code>-p</code> or non-TTY</td><td><code>--mode rpc</code></td></tr>
+<tr><td>Input</td><td>TUI editor</td><td>CLI args / stdin</td><td>stdin JSON commands</td></tr>
+<tr><td>Output</td><td>Terminal (TUI rendering)</td><td>stdout (text/json)</td><td>stdout JSON lines</td></tr>
+<tr><td>Event consumption</td><td>Rendered into ~45 components</td><td>text takes final text / json serializes everything</td><td>Serialized as RPC events</td></tr>
+<tr><td>Lifecycle</td><td>Until <code>/quit</code></td><td>Exits when done (returns exit code)</td><td>Never returns (<code>Promise&lt;never&gt;</code>)</td></tr>
+<tr><td>Slash commands</td><td>Handled interactively</td><td>N/A</td><td>Via RPC commands</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The three modes differ enormously in code size — interactive is 6,100 lines, print a few hundred, RPC a bit over a thousand. Yet their <strong>core logic</strong> (subscribing to events, driving prompt) is nearly identical. All of the size difference comes from "how to present": interactive renders a rich UI and handles keyboard interaction; print just writes text; RPC just serializes JSON.</p>
+
+<p>This distribution is itself a sign of architectural health: <strong>complexity is concentrated in "interacting with humans", not "interacting with the Agent".</strong> Because Agent interaction is fully encapsulated by <code>AgentSession</code> and the event stream, each mode only has to handle its own presentation layer.</p>
+
+<hr class="sep">
+
+<h2 id="why">Why This Matters</h2>
+
+<p>Let's step back and look at the value of this design.</p>
+
+<p>Suppose Pi Agent had tangled UI logic with Agent logic from the start — like many agents do, calling the model directly and printing output directly inside the REPL loop. Then:</p>
+
+<ul>
+<li>Want a headless mode? You'd have to strip the UI code out of the REPL.</li>
+<li>Want IDE integration? You'd have to rewrite a driver loop without the UI.</li>
+<li>Want a daemon? You'd have to rewrite it all over again.</li>
+</ul>
+
+<p>Each time you'd reimplement the logic of "calling the model, executing tools, managing state", and each copy could drift into subtly different behavior from the main loop.</p>
+
+<p>Pi Agent's approach avoids all of this. <code>AgentSession</code> is the single home of Agent logic; it expresses progress as <code>AgentSessionEvent</code>s; modes are merely consumers of events. So:</p>
+
+<ul>
+<li>Adding a headless mode = writing a subscriber that only outputs text (<code>runPrintMode</code>)</li>
+<li>Adding IDE integration = writing a subscriber that serializes events to JSON-RPC (<code>runRpcMode</code>)</li>
+<li>Adding a daemon = spawning an RPC child process (Chapter 15)</li>
+</ul>
+
+<p>The three modes are not "three Agent implementations" but "three projections of a single Agent implementation". This is the final fulfillment, at the product layer, of Chapter 3's "the loop emits events, upper layers reduce" architecture.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's three modes offer four transferable patterns for "how to let one system serve multiple ways of use".</p>
+
+<p><strong>Event stream as contract, modes as projections.</strong> Express all progress of the system as one event stream; every way of use is just a consumer/projection of that stream. The problem it solves: each new way of use would otherwise force rewriting the core logic, letting multiple implementations drift apart. When the core only emits events, adding a mode is just adding a subscriber, and the core logic always exists in a single copy.</p>
+
+<p><strong>Let consumers care only about the events they need.</strong> Print's text mode takes only the final assistant text and ignores intermediate events; interactive renders every event. The problem it solves: consumers being forced to handle events they don't care about. When the event stream is fine-grained, each consumer takes what it needs.</p>
+
+<p><strong>Express lifecycle semantics in the return type.</strong> Print returns <code>Promise&lt;number&gt;</code> (an exit code), RPC returns <code>Promise&lt;never&gt;</code> (never exits). The problem it solves: callers not knowing a mode's lifecycle. When the return type itself says "I will exit and give you an exit code" or "I never return", misuse becomes much harder.</p>
+
+<p><strong>Concentrate complexity where it is genuinely complex.</strong> All of the size difference among the three modes comes from "interacting with humans" (UI), not "interacting with the Agent". The problem it solves: core logic getting drowned in UI complexity, becoming hard to test and reuse. When Agent interaction is fully encapsulated, complexity stays only where it belongs — the presentation layer.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's three operating modes — interactive TUI, headless print, RPC — share the same <code>AgentSession</code> and the same <code>AgentSessionEvent</code> stream, differing only in how they consume it. Interactive mode (6,100 lines) renders events into roughly 45 TUI components for humans; print mode outputs events as plain text or JSON lines for scripts and returns an exit code; RPC mode exposes <code>AgentSession</code>'s capabilities as a JSON command vocabulary, serializes events for IDEs and daemons, and never returns.</p>
+
+<p>Their core logic is nearly identical; all the size difference comes from the presentation layer. This is the final fulfillment of the "event stream as contract" design: the three modes are not three Agent implementations but three projections of one. Adding a new way of use only requires adding a new event subscriber.</p>
+
+<p>This concludes Part IV. We have covered the full product layer: from startup in <code>cli.ts</code> (Chapter 8), to orchestration in <code>AgentSession</code> (Chapter 9), to system prompt assembly (Chapter 10), to the three modes' consumption (Chapter 11). In the next part, we dive into that repeatedly mentioned <code>pi-tui</code> — a fully homegrown terminal renderer — to see what kind of rendering engine lies beneath those interactive-mode components.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("modes", function (d) {
+  d.box({ id: "rt", x: 330, y: 36, w: 220, h: 52, title: "AgentSessionRuntime", tone: "accent", titleSize: 13 });
+  d.box({ id: "as", x: 330, y: 136, w: 220, h: 62, title: "AgentSession", lines: ["session.subscribe(...)"], tone: "gold", titleSize: 13 });
+  d.box({ id: "im", x: 40, y: 268, w: 240, h: 68, title: "InteractiveMode", lines: ["Renders to TUI"], tone: "teal", titleSize: 13 });
+  d.box({ id: "pm", x: 320, y: 268, w: 240, h: 68, title: "runPrintMode", lines: ["Writes stdout (text/json)"], tone: "violet", titleSize: 13 });
+  d.box({ id: "rm", x: 600, y: 268, w: 240, h: 68, title: "runRpcMode", lines: ["Serializes JSON-RPC"], tone: "violet", titleSize: 13 });
+  d.box({ id: "u1", x: 40, y: 410, w: 240, h: 52, title: "Human", tone: "accent", titleSize: 13 });
+  d.box({ id: "u2", x: 320, y: 410, w: 240, h: 52, title: "Scripts / pipes", tone: "slate", titleSize: 13 });
+  d.box({ id: "u3", x: 600, y: 410, w: 240, h: 52, title: "IDE / daemon", tone: "slate", titleSize: 13 });
+
+  d.arrow("rt", "as", { from: "bottom", to: "top" });
+  d.arrow("as", "im", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("as", "pm", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("as", "rm", { from: "bottom", to: "top", label: "AgentSessionEvent" });
+  d.arrow("im", "u1", { from: "bottom", to: "top" });
+  d.arrow("pm", "u2", { from: "bottom", to: "top" });
+  d.arrow("rm", "u3", { from: "bottom", to: "top" });
+
+  d.text("Three modes share one event stream; only presentation differs", 440, 520, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

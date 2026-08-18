@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 16 · Behavioral Evaluation: pi-evals | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch16">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part VII · Quality &amp; Conclusion</p>
+  <h1>Chapter 16: Behavioral Evaluation: pi-evals</h1>
+  <p class="chapter-sub">Turning "is my agent getting better" from a feeling into a number: isolated environments, comparison matrices, model judges, and lift metrics</p>
+</header>
+
+<h2 id="hook">How Do You Know It Got Better</h2>
+
+<p>Across the previous 15 chapters, we looked at how an agent is built. But there is an equally fundamental question: <strong>how do you know you improved it?</strong></p>
+
+<p>Testing traditional software is deterministic: give an input, assert on the output. But an agent is not. You change one sentence in the system prompt, switch models, or add a tool: how will its behavior change? Will it get better on some tasks and worse on others? Will it trade more tokens for higher accuracy? Unit tests cannot answer these questions, because agent behavior is <strong>emergent and non-deterministic</strong> — run the same prompt twice and the paths may differ.</p>
+
+<p><code>pi-evals</code> (<code>packages/evals</code>) is Pi Agent's answer to this question. Its README states it plainly:</p>
+
+<blockquote>
+<p>Pi evals are behavioral, model-backed checks for Pi workflows.</p>
+</blockquote>
+
+<p>Behavioral, model-backed: those are the key words. It doesn't mock the model or pretend determinism; instead it <strong>actually runs an agent</strong>, judges the output with a model, and then does rigorous comparisons between baseline and candidate. This chapter dissects the evaluation framework and shows how it turns "is my agent getting better" from a feeling into a number.</p>
+
+<p>For an agent whose philosophy is minimalism, this framework matters even more: as you constantly weigh whether a feature belongs in the core, you need an objective referee to tell you whether a given change helps or hurts.</p>
+
+<hr class="sep">
+
+<h2 id="harness">The Core Abstraction: harness</h2>
+
+<p><code>pi-evals</code> builds on the third-party framework <code>vitest-evals</code> and adapts it to pi. The core adapter is <code>createPiCodingAgentHarness</code> (<code>packages/evals/src/pi-harness.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/pi-harness.ts">export function createPiCodingAgentHarness&lt;TOutput extends JsonValue&gt;(
+	options: PiCodingAgentHarnessWithOutput&lt;TOutput&gt;,
+): Harness&lt;PiCodingAgentInput, TOutput&gt;;
+export function createPiCodingAgentHarness(options?: PiCodingAgentHarnessOptions): Harness&lt;PiCodingAgentInput, string&gt;;</pre>
+
+<p>It returns a <code>Harness</code>, a <code>vitest-evals</code> concept: essentially an evaluable unit that takes input and produces output. The options include:</p>
+
+<pre class="code" data-lang="ts">{
+	name: string;
+	model: { provider: string; id: string };
+	noTools?: ...;
+	transformSystemPrompt?: (defaultPrompt: string) =&gt; string; // 变换系统提示词
+	output?: ({ response, session }) =&gt; TOutput;               // 自定义输出提取
+}</pre>
+
+<p>The input type (<code>PiCodingAgentInput</code>) can be a single prompt, or a sequence of steps:</p>
+
+<pre class="code" data-lang="ts">export type PiCodingAgentInput = string | Array&lt;{ type: "prompt"; content: string } | { type: "reload" }&gt;;</pre>
+
+<p>The <code>{ type: "reload" }</code> step is useful: it lets an eval "first have the agent create a resource, then reload the resource, then have the agent use it". We'll see this pattern in the extensions eval shortly.</p>
+
+<p><code>transformSystemPrompt</code> is the key to controlled experiments: it takes the default system prompt and returns a transformed version. You can then build two harnesses, one with the full prompt and one with a section removed, and compare their performance. That is exactly the rigorous way to test "does my prompt change help".</p>
+
+<hr class="sep">
+
+<h2 id="run">Running a Real Agent</h2>
+
+<p><code>runPiCodingAgent</code> (<code>packages/evals/src/pi-harness.ts:109</code>) is the real workflow. It doesn't reuse any existing session; instead it runs a brand-new <code>AgentSession</code> in a <strong>fully isolated environment</strong>:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="workflow" data-w="900" data-h="1000"></canvas></div>
+  <figcaption>Figure 1: The full workflow of a single eval run: resolve model → build isolated environment → run prompt/reload steps → assert and snapshot → cleanup; the transformSystemPrompt branch decides where the system prompt comes from.</figcaption>
+</figure>
+
+<p>A few design decisions are worth noting.</p>
+
+<p><strong>Full isolation.</strong> Each eval runs in a temporary directory created with <code>mkdtemp</code>, with its own <code>workspace/</code> (the project the agent operates on) and <code>agent/</code> (config/session). <code>SettingsManager.inMemory()</code> avoids reading or writing real settings. The temporary directory is removed when done. This guarantees evals don't interfere with each other and don't pollute the developer's real environment.</p>
+
+<p><strong><code>thinkingLevel: "off"</code>.</strong> Evals turn thinking off by default, to reduce non-determinism, lower cost, and speed up evaluation. It is a choice that evaluation focuses on behavior rather than the reasoning process.</p>
+
+<p><strong>Assert <code>stopReason === "stop"</code>.</strong> After each prompt step, it asserts the response completed normally (not error/aborted/length). If the agent fails to complete normally, the eval fails; this is a basic sanity check.</p>
+
+<p><strong>Customizable output extraction.</strong> The default output is <code>getLastAssistantText()</code> (the last assistant message text). The <code>output</code> option lets you customize this, for example to extract structured data from the session state.</p>
+
+<p><strong>Session snapshot as artifact.</strong> When done, the entire session's JSONL is snapshotted as a test artifact (<code>PI_SESSION_SNAPSHOT_ARTIFACT = "piSessionJsonl"</code>). This means every eval run leaves a complete, replayable session record: you can open it to see exactly what the agent did, which tools it called, and how many tokens it spent.</p>
+
+<hr class="sep">
+
+<h2 id="comparison">Controlled Experiments: <code>evalHarnessTable</code></h2>
+
+<p>A single harness run only tells you what it did. To answer "is it better than before", you need <strong>comparison</strong>. <code>evalHarnessTable</code> (<code>packages/evals/src/vitest-evals/harness-table.ts</code>) builds a baseline × candidate comparison matrix:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/vitest-evals/harness-table.ts">evalHarnessTable(evalSet, {
+	baseline,        // 基准 harness
+	candidate | candidates, // 候选 harness（可以有多个）
+	repetitions?,    // 每组重复次数
+}): EvalHarnessTableRow[]</pre>
+
+<p>It expands every harness × input × repetition into a row and runs them with Vitest's <code>describe.for(...)</code>. Each run is tagged with an <code>EVAL_HARNESS_ITERATION_ARTIFACT</code> (evalSet, groupKey, harness, baseline, candidates, repetition) so runs can be paired later.</p>
+
+<p><code>deriveEvalGroupKey(input, repetition)</code> pairs observations by "input id (or SHA-256 of the input JSON) + repetition number", so baseline and candidate are compared on <strong>exactly the same input and repetition</strong>. <code>canonicalizeJson</code> enforces JSON canonicalization (finite numbers, no cycles, sorted keys), ensuring the same input yields the same key.</p>
+
+<p><code>repetitions</code> matters: because agent behavior is non-deterministic, a single run could be luck. Repeating multiple times is the only way to distinguish "genuinely better" from "just lucky this time".</p>
+
+<hr class="sep">
+
+<h2 id="judge">Judging: score and judge</h2>
+
+<p>Every eval run produces a score. <code>vitest-evals</code>'s convention is: <strong>score &gt;= 1 counts as passing.</strong> A score can come from:</p>
+
+<ul>
+<li><strong>Deterministic judging</strong>: check whether the output satisfies hard conditions.</li>
+<li><strong>Model judging</strong>: use another LLM to judge output quality (model-backed).</li>
+</ul>
+
+<p><code>extensions.eval.ts</code> is a good example of deterministic judging. It evaluates whether the agent can correctly author a pi extension, scoring it with a deterministic <code>ExtensionAuthoringJudge</code> (<code>createJudge</code>) that checks:</p>
+
+<ul>
+<li>The generated extension imports <code>@earendil-works/pi-coding-agent</code> (not the outdated <code>@mariozechner/</code> or <code>@sinclair/typebox</code>)</li>
+<li>The extension loads without errors</li>
+<li>A <code>hello</code> tool is registered</li>
+<li><code>hello({ name: "Bob" })</code> returns <code>"Hello, Bob!"</code></li>
+</ul>
+
+<p>This eval's input is a step sequence: create the extension → <code>reload</code> → use the extension. It uses <code>judgeThreshold: null</code>, so a low score counts as an "observation" rather than a "failure". This is a subtle but important design: an exploratory eval (where you're still learning about baseline performance) shouldn't turn the test red just because scores are low; it should serve as data collection.</p>
+
+<p><code>smoke.eval.ts</code>, on the other hand, is the simplest end-to-end check: it runs a factual question with <code>noTools: "all"</code>, asserts the output is "Paris", and checks usage metadata. It verifies that the evaluation framework itself works.</p>
+
+<hr class="sep">
+
+<h2 id="metrics">Metrics: lift and Paired Differences</h2>
+
+<p>After the controlled experiment runs, <code>summarizeHarnessComparisons</code> (<code>packages/evals/src/vitest-evals/summary.ts</code>) computes two kinds of metrics.</p>
+
+<p><strong>Correctness lift</strong> (<code>CorrectnessLiftSummary</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/evals/src/vitest-evals/summary.ts">export type CorrectnessLiftSummary = {
+	eligiblePairs: number;
+	baselinePassRate: number | null;
+	candidatePassRate: number | null;
+	lift: number | null; // candidatePassRate - baselinePassRate
+};</pre>
+
+<p><code>lift = candidatePassRate - baselinePassRate</code>, measured in percentage points (pp). If the candidate harness's pass rate is 12 points higher than baseline, lift is +12pp. This is the direct answer to "how much did my change improve correctness".</p>
+
+<p><strong>Paired metric differences</strong> (<code>PairedMetricSummary</code>): for <code>totalTokens</code>, <code>totalMs</code> (latency), and <code>estimatedCostUsd</code> (cost), it computes the paired differences between baseline and candidate. This answers "how much extra token/time/money did the accuracy gain cost".</p>
+
+<p>The report (<code>formatHarnessComparisonReport</code>) renders these as colored terminal output:</p>
+
+<pre class="code" data-lang="text">correctness: +12.0 pp (candidate 85%, baseline 73%)
+totalTokens: +1,234 (candidate ..., baseline ...)
+estimatedCostUsd: +$0.05 (...)</pre>
+
+<p>It also diagnoses incomplete observations: <code>missing-observation</code>, <code>duplicate-observation</code>, <code>harness-error</code>, <code>missing-score</code>, <code>unscorable-outcome</code>. These diagnostics tell you which comparison pairs failed to produce valid data, so you aren't misled by incomplete statistics.</p>
+
+<p>So "is switching this model / changing this prompt sentence / adding this tool worth it" becomes a multi-dimensional objective judgment: the correctness lift is positive, but how much did tokens and cost go up? If accuracy is +5pp but cost doubles, it may not be worth it; if accuracy is +5pp and cost stays flat, that's a net improvement.</p>
+
+<hr class="sep">
+
+<h2 id="minimal">Why This Matters Especially for a Minimal Agent</h2>
+
+<p>Back to the book's main thread. Pi Agent's core philosophy is minimalism: constantly pushing features out of the core. But every such tradeoff demands an answer: did this decision make the agent better or worse?</p>
+
+<p>For example:</p>
+
+<ul>
+<li>If you remove a guideline from the default prompt (to make it leaner), does agent performance degrade? <code>extensions.eval.ts</code> tests exactly this: it compares the "full prompt" against a prompt with the Guidelines/documentation sections removed.</li>
+<li>Is it better to activate 4 tools by default or 7?</li>
+<li>Switch to a cheaper model: how much accuracy is lost? How much cost is saved?</li>
+<li>Add a skill: is it actually used effectively?</li>
+</ul>
+
+<p>None of these questions has an a priori answer. <code>pi-evals</code> provides an <strong>objective referee</strong>: build a baseline and a candidate, run the controlled experiment, and look at lift and cost differences. Minimalism then stops being a matter of faith and becomes a testable hypothesis: if removing something shows lift ≈ 0 and lower cost, delete it with confidence; if lift is negative, keep it.</p>
+
+<p>This is a model of data-driven architecture decisions. Many agent projects tune prompts and tool sets by intuition; Pi Agent turns that tuning into repeatable, comparable, quantifiable experiments. The <code>evals</code> package is <code>private: true</code>; it isn't shipped to users but is purely development-time quality infrastructure. Its existence is what lets the whole project keep making minimalism tradeoffs with confidence.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>pi-evals</code> offers four transferable patterns for evaluating a non-deterministic agent.</p>
+
+<p><strong>Evaluate with a real model, not a mock.</strong> An eval really runs an <code>AgentSession</code>, really calls the model, really executes tools. The problem it solves: mocking the model can only test what you <em>think</em> it will do, not what it <em>actually</em> does. When evaluation is model-backed, you're measuring real emergent behavior rather than your assumptions. The cost is that evals are slow, expensive, and non-deterministic, but for the question "is the behavior correct", there is no cheaper shortcut.</p>
+
+<p><strong>Isolation + replayable artifacts.</strong> Every eval runs in a temporary directory with in-memory settings, and the directory is deleted afterward, but the session JSONL is snapshotted as an artifact. The problem it solves: evals interfering with each other, polluting the real environment, and leaving nothing to investigate after a failure. When every run is isolated yet leaves a complete record, evals are both repeatable and debuggable.</p>
+
+<p><strong>Comparison + repetition: turn a "feeling" into a "number".</strong> A baseline × candidate matrix, paired on identical inputs, repeated many times, computing correctness lift and token/cost paired differences. The problem it solves: a single run's result may be luck, and "it got better" is a vague feeling. When comparisons are paired, repeated, and lift is quantified, improvement becomes a statistically verifiable fact.</p>
+
+<p><strong>Drive architecture tradeoffs with evaluation.</strong> Use evals to verify whether removing or simplifying something hurts behavior, making minimalism a testable hypothesis rather than a matter of faith. The problem it solves: architecture tradeoffs made by intuition, where you can't tell if removing something was a mistake. When every tradeoff is judged by an eval, "staying minimal" has an objective basis: a way of combining engineering taste with engineering discipline.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>pi-evals</code> is Pi Agent's behavioral evaluation framework: <code>createPiCodingAgentHarness</code> adapts a real <code>AgentSession</code> into a <code>vitest-evals</code> harness that runs in a fully isolated temporary environment (in-memory settings, thinking off, session snapshotted as an artifact); <code>evalHarnessTable</code> builds a baseline × candidate comparison matrix with multiple repetitions; judging uses a deterministic judge or a model judge, and score &gt;= 1 counts as passing; <code>summary</code> computes correctness lift (in percentage points) and token/latency/cost paired differences, rendered into a comparison report.</p>
+
+<p>It isn't shipped to users (<code>private: true</code>), yet it is what lets the whole project keep making minimalism tradeoffs with confidence: every "should the core add/remove this" decision can be judged objectively by it. It is the infrastructure that turns minimalism from a matter of faith into a testable hypothesis.</p>
+
+<p>In the next chapter, we close the book: we review Pi Agent's six architectural bets, distill transferable lessons, and examine the costs and limits of the minimalist path.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("workflow", function (d) {
+  var BX = 280, BW = 340;
+
+  d.box({ id: "A", x: BX, y: 24, w: BW, h: 58, title: "Resolve model", lines: ["(options or PI_PROVIDER/PI_MODEL)"], tone: "accent", titleSize: 13, size: 11.5 });
+  d.box({ id: "B", x: BX, y: 104, w: BW, h: 44, title: "Create ModelRuntime", tone: "accent", titleSize: 13 });
+  d.box({ id: "C", x: BX, y: 170, w: BW, h: 58, title: "mkdtemp isolated root", lines: ["workspace/ + agent/"], tone: "teal", titleSize: 13, size: 11.5 });
+  d.box({ id: "D", x: BX, y: 250, w: BW, h: 58, title: "createAgentSessionServices", lines: ["(SettingsManager.inMemory)"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "E", x: BX, y: 330, w: BW, h: 44, title: "Create SessionManager", tone: "teal", titleSize: 13 });
+  d.box({ id: "F", x: BX, y: 396, w: BW, h: 58, title: "createAgentSessionFromServices", lines: ["(thinkingLevel: off)"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "G", x: BX, y: 476, w: BW, h: 52, title: "transformSystemPrompt?", tone: "gold", titleSize: 13.5 });
+  d.box({ id: "H", x: 640, y: 550, w: 240, h: 44, title: "Transform + reload prompt", tone: "violet", titleSize: 13 });
+  d.box({ id: "I", x: 60, y: 550, w: 200, h: 44, title: "Use default", tone: "slate", titleSize: 13 });
+  d.box({ id: "J", x: BX, y: 620, w: BW, h: 44, title: "Run prompt/reload steps", tone: "teal", titleSize: 13 });
+  d.box({ id: "K", x: BX, y: 686, w: BW, h: 58, title: "Assert stopReason === stop", lines: ["Extract getLastAssistantText"], tone: "teal", titleSize: 12.5, size: 11.5 });
+  d.box({ id: "L", x: BX, y: 766, w: BW, h: 58, title: "Convert to TranscriptEvent[]", lines: ["Collect usage/stats"], tone: "teal", titleSize: 13, size: 11.5 });
+  d.box({ id: "M", x: BX, y: 846, w: BW, h: 44, title: "Snapshot session JSONL as artifact", tone: "teal", titleSize: 13 });
+  d.box({ id: "N", x: BX, y: 912, w: BW, h: 44, title: "dispose + delete temp dir", tone: "slate", titleSize: 13 });
+
+  d.arrow("A", "B", { from: "bottom", to: "top" });
+  d.arrow("B", "C", { from: "bottom", to: "top" });
+  d.arrow("C", "D", { from: "bottom", to: "top" });
+  d.arrow("D", "E", { from: "bottom", to: "top" });
+  d.arrow("E", "F", { from: "bottom", to: "top" });
+  d.arrow("F", "G", { from: "bottom", to: "top" });
+  d.arrow("G", "H", { from: "right", to: "left", label: "Yes" });
+  d.arrow("G", "I", { from: "left", to: "right", label: "No" });
+  d.arrow("H", "J", { from: "bottom", to: "top" });
+  d.arrow("I", "J", { from: "bottom", to: "top" });
+  d.arrow("J", "K", { from: "bottom", to: "top" });
+  d.arrow("K", "L", { from: "bottom", to: "top" });
+  d.arrow("L", "M", { from: "bottom", to: "top" });
+  d.arrow("M", "N", { from: "bottom", to: "top" });
+});
+</script>
+</body>
+</html>

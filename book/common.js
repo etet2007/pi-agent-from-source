@@ -10,29 +10,104 @@
 
   /* ============================ 书籍数据 ============================ */
 
-  var BOOK = {
-    title: "Pi Agent 源码解析",
-    short: "Pi Agent",
-    chapters: [
-      { file: "index.html", no: "", title: "序言", part: "" },
-      { file: "ch01-architecture.html", no: "01", title: "架构总览：最小化 Agent 的设计哲学", part: "第一部分 · 基础" },
-      { file: "ch02-ai-layer.html", no: "02", title: "与模型对话：pi-ai 统一 LLM 层", part: "第一部分 · 基础" },
-      { file: "ch03-agent-loop.html", no: "03", title: "Agent Loop：两层嵌套循环", part: "第二部分 · Agent 核心" },
-      { file: "ch04-tools.html", no: "04", title: "工具系统：从定义到执行", part: "第二部分 · Agent 核心" },
-      { file: "ch05-state-and-session-tree.html", no: "05", title: "状态、消息与会话树", part: "第二部分 · Agent 核心" },
-      { file: "ch06-harness.html", no: "06", title: "AgentHarness：可持久化的编排器", part: "第三部分 · 持久化编排" },
-      { file: "ch07-compaction.html", no: "07", title: "上下文压缩与分支摘要", part: "第三部分 · 持久化编排" },
-      { file: "ch08-bootstrap.html", no: "08", title: "启动流水线：从 cli.ts 到模式分发", part: "第四部分 · 编码 Agent 产品" },
-      { file: "ch09-agent-session.html", no: "09", title: "AgentSession：中央编排器", part: "第四部分 · 编码 Agent 产品" },
-      { file: "ch10-system-prompt.html", no: "10", title: "系统提示词与资源装配", part: "第四部分 · 编码 Agent 产品" },
-      { file: "ch11-modes.html", no: "11", title: "三种运行模式", part: "第四部分 · 编码 Agent 产品" },
-      { file: "ch12-tui-rendering.html", no: "12", title: "pi-tui：自研渲染器", part: "第五部分 · 终端界面" },
-      { file: "ch13-input-and-editor.html", no: "13", title: "输入、按键与编辑器", part: "第五部分 · 终端界面" },
-      { file: "ch14-extensions.html", no: "14", title: "扩展系统：最小化核心的延伸", part: "第六部分 · 扩展与连接" },
-      { file: "ch15-remote.html", no: "15", title: "远程控制：守护进程、RPC 与协议", part: "第六部分 · 扩展与连接" },
-      { file: "ch16-evals.html", no: "16", title: "行为评估：pi-evals", part: "第七部分 · 质量与结语" },
-      { file: "ch17-epilogue.html", no: "17", title: "结语：最小化的赌注", part: "第七部分 · 质量与结语" }
-    ]
+  // 语言检测：路径中含 en 路径段即英文版（book/en/ 或部署后的 /en/）
+  function detectLang() {
+    var segs = (location.pathname || "").split("/");
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === "en") return "en";
+    }
+    return "zh";
+  }
+  var LANG = detectLang();
+
+  var BOOKS = {
+    zh: {
+      title: "Pi Agent 源码解析",
+      short: "Pi Agent",
+      chapters: [
+        { file: "index.html", no: "", title: "序言", part: "" },
+        { file: "ch01-architecture.html", no: "01", title: "架构总览：最小化 Agent 的设计哲学", part: "第一部分 · 基础" },
+        { file: "ch02-ai-layer.html", no: "02", title: "与模型对话：pi-ai 统一 LLM 层", part: "第一部分 · 基础" },
+        { file: "ch03-agent-loop.html", no: "03", title: "Agent Loop：两层嵌套循环", part: "第二部分 · Agent 核心" },
+        { file: "ch04-tools.html", no: "04", title: "工具系统：从定义到执行", part: "第二部分 · Agent 核心" },
+        { file: "ch05-state-and-session-tree.html", no: "05", title: "状态、消息与会话树", part: "第二部分 · Agent 核心" },
+        { file: "ch06-harness.html", no: "06", title: "AgentHarness：可持久化的编排器", part: "第三部分 · 持久化编排" },
+        { file: "ch07-compaction.html", no: "07", title: "上下文压缩与分支摘要", part: "第三部分 · 持久化编排" },
+        { file: "ch08-bootstrap.html", no: "08", title: "启动流水线：从 cli.ts 到模式分发", part: "第四部分 · 编码 Agent 产品" },
+        { file: "ch09-agent-session.html", no: "09", title: "AgentSession：中央编排器", part: "第四部分 · 编码 Agent 产品" },
+        { file: "ch10-system-prompt.html", no: "10", title: "系统提示词与资源装配", part: "第四部分 · 编码 Agent 产品" },
+        { file: "ch11-modes.html", no: "11", title: "三种运行模式", part: "第四部分 · 编码 Agent 产品" },
+        { file: "ch12-tui-rendering.html", no: "12", title: "pi-tui：自研渲染器", part: "第五部分 · 终端界面" },
+        { file: "ch13-input-and-editor.html", no: "13", title: "输入、按键与编辑器", part: "第五部分 · 终端界面" },
+        { file: "ch14-extensions.html", no: "14", title: "扩展系统：最小化核心的延伸", part: "第六部分 · 扩展与连接" },
+        { file: "ch15-remote.html", no: "15", title: "远程控制：守护进程、RPC 与协议", part: "第六部分 · 扩展与连接" },
+        { file: "ch16-evals.html", no: "16", title: "行为评估：pi-evals", part: "第七部分 · 质量与结语" },
+        { file: "ch17-epilogue.html", no: "17", title: "结语：最小化的赌注", part: "第七部分 · 质量与结语" }
+      ]
+    },
+    en: {
+      title: "Pi Agent Source Code Analysis",
+      short: "Pi Agent",
+      chapters: [
+        { file: "index.html", no: "", title: "Preface", part: "" },
+        { file: "ch01-architecture.html", no: "01", title: "Architecture Overview: The Design Philosophy of a Minimal Agent", part: "Part I · Foundations" },
+        { file: "ch02-ai-layer.html", no: "02", title: "Talking to Models: The pi-ai Unified LLM Layer", part: "Part I · Foundations" },
+        { file: "ch03-agent-loop.html", no: "03", title: "Agent Loop: Two Nested Loops", part: "Part II · Agent Core" },
+        { file: "ch04-tools.html", no: "04", title: "The Tool System: From Definition to Execution", part: "Part II · Agent Core" },
+        { file: "ch05-state-and-session-tree.html", no: "05", title: "State, Messages, and the Session Tree", part: "Part II · Agent Core" },
+        { file: "ch06-harness.html", no: "06", title: "AgentHarness: A Persistable Orchestrator", part: "Part III · Persistent Orchestration" },
+        { file: "ch07-compaction.html", no: "07", title: "Context Compaction and Branch Summaries", part: "Part III · Persistent Orchestration" },
+        { file: "ch08-bootstrap.html", no: "08", title: "The Bootstrap Pipeline: From cli.ts to Mode Dispatch", part: "Part IV · Coding Agent Product" },
+        { file: "ch09-agent-session.html", no: "09", title: "AgentSession: The Central Orchestrator", part: "Part IV · Coding Agent Product" },
+        { file: "ch10-system-prompt.html", no: "10", title: "System Prompts and Resource Assembly", part: "Part IV · Coding Agent Product" },
+        { file: "ch11-modes.html", no: "11", title: "Three Operating Modes", part: "Part IV · Coding Agent Product" },
+        { file: "ch12-tui-rendering.html", no: "12", title: "pi-tui: A Homegrown Renderer", part: "Part V · Terminal UI" },
+        { file: "ch13-input-and-editor.html", no: "13", title: "Input, Keybindings, and the Editor", part: "Part V · Terminal UI" },
+        { file: "ch14-extensions.html", no: "14", title: "The Extension System: Extending the Minimal Core", part: "Part VI · Extensions & Connectivity" },
+        { file: "ch15-remote.html", no: "15", title: "Remote Control: Daemon, RPC, and Protocols", part: "Part VI · Extensions & Connectivity" },
+        { file: "ch16-evals.html", no: "16", title: "Behavioral Evaluation: pi-evals", part: "Part VII · Quality & Conclusion" },
+        { file: "ch17-epilogue.html", no: "17", title: "Epilogue: The Minimalist Bet", part: "Part VII · Quality & Conclusion" }
+      ]
+    }
+  };
+  var BOOK = BOOKS[LANG];
+
+  /* 界面文案：随语言切换 */
+  var L10N = {
+    zh: {
+      tocBtn: "目录",
+      tocBtnAria: "打开目录",
+      drawerClose: "关闭 ✕",
+      drawerCloseAria: "关闭目录",
+      tocTitle: "本章目录",
+      prevKicker: "← 上一章",
+      nextKicker: "下一章 · ",
+      nextKickerEnd: " →",
+      topAria: "返回顶部",
+      langAria: "切换语言",
+      crumb: function (no, title) { return "第 " + no + " 章 · " + title; },
+      footer: function () {
+        return "《" + BOOK.title + "》 · 书中所有文件路径均相对于 <code>pi-agent-src/</code>。" +
+          " 本书为独立的教育性源码分析，与 Pi Agent 的维护者无关。";
+      }
+    },
+    en: {
+      tocBtn: "Contents",
+      tocBtnAria: "Open table of contents",
+      drawerClose: "Close ✕",
+      drawerCloseAria: "Close table of contents",
+      tocTitle: "On this page",
+      prevKicker: "← Previous chapter",
+      nextKicker: "Next chapter · ",
+      nextKickerEnd: " →",
+      topAria: "Back to top",
+      langAria: "Switch language",
+      crumb: function (no, title) { return "Chapter " + no + " · " + title; },
+      footer: function () {
+        return "&ldquo;" + BOOK.title + "&rdquo; · All file paths in this book are relative to <code>pi-agent-src/</code>." +
+          " This book is an independent educational source-code analysis and is not affiliated with the Pi Agent maintainers.";
+      }
+    }
   };
 
   function $(sel, root) { return (root || document).querySelector(sel); }
@@ -56,6 +131,30 @@
 
   /* ============================ 页头 ============================ */
 
+  /* 语言切换：中文 | English（当前语言加粗高亮，另一个为指向另一版本的链接） */
+  function buildLangSwitcher() {
+    var file = currentFile();
+    var grp = el("div", "pb-lang");
+    grp.setAttribute("role", "group");
+    grp.setAttribute("aria-label", L10N[LANG].langAria);
+    if (LANG === "en") {
+      var zhA = el("a", "pb-lang-btn", "中文");
+      zhA.href = "../" + file;
+      grp.appendChild(zhA);
+    } else {
+      grp.appendChild(el("span", "pb-lang-btn here", "中文"));
+    }
+    grp.appendChild(el("span", "pb-lang-sep", "|"));
+    if (LANG === "zh") {
+      var enA = el("a", "pb-lang-btn", "English");
+      enA.href = "en/" + file;
+      grp.appendChild(enA);
+    } else {
+      grp.appendChild(el("span", "pb-lang-btn here", "English"));
+    }
+    return grp;
+  }
+
   function buildHeader() {
     var here = findChapter(currentFile());
     var ch = here >= 0 ? BOOK.chapters[here] : null;
@@ -68,12 +167,13 @@
     var name = el("span", "pb-name", BOOK.title);
     site.appendChild(name);
     if (ch && ch.no) {
-      var crumb = el("span", "pb-crumb", "第 " + ch.no + " 章 · " + ch.title);
+      var crumb = el("span", "pb-crumb", L10N[LANG].crumb(ch.no, ch.title));
       site.appendChild(crumb);
     }
     bar.appendChild(site);
 
     var btns = el("div", "pb-headbtns");
+    btns.appendChild(buildLangSwitcher());
     var gh = el("a", "pb-gh");
     gh.href = "https://github.com/kuwii/pi-agent-from-source";
     gh.target = "_blank";
@@ -82,9 +182,9 @@
     gh.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>';
     btns.appendChild(gh);
     btns.appendChild(el("span", "pb-sep", "|"));
-    var tocBtn = el("button", "pb-btn", "目录");
+    var tocBtn = el("button", "pb-btn", L10N[LANG].tocBtn);
     tocBtn.id = "pb-toc-btn";
-    tocBtn.setAttribute("aria-label", "打开目录");
+    tocBtn.setAttribute("aria-label", L10N[LANG].tocBtnAria);
     btns.appendChild(tocBtn);
     bar.appendChild(btns);
 
@@ -106,8 +206,9 @@
     drawer.id = "pb-drawer";
     var panel = el("div", "pb-drawer-panel");
     var head = el("div", "pb-drawer-head");
-    var closeBtn = el("button", "pb-btn", "关闭 ✕");
+    var closeBtn = el("button", "pb-btn", L10N[LANG].drawerClose);
     closeBtn.id = "pb-drawer-close";
+    closeBtn.setAttribute("aria-label", L10N[LANG].drawerCloseAria);
     head.appendChild(closeBtn);
     panel.appendChild(head);
 
@@ -160,7 +261,7 @@
 
     var toc = el("nav");
     toc.id = "pb-toc";
-    toc.appendChild(el("div", "pb-toc-title", "本章目录"));
+    toc.appendChild(el("div", "pb-toc-title", L10N[LANG].tocTitle));
     heads.forEach(function (h) {
       var a = el("a", h.tagName === "H3" ? "lv3" : "lv2", h.textContent);
       a.href = "#" + h.id;
@@ -203,14 +304,14 @@
 
     var pa = el("a", "prev");
     pa.href = prev.file;
-    pa.appendChild(el("div", "pb-nav-kicker", "← 上一章" + (prev.part ? " · " + prev.part : "")));
+    pa.appendChild(el("div", "pb-nav-kicker", L10N[LANG].prevKicker + (prev.part ? " · " + prev.part : "")));
     pa.appendChild(el("div", "pb-nav-title", (prev.no ? prev.no + " · " : "") + prev.title));
     nav.appendChild(pa);
 
     if (next) {
       var na = el("a", "next");
       na.href = next.file;
-      na.appendChild(el("div", "pb-nav-kicker", "下一章 · " + next.part + " →"));
+      na.appendChild(el("div", "pb-nav-kicker", L10N[LANG].nextKicker + next.part + L10N[LANG].nextKickerEnd));
       na.appendChild(el("div", "pb-nav-title", next.no + " · " + next.title));
       nav.appendChild(na);
     } else {
@@ -219,8 +320,7 @@
 
     var foot = el("div");
     foot.id = "pb-footer";
-    foot.innerHTML = "《" + BOOK.title + "》 · 书中所有文件路径均相对于 <code>pi-agent-src/</code>。" +
-      " 本书为独立的教育性源码分析，与 Pi Agent 的维护者无关。";
+    foot.innerHTML = L10N[LANG].footer();
 
     var holder = $("#pb-nav-holder");
     if (holder) {
@@ -251,7 +351,7 @@
     var top = el("button");
     top.id = "pb-top";
     top.textContent = "↑";
-    top.setAttribute("aria-label", "返回顶部");
+    top.setAttribute("aria-label", L10N[LANG].topAria);
     document.body.appendChild(top);
     top.addEventListener("click", function () { window.scrollTo({ top: 0, behavior: "smooth" }); });
 

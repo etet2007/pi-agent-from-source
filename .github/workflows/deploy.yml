@@ -28,7 +28,7 @@ jobs:
       - name: Cache-bust assets
         run: |
           HASH=$(cat book/style.css book/common.js | sha256sum | cut -c1-12)
-          sed -i "s/__CACHE_BUST__/$HASH/g" book/*.html
+          sed -i "s/__CACHE_BUST__/$HASH/g" book/*.html book/en/*.html
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

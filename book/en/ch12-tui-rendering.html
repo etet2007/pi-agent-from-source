@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 12 · pi-tui: A Homegrown Renderer | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch12">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part V · Terminal UI</p>
+  <h1>Chapter 12: pi-tui — A Homegrown Renderer</h1>
+  <p class="chapter-sub">Bringing rendering back to "lines + ANSI": components output string arrays, the renderer compares line by line and writes only what changed — a homegrown, flicker-free, scrollable terminal renderer</p>
+</header>
+
+<h2 id="unusual">An Unusual Decision</h2>
+
+<p>Chapter 11's interactive mode renders <code>AgentSessionEvent</code> onto the terminal screen. Underneath those screens is <code>pi-tui</code> (<code>packages/tui</code>) — Pi Agent's terminal UI library.</p>
+
+<p>One unusual decision deserves to be stated up front: <strong><code>pi-tui</code> is not based on React/Ink.</strong> No virtual DOM, no JSX, no reconciler. In an era where "terminal UI" is nearly synonymous with Ink, Pi Agent wrote a renderer from scratch.</p>
+
+<p>Why? Because Pi Agent's needs are in fundamental tension with Ink's model. Ink models the terminal as a fixed-height viewport and diffs a virtual DOM. But a coding agent's output is a <strong>streaming, ever-growing document</strong> — assistant replies pour out line by line, tool results get appended chunk by chunk, and the user needs to scroll up to review. Ink's "fixed viewport + full recompute" model flickers in this scenario and loses scroll history. What Pi Agent wants is "to write the ever-growing document efficiently into the terminal's scrollback buffer, rewriting only the lines that changed."</p>
+
+<p>So <code>pi-tui</code>'s core model is almost naively simple: <strong>components render into arrays of strings, and the renderer compares line by line, writing only what changed.</strong> This chapter dissects that model and shows how, with very little abstraction, it achieves flicker-free, scrollable terminal rendering with image and IME support.</p>
+
+<hr class="sep">
+
+<h2 id="contract">The Component Contract: <code>render(width) =&gt; string[]</code></h2>
+
+<p><code>pi-tui</code> components are not React functions but an interface (<code>packages/tui/src/tui.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">export interface Component {
+	/** 把组件渲染成给定视口宽度下的若干行 */
+	render(width: number): string[];
+	/** 获得焦点时的键盘输入处理（可选） */
+	handleInput?(data: string): void;
+	/** 是否接收按键释放事件（Kitty 协议），默认 false */
+	wantsKeyRelease?: boolean;
+	/** 使缓存的渲染状态失效（主题变更等） */
+	invalidate(): void;
+}</pre>
+
+<p>The core is <code>render(width): string[]</code> — given a width, return an array of strings, one per line (possibly containing ANSI escape sequences). This is <strong>pull-based</strong> rendering: the renderer actively calls the component's <code>render</code>, and the component decides how many lines to emit based on its own content. There is no retained scene graph for the renderer to walk and lay out — components produce their own lines.</p>
+
+<p>The benefit of this contract is a mental model that hugs the terminal: the terminal is "lines + ANSI," and a component's output is also "lines + ANSI." There is no virtual-DOM layer of translation in between. The cost is that each component must handle its own wrapping, truncation, and caching — but that logic is inherently component-specific anyway.</p>
+
+<p>Focusable components implement <code>Focusable</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">export interface Focusable {
+	focused: boolean; // TUI 在焦点变化时设置
+}</pre>
+
+<p>A focused component emits a zero-width <code>CURSOR_MARKER</code> at its logical cursor position within its <code>render</code> output:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">export const CURSOR_MARKER = "\x1b_pi:c\x07"; // 零宽 APC 序列</pre>
+
+<p>The renderer later finds this marker, computes the visual column, strips it, and moves the hardware cursor there — so the IME candidate window can position itself correctly. This zero-width marker is a neat design: the component doesn't need to know the hardware cursor exists; it just says "here is where my cursor is," and the renderer aligns the hardware cursor to it.</p>
+
+<hr class="sep">
+
+<h2 id="container">Composition: <code>Container</code> and the Component Catalog</h2>
+
+<p>Components compose through <code>Container</code> (<code>packages/tui/src/tui.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">export class Container implements Component {
+	children: Component[] = [];
+	addChild(component: Component): void;
+	removeChild(component: Component): void;
+	clear(): void;
+	invalidate(): void;
+	render(width: number): string[]; // 垂直拼接所有子组件的行
+}</pre>
+
+<p><code>Container.render</code> simply calls each child's <code>render(width)</code> in turn and concatenates the results vertically. It's the most primitive layout — stacking top to bottom.</p>
+
+<p>On top of that, <code>pi-tui</code> provides a component catalog (<code>packages/tui/src/components/</code>):</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Component</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>Text</code></td><td>Multi-line wrapping text, cached by <code>(text, width)</code></td></tr>
+<tr><td><code>TruncatedText</code></td><td>Single-line truncated text</td></tr>
+<tr><td><code>Spacer</code></td><td>N blank lines</td></tr>
+<tr><td><code>Box</code></td><td>Adds padding and background to children</td></tr>
+<tr><td><code>Image</code></td><td>Kitty/iTerm2 inline images with text fallback</td></tr>
+<tr><td><code>Loader</code> / <code>CancellableLoader</code></td><td>Spinner animation (the latter supports AbortSignal + Esc)</td></tr>
+<tr><td><code>Markdown</code></td><td>Renders Markdown with the bundled <code>marked</code></td></tr>
+<tr><td><code>Input</code></td><td>Single-line input</td></tr>
+<tr><td><code>Editor</code></td><td>Heavyweight multi-line editor (about 2,352 lines; detailed in Chapter 13)</td></tr>
+<tr><td><code>SelectList</code> / <code>SettingsList</code></td><td>Interactive lists</td></tr>
+<tr><td><code>VStack</code> / <code>HStack</code> / <code>ScrollView</code></td><td>Layout containers</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Each component is a <code>Component</code> implementation that manages its own wrapping, truncation, and caching. <code>Text</code> uses <code>wrapTextWithAnsi</code> for ANSI-aware wrapping (it never miscounts width because of escape sequences) and caches by <code>(text, width)</code> — the same text at the same width is not recomputed.</p>
+
+<hr class="sep">
+
+<h2 id="renderers">Renderers: One Interface, Two Implementations</h2>
+
+<p><code>TUI</code> is the interface consumers see (<code>packages/tui/src/tui.ts</code>): <code>addChild</code>, <code>setFocus</code>, <code>showOverlay</code>/<code>hideOverlay</code>, <code>start</code>/<code>stop</code>, <code>requestRender</code>, <code>addInputListener</code>. It has an abstract base class <code>TuiBase</code> that leaves one abstract method:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">export abstract class TuiBase extends Container implements TUI {
+	protected abstract doRender(): void;
+	// 焦点、overlay、输入监听、帧调度、终端查询
+}</pre>
+
+<p><code>doRender()</code> is the concrete "write the current frame to the terminal" implementation, provided by each of two subclasses:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="tui-hierarchy" data-w="760" data-h="430"></canvas></div>
+  <figcaption>Figure 1: The class hierarchy of the <code>TUI</code> interface. <code>TuiBase</code> carries the shared machinery — focus, overlays, frame scheduling; the two subclasses each implement <code>doRender</code> — the main screen writes the scrollback buffer, the alt screen writes a fixed viewport.</figcaption>
+</figure>
+
+<ul>
+<li><strong><code>TuiMainScreen</code></strong> (<code>packages/tui/src/TuiMainScreen.ts</code>): writes to the terminal's <strong>scrollback buffer</strong>; output can grow endlessly and scroll upward. This is what interactive mode uses by default — the agent's streaming output is an ever-growing document. It uses <strong>relative cursor movement</strong> to rewrite only the changed line range.</li>
+<li><strong><code>TuiAltScreen</code></strong> (<code>packages/tui/src/TuiAltScreen.ts</code>): enters the terminal's <strong>alternate screen</strong>, owning a fixed-height viewport with mouse support, selection, and true 2D layout. It rewrites line by line using <strong>absolute cursor addressing</strong>.</li>
+</ul>
+
+<p>The two renderers share <code>TuiBase</code>'s focus management, overlay system, frame scheduling, and input handling; they diverge only in "how the frame is written to the terminal." This is the strategy pattern: consumers face a single <code>TUI</code> interface while the underlying rendering strategy is swappable. The <code>ViewportTUI</code> interface plus the <code>isViewportTUI</code> guard identify "is this an alt-screen renderer," gating alt-screen-only features (such as <code>setLayoutRoot</code>).</p>
+
+<hr class="sep">
+
+<h2 id="diff">Diff Rendering: A Line-by-Line Equality Scan</h2>
+
+<p>Now for the core. How does <code>TuiMainScreen.doRender()</code> (<code>packages/tui/src/TuiMainScreen.ts:146</code>) write only the changed lines? The answer is astonishingly plain — a <strong>line-by-line string equality scan</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/TuiMainScreen.ts">let firstChanged = -1;
+let lastChanged = -1;
+const maxLines = Math.max(newLines.length, this.previousLines.length);
+for (let i = 0; i &lt; maxLines; i++) {
+	const oldLine = i &lt; this.previousLines.length ? this.previousLines[i] : "";
+	const newLine = i &lt; newLines.length ? newLines[i] : "";
+	if (oldLine !== newLine) {
+		if (firstChanged === -1) firstChanged = i;
+		lastChanged = i;
+	}
+}</pre>
+
+<p>It compares the new frame (<code>newLines</code>, the result of <code>render(width)</code> across the whole component tree) with the previous frame (<code>previousLines</code>) line by line, finding the first and last changed lines. No LCS, no edit distance — just <code>oldLine !== newLine</code>.</p>
+
+<p>Once the changed range is found, it <strong>rewrites only that range</strong>: it moves the hardware cursor to <code>firstChanged</code> (via relative moves <code>\x1b[...A</code>/<code>\x1b[...B</code>), then emits <code>\x1b[2K</code> (erase the whole line) plus the new content for each changed line. Stale old lines at the end are erased separately.</p>
+
+<p>That's all "double buffering" means here: the <code>previousLines</code> array is retained between frames as the diff baseline. No offscreen canvas, no pixel buffer — the "buffer" is just an array of strings.</p>
+
+<h3>When a Full Redraw Happens</h3>
+
+<p>Not every situation can be incremental. <code>doRender</code> falls back to <code>fullRender</code> (clear screen + full resend) in several cases:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/TuiMainScreen.ts">// 首次渲染
+if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
+	fullRender(false); // 全量，但不清屏
+	return;
+}
+// 宽度变化、或变化发生在可视视口之上、或需要清屏收缩
+if (widthChanged || firstChanged &lt; prevViewportTop || ...) {
+	fullRender(true); // 清屏 + 清滚动缓冲 + 全量
+	return;
+}</pre>
+
+<p>The <code>firstChanged &lt; prevViewportTop</code> condition is worth noting: if a change happens above the region the user has scrolled up to (and can't see), incremental rewriting would miscount the cursor position, so it just does a full redraw. This is a pragmatic compromise — incremental rendering is efficient in the common cases (appends at the bottom, localized updates) and falls back to full rendering in the rare ones (changes above, size changes).</p>
+
+<h3>Synchronized Output: The Key to No Flicker</h3>
+
+<p>Whether incremental or full, the whole frame is wrapped in a <strong>synchronized output</strong> sequence:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/TuiMainScreen.ts">let buffer = "\x1b[?2026h"; // Begin synchronized output
+// ... 拼接所有变化行的擦除 + 重写 ...
+buffer += "\x1b[?2026l"; // End synchronized output
+this.terminal.write(buffer); // 一次性写出</pre>
+
+<p><code>\x1b[?2026h</code>/<code>\x1b[?2026l</code> tell the terminal: "a batch of updates is coming — buffer them and display them all at once when the end sequence arrives." Terminals that support it (most modern ones) render the whole frame as one atomic operation — the user never sees the intermediate "erase first, then rewrite line by line" state, hence no flicker. The whole frame is assembled into a single string and written in one <code>write</code> call; combined with synchronized output, that guarantees atomicity.</p>
+
+<h3>Enforcing the Contract Defensively</h3>
+
+<p><code>doRender</code> also has a guard: if any component returns a line whose <code>visibleWidth</code> exceeds the terminal width, it throws and writes a <code>pi-crash.log</code>:</p>
+
+<pre class="code" data-lang="text" data-file="packages/tui/src/TuiMainScreen.ts">// 若某行宽度超过终端宽度 → 抛错 + 诊断日志，指向 truncateToWidth</pre>
+
+<p>This turns a silent rendering corruption (lines so long that the terminal wraps them and the layout breaks) into an actionable error that directly points out "which component should use <code>truncateToWidth</code>." It's a good example of "turning a contract violation into a loud error" — rather than letting the user stare at a broken UI with no way to investigate, crashing and leaving a diagnostic log is friendlier.</p>
+
+<hr class="sep">
+
+<h2 id="scheduling">Frame Scheduling: A 16ms Throttle</h2>
+
+<p>Components don't trigger a redraw on every state change. <code>TuiBase.requestRender</code> (<code>packages/tui/src/tui.ts:745</code>) coalesces and throttles:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/tui.ts">requestRender(force = false): void {
+	if (force) {
+		this.resetRenderState();
+		// ... 立即在 nextTick 渲染 ...
+		return;
+	}
+	if (this.renderRequested) return; // 合并：已有请求就不重复
+	this.renderRequested = true;
+	process.nextTick(() =&gt; this.scheduleRender());
+}
+
+private scheduleRender(): void {
+	if (this.stopped || this.renderTimer || !this.renderRequested) return;
+	const elapsed = performance.now() - this.lastRenderAt;
+	const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed); // 16ms
+	this.renderTimer = setTimeout(() =&gt; {
+		this.renderTimer = undefined;
+		if (this.stopped || !this.renderRequested) return;
+		this.renderRequested = false;
+		this.lastRenderAt = performance.now();
+		this.doRender();
+		if (this.renderRequested) this.scheduleRender(); // 期间又有请求就再排一次
+	}, delay);
+}</pre>
+
+<p>Two mechanisms:</p>
+
+<ul>
+<li><strong>Coalescing</strong>: the <code>renderRequested</code> flag ensures that multiple <code>requestRender</code> calls trigger only one render per frame. During streaming output every token delta calls <code>requestRender</code>, but the actual renders are coalesced.</li>
+<li><strong>Throttling</strong>: <code>MIN_RENDER_INTERVAL_MS = 16</code> (about 60fps) ensures at least 16ms between frames. Spinners and streaming output never flush the terminal hundreds of times per second.</li>
+</ul>
+
+<p><code>start()</code> wires up the terminal: <code>this.terminal.start((data) =&gt; this.handleTerminalInput(data), () =&gt; this.requestRender())</code> — input triggers a render, and window resizes do too. Components can also call <code>tui.requestRender()</code> themselves (e.g. <code>Loader</code> on its timer, <code>Editor</code> after edits).</p>
+
+<hr class="sep">
+
+<h2 id="dual-layout">The Dual Layout Model</h2>
+
+<p><code>VStack</code>/<code>HStack</code>/<code>ScrollView</code> — these layout containers have an interesting split personality.</p>
+
+<p>On <code>TuiMainScreen</code> (and in non-layout contexts), they use plain <code>render(width)</code> — <code>VStack.render</code> just concatenates the children's lines vertically, producing an <strong>unbounded document</strong>. That's exactly what streaming agent output needs: the document can grow without limit.</p>
+
+<p>But on <code>TuiAltScreen</code>, they participate in a real 2D flexbox layout through a symbol protocol, <code>LAYOUT_NODE</code> (<code>packages/tui/src/layout-node.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/tui/src/layout-node.ts">export const LAYOUT_NODE = Symbol.for("@earendil-works/pi-tui/layout-node");
+export type LayoutNode = StackLayoutNode | ScrollLayoutNode;
+export function getLayoutNode(component: Component): LayoutNode | undefined</pre>
+
+<p>The alt screen's layout engine (<code>renderLayoutFrame</code> in <code>packages/tui/src/layout.ts</code>) recursively builds the layout tree, measures intrinsic sizes, distributes space by grow/shrink, computes clipping, and composites every box into the fixed-height screen. This lets the alt screen have "confined regions that scroll independently" — for example, a fixed-height list plus an independently scrolling details panel.</p>
+
+<p>So the same set of components behaves as an unbounded document on the main screen and as a flexbox viewport on the alt screen. Using a symbol rather than <code>instanceof</code> as the capability protocol lets this duck-typed extension work across packages. It's a clean separation of two UI paradigms — "streaming document" versus "application viewport" — while reusing the components.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>pi-tui</code> offers four transferable patterns for "how to build a terminal UI." Some run counter to the mainstream virtual-DOM approach, yet they fit streaming agents perfectly.</p>
+
+<p><strong>Rendering is strings; diffing is an equality scan.</strong> Components output <code>string[]</code>, the renderer compares line by line with <code>!==</code> and rewrites only the changed range. The problem it solves: a virtual-DOM reconciler is overkill for an ever-growing streaming document, and the fixed-viewport model loses scroll history. When the output is already the terminal's native representation (lines + ANSI), the renderer can be paper-thin, and scrolling and incremental updates both fall out naturally. The cost is that each component manages its own wrapping/truncation/caching — but for a library this close to the terminal, that cost buys simplicity and control.</p>
+
+<p><strong>Synchronized output + a single write = no flicker.</strong> Assemble the whole frame into one string, wrap it in <code>\x1b[?2026h/l</code>, and <code>write</code> it once. The problem it solves: line-by-line writes expose the intermediate states of a redraw. When the terminal displays the whole frame as an atomic operation, the user sees one clean update no matter how many lines were erased internally.</p>
+
+<p><strong>Coalescing + throttling govern render frequency.</strong> <code>renderRequested</code> coalesces multiple requests, and a 16ms throttle caps the frame rate. The problem it solves: every streaming delta and every animation tick triggers a redraw, flooding the terminal and wasting CPU. When render requests are coalesced and throttled, the actual frame rate stays within a sane range no matter how often state changes.</p>
+
+<p><strong>Replace silent corruption with contract enforcement.</strong> A component returning an over-wide line throws and leaves a diagnostic log instead of quietly breaking the UI. The problem it solves: rendering bugs manifest as UI corruption that's hard to track down. When a contract violation becomes a loud error that points toward the fix, debugging costs drop sharply.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>pi-tui</code> is a fully homegrown terminal renderer whose core model is plain but powerful: components implement <code>render(width): string[]</code>, <code>Container</code> concatenates vertically, <code>TuiBase</code> provides focus/overlays/frame scheduling, and two concrete renderers (the main screen <code>TuiMainScreen</code> writing the scrollback buffer and the alt screen <code>TuiAltScreen</code> writing a fixed viewport) share one <code>TUI</code> interface. Diff rendering is a line-by-line string equality scan that rewrites only the changed range; synchronized output plus a single write guarantees no flicker; a 16ms throttle plus request coalescing governs the frame rate. Focusable components mark the cursor with a zero-width <code>CURSOR_MARKER</code> for IME support, and the layout containers have their "unbounded document" / "flexbox viewport" split personality.</p>
+
+<p>It isn't based on React/Ink — not for novelty's sake, but because a streaming agent's output is an ever-growing document that needs the "lines + diff + scrollback buffer" model rather than the "fixed viewport + virtual DOM" model. Understand that, and you understand why a decision that looks like "reinventing the wheel" is in fact a precise response to the requirement.</p>
+
+<p>In the next chapter, we look at how user input enters this renderer — Kitty keyboard protocol negotiation, escape-sequence reassembly, key parsing, and that 2,352-line <code>Editor</code> component.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("tui-hierarchy", function (d) {
+  d.box({ id: "tui", x: 280, y: 40, w: 200, h: 58, title: "TUI interface", tone: "accent", titleSize: 13 });
+  d.box({ id: "base", x: 280, y: 150, w: 200, h: 72, title: "TuiBase (abstract)", lines: ["Focus / overlay / frame scheduling"], tone: "gold", titleSize: 13 });
+  d.box({ id: "main", x: 40, y: 300, w: 280, h: 80, title: "TuiMainScreen", lines: ["Main screen + scrollback", "Relative cursor moves"], tone: "teal", titleSize: 13 });
+  d.box({ id: "alt", x: 440, y: 300, w: 280, h: 80, title: "TuiAltScreen", lines: ["Alt-screen fixed viewport", "Absolute addressing + mouse"], tone: "violet", titleSize: 13 });
+
+  d.arrow("tui", "base", { from: "bottom", to: "top" });
+  d.arrow("base", "main", { from: "left", to: "top" });
+  d.arrow("base", "alt", { from: "right", to: "top" });
+});
+</script>
+</body>
+</html>

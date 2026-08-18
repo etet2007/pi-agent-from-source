@@ -116,6 +116,19 @@ hr.sep { border: none; border-top: 1px solid var(--border); margin: 3rem 0; }
 #pb-header .pb-gh:hover { color: var(--accent); }
 #pb-header .pb-sep { color: var(--fg-faint); font-size: 0.86em; }
 
+/* ---------- 语言切换（中文 | English） ---------- */
+
+#pb-header .pb-lang {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.2em 0.55em; font-size: 0.86em;
+  white-space: nowrap; line-height: 1.5;
+}
+#pb-header .pb-lang .pb-lang-btn { color: var(--fg-muted); border-bottom: none; font-weight: 500; }
+#pb-header .pb-lang .pb-lang-btn:hover { color: var(--fg); }
+#pb-header .pb-lang .pb-lang-btn.here { color: var(--accent-strong); font-weight: 700; }
+#pb-header .pb-lang .pb-lang-sep { color: var(--fg-faint); }
+
 /* ---------- 目录抽屉 ---------- */
 
 #pb-drawer {
@@ -422,6 +435,7 @@ kbd {
   .chapter-head h1 { font-size: 1.6em; }
   #pb-chapter-nav { grid-template-columns: 1fr; }
   #pb-chapter-nav a.next { text-align: left; }
+  #pb-header .pb-lang { padding: 0.14em 0.4em; }
 }
 
 /* ---------- 返回顶部 ---------- */

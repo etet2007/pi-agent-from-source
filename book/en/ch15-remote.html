@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 15 · Remote Control: Daemon, RPC, and Protocols | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch15">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part VI · Extensions &amp; Connectivity</p>
+  <h1>Chapter 15: Remote Control — Daemon, RPC, and Protocols</h1>
+  <p class="chapter-sub">Two remote designs in parallel: one daemon already implemented, one protocol awaiting its server</p>
+</header>
+
+<h2 id="hook">Beyond localhost</h2>
+
+<p>So far, everything we have looked at is "one pi process running in one terminal on one machine." But production scenarios often go beyond that: you want multiple agents running in the background for long periods, to drive them from an IDE, and to reach them from another machine.</p>
+
+<p>Pi Agent's remote-control story hinges on one key fact: <strong>this codebase contains two fundamentally different remote designs.</strong> That is not redundancy but the product of two different stages and two different goals — understanding the difference helps you see how a system handles the "remote" requirement as it evolves.</p>
+
+<p>The first is <strong><code>pi-server</code></strong>: a fully implemented daemon that supervises multiple headless <code>pi --mode rpc</code> child processes and registers them with a remote relay called Radius. It communicates with newline-delimited JSON.</p>
+
+<p>The second is <strong><code>pi-protocol</code> + <code>pi-client</code></strong>: a transport-neutral, binary (length-prefixed CBOR) protocol paired with a runtime-agnostic client SDK. It is well designed — but in this snapshot of the code, <strong>nothing serves this protocol</strong>. It is a client prepared for a future remote UI, waiting for its server.</p>
+
+<p>This chapter dissects each design in turn, then answers: why are there two?</p>
+
+<hr class="sep">
+
+<h2 id="pi-server">The first design: the <code>pi-server</code> daemon</h2>
+
+<p><code>pi-server</code> (<code>packages/server</code>)'s <code>package.json</code> honestly labels it "experimental". At its core it is a <strong>supervisor</strong>: a long-running daemon that manages multiple headless coding-agent child processes.</p>
+
+<h3 id="cli">Command line</h3>
+
+<p>The <code>server</code> binary (<code>packages/server/src/cli.ts</code>) offers these subcommands:</p>
+
+<pre class="code" data-lang="text" data-file="packages/server/src/cli.ts">server serve              # 启动守护进程，一直运行
+server list               # 列出实例
+server spawn [--cwd &lt;path&gt;] [--label &lt;label&gt;]  # 启动一个 Agent 实例
+server status &lt;id&gt;        # 查询实例状态
+server stop &lt;id&gt;          # 停止实例
+server rpc &lt;id&gt; &lt;json&gt;    # 向实例发一个 RPC 命令
+server rpc-stream &lt;id&gt;    # 打开持久 RPC 流</pre>
+
+<p>Except for <code>serve</code>, every command is a <strong>thin IPC client</strong> — it sends a request to the daemon over a Unix socket and gets one response. All the real logic lives in the daemon.</p>
+
+<h3 id="supervisor">Supervisor: <code>ServerSupervisor</code></h3>
+
+<p>The core is <code>ServerSupervisor</code> (<code>packages/server/src/supervisor.ts</code>), an exported singleton <code>supervisor</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/supervisor.ts">export class ServerSupervisor {
+	private readonly liveInstances = new Map&lt;string, LiveInstance&gt;();
+
+	async spawnInstance(options: { cwd: string; label?: string }): Promise&lt;InstanceRecord&gt; { ... } // :270
+	async stopInstance(instanceId: string): Promise&lt;InstanceRecord | undefined&gt; { ... }            // :300
+	async recoverAfterRestart(): Promise&lt;void&gt; { ... }                                             // :244
+	async shutdown(): Promise&lt;void&gt; { ... }
+	listInstances(): InstanceRecord[];
+	listLiveInstances(): InstanceRecord[] { ... }                                                  // :240
+}</pre>
+
+<p>It maintains a <code>liveInstances</code> table; each <code>LiveInstance</code> bundles an <code>InstanceRecord</code> (the persisted record) with live resources (the RPC process, Radius id, session id, event subscribers).</p>
+
+<p>The <code>spawnInstance</code> flow: create a record (status <code>starting</code>) → persist it → create an <code>RpcProcessInstance</code> (spawn the child process) → bind event/exit/UI handlers → sync session metadata → register with Radius → set status to <code>online</code>. On failure it cleans up and sets <code>stopped</code>.</p>
+
+<p><code>recoverAfterRestart</code> handles daemon restarts: it marks any <code>online</code>/<code>starting</code> instance as <code>stopped</code> (because their child processes died with the previous process) and disconnects them from Radius. This is the familiar "state reconciliation after restart" of distributed systems.</p>
+
+<h3 id="rpc-process">Child processes: <code>RpcProcessInstance</code></h3>
+
+<p>Each instance is a child process wrapped by <code>RpcProcessInstance</code> (<code>packages/server/src/rpc-process.ts</code>). The spawn command is <code>pi --mode rpc</code> (or the equivalent <code>node .../rpc-entry</code>).</p>
+
+<p>Recall Chapter 11: <code>pi --mode rpc</code> enters a JSON-RPC loop that reads commands from stdin and writes responses to stdout. <code>RpcProcessInstance</code> talks to it over the <strong>child process's stdin/stdout using JSON Lines</strong>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/rpc-process.ts">send(command: RpcCommand): Promise&lt;RpcResponse&gt; {
+	// 分配 id，写 JSON.stringify(command) + "\n"，按 id 关联响应
+}</pre>
+
+<p>Each stdout line is dispatched: <code>type: "response"</code> resolves a pending request, <code>type: "extension_ui_request"</code> invokes the UI handlers, and everything else is broadcast to event listeners as an <code>AgentSessionEvent</code>.</p>
+
+<p>So the chain is: the daemon drives a headless pi over stdio JSONL, reusing the entire RPC pattern from Chapter 11. The <code>RpcCommand</code>/<code>RpcResponse</code>/<code>AgentSessionEvent</code> types all come from <code>@earendil-works/pi-coding-agent</code> — <code>pi-server</code> depends on <code>coding-agent</code> and treats it as a spawnable RPC service.</p>
+
+<h3 id="ipc">Local control plane: IPC</h3>
+
+<p>Between the daemon and its CLI clients sits another protocol layer — local IPC (<code>packages/server/src/ipc/</code>). It uses newline-delimited JSON over a Unix socket:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/ipc/">// 请求：spawn / list / stop / status / rpc / rpc_stream
+// 响应：spawn_result / list_result / stop_result / status_result / rpc_result / rpc_ready / error
+encodeMessage(message): string = JSON.stringify(message) + "\n"</pre>
+
+<p><code>startIpcServer</code> listens on the Unix socket. One-shot requests call <code>socket.end()</code> once they get their response; an <code>rpc_stream</code> request upgrades the socket into a persistent bidirectional JSONL stream. <code>removeStaleSocketIfNeeded</code> + <code>isSocketLive</code> detect and refuse to clobber a running daemon ("server is already running").</p>
+
+<p>Note: this IPC layer and the child-process RPC are both JSON Lines, but with <strong>different vocabularies</strong> — IPC "manages the daemon" (spawn/stop/list), while RPC "drives an agent" (prompt/steer/set_model). Each layer minds its own segment.</p>
+
+<h3 id="storage-radius">Persistence and Radius</h3>
+
+<p>The daemon's state lives in <code>~/.pi/server/</code> (<code>packages/server/src/storage.ts</code>): <code>machine.json</code> (machine record) and <code>instances.json</code> (instance records). <code>InstanceRecord</code> has <code>id, status, cwd, label?, sessionId?, sessionFile?, radiusPiId?</code>, and <code>InstanceStatus = starting | online | stopping | stopped | error</code>.</p>
+
+<p>Finally there is Radius (<code>packages/server/src/radius.ts</code>) — the remote relay. <code>RadiusPresence</code> registers the machine's agents with a central service at <code>https://radius.pi.dev/</code> so they can be reached remotely:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/server/src/radius.ts">// 注册机器（machines/register）和每个 pi 实例（pis/register）
+// capabilities: { rpc: true, relay: false, iroh: false }
+// 心跳循环：heartbeatMachine / heartbeatPi，指数退避 + 抖动</pre>
+
+<p>It registers the machine and each instance, then runs a heartbeat loop (with exponential backoff + jitter), re-registering after three consecutive 404s. The <code>capabilities</code> field has <code>rpc: true</code> but <code>relay: false, iroh: false</code> — a hint that the relay and iroh transports are planned but not yet implemented.</p>
+
+<h3 id="architecture">The full architecture</h3>
+
+<p>Putting the first design together:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="server-chain" data-w="900" data-h="700"></canvas></div>
+  <figcaption>Figure 1: The complete chain of the first remote design. The CLI drives the daemon over Unix-socket JSONL; the supervisor drives headless <code>pi --mode rpc</code> child processes over stdio JSONL and registers them with the Radius relay via HTTPS heartbeats; remote clients reach the agents through the relay.</figcaption>
+</figure>
+
+<p>This is one complete chain: CLI/IPC client → (Unix socket JSONL) → daemon supervisor → (stdio JSONL) → headless <code>pi --mode rpc</code> child processes → (HTTPS heartbeat) → Radius remote relay. It reuses the Chapter 11 RPC pattern as the innermost layer and extends outward layer by layer.</p>
+
+<hr class="sep">
+
+<h2 id="protocol-client">The second design: <code>pi-protocol</code> + <code>pi-client</code></h2>
+
+<p>Now for the second design — one with a very different temperament.</p>
+
+<h3 id="cbor-protocol"><code>pi-protocol</code>: a transport-neutral CBOR protocol</h3>
+
+<p><code>pi-protocol</code> (<code>packages/protocol</code>) describes itself as a "Transport-neutral CBOR protocol for remote pi sessions". It has only one runtime dependency (<code>typebox</code>) and zero Node-specific imports — it defines a pure protocol: schemas, CBOR encoding, and byte-stream framing.</p>
+
+<p><strong>Framing</strong> (<code>packages/protocol/src/framing.ts</code>): protocol version 2; each frame is</p>
+
+<pre class="code" data-lang="text" data-file="packages/protocol/src/framing.ts">[4 字节大端无符号长度][一个定长 CBOR 项]</pre>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/framing.ts">export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024; // 16 MiB
+export function encodeFrame(payload: Uint8Array): Uint8Array; // 加长度头
+export class FrameDecoder {
+	push(chunk: Uint8Array): Uint8Array[]; // 增量切分任意字节块
+	end(): void;
+}</pre>
+
+<p><code>FrameDecoder.push</code> incrementally splits any byte stream (handling fragmentation and coalescing) into complete payloads. The CBOR is a strict RFC 8949 subset (<code>cbor/</code>): null/booleans, finite safe integers and float64, UTF-8 strings, byte strings, fixed-length arrays, fixed-length maps. Default limits: 16 MiB payload, 1,000,000 elements, 64 nesting levels.</p>
+
+<p><strong>Message vocabulary</strong> (<code>packages/protocol/src/schemas.ts</code>). The first frame is always the handshake:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const ClientHelloSchema = StrictObject({
+	type: Type.Literal("hello"),
+	version: Type.Integer({ minimum: 0 }),
+	token: Type.String({ minLength: 1 }), // bearer token
+});</pre>
+
+<p>The server answers with <code>hello</code> (carrying <code>connectionId</code> and <code>snapshot</code>) or <code>hello_error</code>. Afterwards the client sends a <code>request</code> envelope wrapping one command. Nine commands:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const CommandSchema = Type.Union([
+	ListCommandSchema,      // list
+	CreateCommandSchema,    // create
+	AttachCommandSchema,    // attach
+	DetachCommandSchema,    // detach
+	PromptCommandSchema,    // prompt
+	SteerCommandSchema,     // steer
+	AbortCommandSchema,     // abort
+	SetModelCommandSchema,  // set_model
+	SetThinkingCommandSchema, // set_thinking
+]);</pre>
+
+<p>Server messages come in a <code>response</code> envelope (correlated by id, <code>ok: true</code> + result, or <code>ok: false</code> + error) and an <code>event</code> envelope. Events are one of four kinds:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/protocol/src/schemas.ts">export const ServerEventSchema = Type.Union([
+	// server_snapshot, session_snapshot, session_progress, session_removed
+]);</pre>
+
+<p>It also defines a full <strong>transcript domain model</strong>: content parts (text/thinking/image/toolCall), <code>TranscriptItem</code> (user/assistant/tool, each with a status), <code>TranscriptProgress</code> (item_started/assistant_delta/item_updated/item_finished), <code>SessionSummary</code>, <code>SessionSnapshot</code>, <code>ServerSnapshot</code>, <code>ModelMetadata</code>, and a structured <code>ProtocolError</code>.</p>
+
+<p>One detail shows its alignment with the core: <code>SessionPhase = idle | turn | compaction | branch_summary | retry</code>, with a comment stating it "Matches AgentHarnessPhase so adapters do not need a second phase vocabulary" — the protocol's phase vocabulary directly reuses the harness phases from Chapter 6, so adapters don't have to maintain two vocabularies.</p>
+
+<p>Every schema uses <code>StrictObject</code> (<code>additionalProperties: false</code>) — unknown properties are rejected. This is a strict protocol designed for long-term evolution.</p>
+
+<h3 id="runtime-client"><code>pi-client</code>: a runtime-agnostic client</h3>
+
+<p><code>pi-client</code> (<code>packages/client</code>) consumes <code>pi-protocol</code>, and its root package has <strong>no Node-specific imports</strong> — the Node/Bun Unix-socket transport is quarantined behind the <code>./unix</code> subpath export. The whole package rests on a minimal transport seam (<code>packages/client/src/transport.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/client/src/transport.ts">export interface ByteTransport {
+	send(chunk: Uint8Array): Promise&lt;void&gt;; // 顺序交付，尊重背压
+	close(): void;                          // 幂等
+}
+export interface ByteTransportHandlers {
+	onData(chunk: Uint8Array): void;
+	onClose(): void;
+	onError(error: Error): void;
+}
+export type ByteTransportFactory = (handlers: ByteTransportHandlers) =&gt; ByteTransport | Promise&lt;ByteTransport&gt;;</pre>
+
+<p><code>ByteTransport</code> has exactly two methods: <code>send</code> and <code>close</code>. Any ordered byte stream will do — WebSocket, Unix socket, or anything else. The factory must produce a <strong>fresh</strong> transport for every connection attempt. This seam makes the whole client runtime-agnostic: swap the <code>ByteTransportFactory</code> and it runs on any transport.</p>
+
+<p><code>PiClient</code> (<code>packages/client/src/client.ts</code>) is the public entry point:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/client/src/client.ts">connect(): Promise&lt;ServerSnapshot&gt;;
+listSessions(): Promise&lt;readonly SessionSummary[]&gt;;
+createSession(options?): Promise&lt;PiSessionHandle&gt;;
+attachSession(sessionId): Promise&lt;PiSessionHandle&gt;;
+subscribe(listener); onEvent(listener); onConnectionStateChange(listener);</pre>
+
+<p>It has no auto-reconnect — the caller drives <code>connect</code>/<code>reconnect</code>/<code>disconnect</code>. <code>PiSessionHandle</code> is a stable client-side reference to a session: <code>prompt(text)</code>, <code>steer(text)</code>, <code>abort()</code>, <code>setModel(model)</code>, <code>setThinking(level)</code>, <code>detach()</code>, each returning <code>Promise&lt;SessionSnapshot&gt;</code>.</p>
+
+<p>The internal <code>Connection</code> (<code>connection.ts</code>) is a lifecycle state machine (<code>disconnected | connecting | connected</code>): it first sends a client <code>hello</code>, expects the server <code>hello</code> as the first inbound message, resolves the handshake with the <code>ServerSnapshot</code>, then routes subsequent messages to <code>onMessage</code>. It defends against "data before the handshake" and "unexpected handshake messages".</p>
+
+<p><code>ClientState</code> (<code>state.ts</code>) holds the snapshot cache (<code>ServerSnapshot</code> plus a per-session <code>SessionSnapshot</code>) and the listener registry; <code>applyServerSnapshot</code> carries a revision guard (stale snapshots don't overwrite newer ones). Subscriber exceptions are quarantined and reported via <code>onListenerError</code> so they "cannot affect client state".</p>
+
+<h3 id="snapshot">Snapshot authority + ephemeral progress</h3>
+
+<p>This protocol embodies an important design philosophy the README hammers home: <strong>snapshots are authoritative; progress events are ephemeral UI hints.</strong></p>
+
+<p>The <code>session_progress</code> events (with <code>TranscriptProgress</code>: item_started/assistant_delta/item_finished) are streaming incremental hints that let the UI render in real time. But if a client misses a few progress events, or has just connected, it doesn't need to replay anything — <code>session_snapshot</code> provides the complete current state. The client can rebuild everything from a snapshot at any time; progress events are just an optimization to "make it feel fluid".</p>
+
+<p>This contrasts with the event stream of Chapter 3: there, events are the single source of truth; here, snapshots are the truth and events are hints. Each model suits different scenarios — for a remote system that may disconnect and reconnect, with multiple clients attaching, "snapshot authority" is more robust.</p>
+
+<h3 id="unwired">An unwired client</h3>
+
+<p>Key fact: in this snapshot of the code, <strong>nothing serves <code>pi-protocol</code>.</strong> <code>pi-server</code> does not import <code>pi-protocol</code> — it uses its own JSON IPC. <code>pi-client</code> is a well-designed client SDK waiting for a server that is not implemented here.</p>
+
+<p>It reads like it was built for a future remote UI (a GUI, a web interface): transport-neutral (it could run on a browser WebSocket), runtime-agnostic, snapshot-authoritative (suited to multiple clients), and a strictly versioned protocol. It is the design draft of a "next-generation" remote solution.</p>
+
+<hr class="sep">
+
+<h2 id="why-two">Why two designs</h2>
+
+<p>Putting the two side by side:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th></th><th><code>pi-server</code> (first design)</th><th><code>pi-protocol</code>/<code>pi-client</code> (second design)</th></tr></thead>
+<tbody>
+<tr><td>Status</td><td>Implemented, self-contained</td><td>Client implemented, server unwired</td></tr>
+<tr><td>Transport</td><td>Unix socket + stdio</td><td>Transport-neutral (any byte stream)</td></tr>
+<tr><td>Encoding</td><td>newline-delimited JSON</td><td>Length-prefixed CBOR (binary)</td></tr>
+<tr><td>Runtime</td><td>Node/Bun</td><td>Runtime-agnostic (browser-capable)</td></tr>
+<tr><td>Topology</td><td>Daemon supervising child processes</td><td>Client-server, multi-client attach</td></tr>
+<tr><td>Remote access</td><td>Radius relay (HTTPS heartbeat)</td><td>The protocol itself is transport-neutral</td></tr>
+<tr><td>Truth model</td><td>Event stream</td><td>Snapshot authority + ephemeral progress</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>These two are not duplicated effort but <strong>two phases of evolution</strong>. <code>pi-server</code> is "what works today" — it solves the concrete need of "run multiple agents in the background + remote access" with simple JSON-over-socket, reusing the existing RPC pattern. <code>pi-protocol</code>/<code>pi-client</code> are "designed for the future" — a more general, stricter, transport-neutral protocol prepared for a remote UI that has not arrived yet.</p>
+
+<p>This reveals a pragmatic engineering attitude: <strong>solve today's problems with the simple approach first, while designing a more general interface for the future — without forcing the two to converge.</strong> <code>pi-server</code> does not force itself onto the immature CBOR protocol for the sake of "elegance"; <code>pi-protocol</code> does not bend to <code>pi-server</code>'s JSON design for the sake of "reuse". The two evolve independently and converge when the time is right — or never.</p>
+
+<p>This is another facet of the minimalism philosophy: remote capability is an <strong>optional side branch</strong> (in the Chapter 1 dependency graph, <code>server</code>/<code>protocol</code>/<code>client</code> are all downstream of the product layer; the product layer does not depend on them). Installing the <code>pi</code> command needs no remote components at all. Remote is "there if you need it", not "forcibly built into the core".</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's two remote designs offer four transferable patterns for "how to add remote capability to a system".</p>
+
+<p><strong>Achieve transport neutrality with a minimal transport seam.</strong> <code>ByteTransport</code> has only <code>send</code>/<code>close</code>; any ordered byte stream can be adapted. It solves the problem of a client being locked to one specific transport (WebSocket/Unix socket). When the transport is a two-method interface, the same client runs on any transport — including the browser.</p>
+
+<p><strong>Snapshots authoritative, events ephemeral.</strong> Full state is expressed with snapshots (rebuildable at any time); streaming events are just UI hints (losing them does not hurt correctness). It solves the problem that, when remote clients disconnect and reconnect and multiple clients attach, a pure event stream needs replay and drifts easily. When snapshots are the truth, reconnecting is just "grab a snapshot", and robustness improves dramatically.</p>
+
+<p><strong>Reuse an existing pattern as the inner layer, then extend outward.</strong> <code>pi-server</code>'s innermost layer directly reuses <code>pi --mode rpc</code> from Chapter 11, wrapped in a supervisor, IPC, and Radius. It solves the problem of writing agent-driving logic from scratch for remote. When remote is "wrapping the existing RPC pattern layer by layer", every layer stays simple and the inner behavior is identical to local.</p>
+
+<p><strong>Let two designs coexist while evolving.</strong> The current simple approach (JSON IPC) and the future general design (CBOR protocol) evolve independently, without forced unification. It solves the problem of either saddling today's solution with elegance or compromising the future design for reuse. When the two are decoupled, each matures on its own schedule — pragmatism often beats consistency.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's remote control has two designs. The first, <code>pi-server</code>, is an implemented daemon: <code>ServerSupervisor</code> supervises multiple <code>pi --mode rpc</code> child processes (over stdio JSONL, reusing the Chapter 11 RPC pattern), the CLI manages it over Unix-socket JSON IPC, state is persisted in <code>~/.pi/server/</code>, and it registers with <code>radius.pi.dev</code> through the Radius relay for remote access. The second, <code>pi-protocol</code> + <code>pi-client</code>, is a transport-neutral, runtime-agnostic CBOR protocol and client: length-prefixed frames, a hello handshake, nine commands, snapshot authority + ephemeral progress, and the two-method <code>ByteTransport</code> seam — but in this snapshot no server serves it; it is a design draft for a future remote UI.</p>
+
+<p>The coexistence of the two is not redundancy but two phases of evolution: a simple present and a general future. And remote capability as a whole is an optional side branch the product core does not depend on at all — once again reflecting the philosophy of "minimal core, optional capabilities pushed to the edge".</p>
+
+<p>Next chapter, we turn to a topic that is often overlooked yet vital for agents: how model-driven behavioral evaluation verifies that an agent truly gets better.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("server-chain", function (d) {
+  d.box({ id: "CLI", x: 350, y: 30, w: 200, h: 58, title: "server CLI", lines: ["spawn / list / rpc …"], tone: "accent", titleSize: 13 });
+  d.box({ id: "IPC", x: 350, y: 140, w: 200, h: 58, title: "IPC server", tone: "accent", titleSize: 13 });
+  d.box({ id: "SUP", x: 330, y: 250, w: 240, h: 70, title: "ServerSupervisor", lines: ["liveInstances"], tone: "gold", titleSize: 13 });
+  d.box({ id: "RPC1", x: 60, y: 400, w: 210, h: 64, title: "pi --mode rpc", lines: ["child 1"], tone: "teal", titleSize: 13 });
+  d.box({ id: "RPC2", x: 320, y: 400, w: 210, h: 64, title: "pi --mode rpc", lines: ["child 2"], tone: "teal", titleSize: 13 });
+  d.box({ id: "RADIUS", x: 620, y: 400, w: 220, h: 64, title: "Radius relay", lines: ["radius.pi.dev"], tone: "violet", titleSize: 13 });
+  d.box({ id: "STORE", x: 60, y: 560, w: 210, h: 66, title: "~/.pi/server/", lines: ["machine.json", "instances.json"], tone: "slate", titleSize: 13 });
+  d.box({ id: "REMOTE", x: 620, y: 560, w: 220, h: 64, title: "Remote client", tone: "slate", titleSize: 13 });
+
+  d.arrow("CLI", "IPC", { from: "bottom", to: "top", label: "Unix socket, JSONL" });
+  d.arrow("IPC", "SUP", { from: "bottom", to: "top" });
+
+  d.path([[380, 320], [380, 352], [165, 352], [165, 400]]);
+  d.path([[450, 320], [450, 352], [425, 352], [425, 400]]);
+  d.path([[520, 320], [520, 352], [730, 352], [730, 400]]);
+  d.path([[330, 285], [36, 285], [36, 562], [60, 562]]);
+  d.arrow("RADIUS", "REMOTE", { from: "bottom", to: "top", dashed: true, label: "Remote access" });
+
+  d.text("spawn + stdin/stdout JSONL", 272, 344, { size: 11.5, color: d.theme.muted, halo: true });
+  d.text("HTTPS heartbeat", 625, 344, { size: 11.5, color: d.theme.muted, halo: true });
+  d.text("read/write", 36, 430, { size: 11.5, color: d.theme.muted, halo: true });
+
+  d.text("CLI/IPC → daemon supervisor → headless pi child → Radius relay: reusing ch. 11 RPC mode, layered outward", 450, 662, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

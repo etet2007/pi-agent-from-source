@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 4 · The Tool System: From Definition to Execution | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch04">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part II · Agent Core</p>
+  <h1>Chapter 4: The Tool System: From Definition to Execution</h1>
+  <p class="chapter-sub">Self-describing tool objects, a prepare / execute / finalize pipeline, and a concurrency philosophy of serial pre-checks, parallel execution, and per-path mutexes</p>
+</header>
+
+<h2 id="hook">Tools Are the Agent's Hands</h2>
+
+<p>A model by itself can do exactly one thing: generate text. It cannot read files, run commands, or modify code. What lets a model actually "do things" is tools — the agent's hands. Chapter 3's loop glossed over <code>executeToolCalls</code> in passing; this chapter takes it apart completely.</p>
+
+<p>Pi Agent's tool system rests on two design decisions worth pondering. First, <strong>tools are self-describing objects</strong>: concurrency mode, parameter schema, and UI rendering all live inside the tool definition, and the loop knows nothing about a tool's internals. Second, <strong>tools have two faces</strong>: the <code>AgentTool</code> the core runtime knows is minimal, while the <code>ToolDefinition</code> used by the product layer is rich (adding prompt metadata and TUI renderers), with only a thin wrapper function between them.</p>
+
+<p>Both decisions serve one goal: adding a tool should require no changes to the loop, to system prompt assembly, or to UI rendering. The tool states everything it needs; the system simply takes it at face value.</p>
+
+<hr class="sep">
+
+<h2 id="two-faces">Two Faces: <code>AgentTool</code> and <code>ToolDefinition</code></h2>
+
+<h3 id="agenttool">The Core Knows <code>AgentTool</code></h3>
+
+<p>The core runtime (<code>pi-agent-core</code>) knows only a minimal interface (<code>packages/agent/src/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/types.ts">export interface AgentTool&lt;TParameters extends TSchema = TSchema, TDetails = any&gt;
+	extends Tool&lt;TParameters&gt; {
+	label: string;
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParameters&gt;;
+	execute: (
+		toolCallId: string,
+		params: Static&lt;TParameters&gt;,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback&lt;TDetails&gt;,
+	) =&gt; Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	executionMode?: ToolExecutionMode; // "sequential" | "parallel"
+}</pre>
+
+<p>It extends <code>Tool&lt;TParameters&gt;</code> from <code>pi-ai</code> (which brings <code>name</code>, <code>description</code>, the <code>parameters</code> schema, and <code>constrainedSampling</code>), adding four more things:</p>
+
+<ul>
+<li><code>label</code>: the label shown in the UI</li>
+<li><code>prepareArguments</code>: optional argument preprocessing before execution</li>
+<li><code>execute</code>: the actual execution logic, receiving the tool call id, parameters, abort signal, and progress callback</li>
+<li><code>executionMode</code>: declares whether the tool must run sequentially or may run in parallel</li>
+</ul>
+
+<p>Note that <code>execute</code> returns an <code>AgentToolResult&lt;T&gt;</code> (<code>packages/agent/src/types.ts</code>) carrying <code>content</code> (the content fed back to the model), <code>details</code> (structured details for the UI), optional <code>usage</code> and <code>addedToolNames</code>, plus a <code>terminate</code> flag — the last one tells the loop "you may stop once this tool finishes".</p>
+
+<p>The core deliberately <strong>does not know</strong> how a tool should be rendered or what it should add to the system prompt. Those are product concerns.</p>
+
+<h3 id="tooldefinition">The Product Layer Uses <code>ToolDefinition</code></h3>
+
+<p>The product layer (<code>pi-coding-agent</code>) needs a richer interface, because the product also cares about "how this tool appears in the prompt" and "how it renders on the terminal". <code>ToolDefinition</code> (<code>packages/coding-agent/src/core/extensions/types.ts</code>) adds these on top of <code>AgentTool</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/extensions/types.ts">export interface ToolDefinition&lt;TParams extends TSchema = TSchema, TDetails = unknown, TState = any&gt; {
+	name: string;          // LLM 工具调用用的名字
+	label: string;         // UI 标签
+	description: string;   // 给 LLM 的描述
+	promptSnippet?: string;    // "Available tools" 提示词段落里的一行简介
+	promptGuidelines?: string[]; // 工具激活时追加的指南要点
+	parameters: TParams;       // TypeBox schema
+	constrainedSampling?: false | ConstrainedSamplingConfig;
+	renderShell?: "default" | "self";
+	prepareArguments?: (args: unknown) =&gt; Static&lt;TParams&gt;;
+	executionMode?: ToolExecutionMode;
+	execute(toolCallId, params, signal, onUpdate, ctx: ExtensionContext): Promise&lt;AgentToolResult&lt;TDetails&gt;&gt;;
+	renderCall?(args, theme, context): Component;    // TUI：如何渲染这次调用
+	renderResult?(result, options, theme, context): Component; // TUI：如何渲染结果
+}</pre>
+
+<p>The extra fields fall into two categories:</p>
+
+<ul>
+<li><strong>Prompt metadata</strong> (<code>promptSnippet</code>, <code>promptGuidelines</code>): as Chapter 10 will show, the "Available tools" section of the system prompt is assembled from the <code>promptSnippet</code> of each active tool, and the "Guidelines" section collects their <code>promptGuidelines</code>. When a tool is enabled, its prompt snippet appears automatically; when it is disabled, the snippet disappears.</li>
+<li><strong>TUI renderers</strong> (<code>renderCall</code>, <code>renderResult</code>): they return a <code>pi-tui</code> <code>Component</code>. As Chapter 12 will show, what a tool call looks like in the terminal (for example, the edit tool's colored diff) is entirely up to the tool itself.</li>
+</ul>
+
+<h3 id="wrapper">The Bridge: <code>wrapToolDefinition</code></h3>
+
+<p>Only a thin function sits between the two faces (<code>packages/coding-agent/src/core/tools/tool-definition-wrapper.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/tool-definition-wrapper.ts">export function wrapToolDefinition&lt;TDetails = unknown&gt;(
+	definition: ToolDefinition&lt;any, TDetails&gt;,
+	ctxFactory?: () =&gt; ExtensionContext,
+): AgentTool&lt;any, TDetails&gt; {
+	return {
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		constrainedSampling: definition.constrainedSampling,
+		prepareArguments: definition.prepareArguments,
+		executionMode: definition.executionMode,
+		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) =&gt;
+			definition.execute(toolCallId, params, signal, onUpdate, ctx ?? (ctxFactory?.() as ExtensionContext)),
+	};
+}</pre>
+
+<p>It projects the rich <code>ToolDefinition</code> onto a minimal <code>AgentTool</code> — dropping <code>promptSnippet</code>, <code>promptGuidelines</code>, <code>renderCall</code>, and <code>renderResult</code>, keeping only the fields the core needs. There is also a reverse <code>createToolDefinitionFromAgentTool</code>: when a caller supplies a bare <code>AgentTool</code> (without prompt metadata or renderers), it synthesizes a minimal <code>ToolDefinition</code>, keeping the product-layer registry "definition-first".</p>
+
+<p>This "rich interface + minimal interface + thin wrapper" pattern is a microcosm of Pi Agent's layering philosophy: the core takes only what it needs, the product keeps what it has extra, and neither contaminates the other. The extension system (Chapter 14) also registers custom tools as <code>ToolDefinition</code>s — so custom tools naturally gain prompt integration and UI rendering for free.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="two-faces" data-w="860" data-h="380"></canvas></div>
+  <figcaption>Figure 1: The two faces and the bridge. The core loop knows only the minimal <code>AgentTool</code>; the product layer and extensions use the rich <code>ToolDefinition</code>; <code>wrapToolDefinition</code> performs the projection between them.</figcaption>
+</figure>
+
+<hr class="sep">
+
+<h2 id="pipeline">The Execution Pipeline: prepare / execute / finalize</h2>
+
+<p>Now we step inside the loop. Chapter 3's <code>executeToolCalls</code> starts with a dispatch decision:</p>
+
+<pre class="code" data-lang="ts">async function executeToolCalls(currentContext, assistantMessage, config, signal, emit) {
+	const toolCalls = assistantMessage.content.filter((c) =&gt; c.type === "toolCall");
+	const hasSequentialToolCall = toolCalls.some(
+		(tc) =&gt; currentContext.tools?.find((t) =&gt; t.name === tc.name)?.executionMode === "sequential",
+	);
+	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	}
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}</pre>
+
+<p>The rule is simple: if <strong>any</strong> tool in the batch declares <code>executionMode: "sequential"</code>, or the global config is sequential, the whole batch runs serially; otherwise it runs in parallel. Note this is a "one bad apple spoils the barrel" strategy — a single sequential tool makes every tool in the batch sequential. This is conservative and correct: sequential tools often have ordering requirements on side effects, and a tool running in parallel with them could trip over them.</p>
+
+<p>Whether serial or parallel, every tool call goes through the same three stages.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="pipeline" data-w="900" data-h="410"></canvas></div>
+  <figcaption>Figure 2: The three-stage execution pipeline for each tool call. Failures are always encoded into the result object (<code>kind: "immediate"</code> / <code>isError: true</code>) rather than thrown.</figcaption>
+</figure>
+
+<h3 id="prepare">Stage One: prepare</h3>
+
+<p><code>prepareToolCall</code> does all the pre-execution preparation, returning either a <code>PreparedToolCall</code> or an immediate failure result:</p>
+
+<pre class="code" data-lang="ts">async function prepareToolCall(currentContext, assistantMessage, toolCall, config, signal) {
+	// 1. 找到工具，找不到立即报错
+	const tool = currentContext.tools?.find((t) =&gt; t.name === toolCall.name);
+	if (!tool) {
+		return { kind: "immediate", result: createErrorToolResult(`Tool ${toolCall.name} not found`), isError: true };
+	}
+	try {
+		// 2. 参数预处理（可选）
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		// 3. 按 schema 校验参数（来自 pi-ai）
+		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		// 4. beforeToolCall 钩子，可以 block
+		if (config.beforeToolCall) {
+			const beforeResult = await config.beforeToolCall({ assistantMessage, toolCall, args: validatedArgs, context: currentContext }, signal);
+			if (signal?.aborted) return { kind: "immediate", result: createErrorToolResult("Operation aborted"), isError: true };
+			if (beforeResult?.block) {
+				return { kind: "immediate", result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"), isError: true };
+			}
+		}
+		if (signal?.aborted) return { kind: "immediate", result: createErrorToolResult("Operation aborted"), isError: true };
+		return { kind: "prepared", toolCall, tool, args: validatedArgs };
+	} catch (error) {
+		return { kind: "immediate", result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
+	}
+}</pre>
+
+<p>Four steps: look up the tool, preprocess with <code>prepareArguments</code>, validate against the TypeBox schema with <code>validateToolArguments</code>, and run the <code>beforeToolCall</code> hook. <code>beforeToolCall</code> is the interception point for the product layer and extensions — it can return <code>{ block: true, reason }</code> to stop execution. Recall Chapter 1: Pi Agent has no per-tool approval dialog, but extensions can implement their own interception logic through <code>beforeToolCall</code> (or the product layer through the <code>tool_call</code> event). The safety mechanism is extrapolated outward, but the seam is left right here.</p>
+
+<p>Note that every failure returns a result object with <code>kind: "immediate"</code> instead of throwing — once again honoring the "failures are data" contract.</p>
+
+<h3 id="execute">Stage Two: execute</h3>
+
+<p><code>executePreparedToolCall</code> actually invokes the tool, handling progress reporting and exceptions:</p>
+
+<pre class="code" data-lang="ts">async function executePreparedToolCall(prepared, signal, emit) {
+	const updateEvents: Promise&lt;void&gt;[] = [];
+	let acceptingUpdates = true;
+	try {
+		const result = await prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args,
+			signal,
+			(partialResult) =&gt; {
+				if (!acceptingUpdates) return;
+				updateEvents.push(Promise.resolve(emit({
+					type: "tool_execution_update",
+					toolCallId: prepared.toolCall.id,
+					toolName: prepared.toolCall.name,
+					args: prepared.toolCall.arguments,
+					partialResult,
+				})));
+			},
+		);
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result, isError: false };
+	} catch (error) {
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
+	} finally {
+		acceptingUpdates = false;
+	}
+}</pre>
+
+<p>The tool reports progress through the fourth parameter, the <code>onUpdate</code> callback, and the loop turns it into <code>tool_execution_update</code> events. The <code>acceptingUpdates</code> flag ensures no late progress updates are accepted after the tool returns. Exceptions thrown by the tool are caught and converted into an error tool result — a failing tool execution does not blow up the loop; it becomes an <code>isError: true</code> result fed back to the model, which decides how to respond (retry? another approach? give up?).</p>
+
+<h3 id="finalize">Stage Three: finalize</h3>
+
+<p><code>finalizeExecutedToolCall</code> gives the <code>afterToolCall</code> hook one last chance to modify the result:</p>
+
+<pre class="code" data-lang="ts">async function finalizeExecutedToolCall(currentContext, assistantMessage, prepared, executed, config, signal) {
+	let result = executed.result;
+	let isError = executed.isError;
+	if (config.afterToolCall) {
+		try {
+			const afterResult = await config.afterToolCall({ assistantMessage, toolCall: prepared.toolCall, args: prepared.args, result, isError, context: currentContext }, signal);
+			if (afterResult) {
+				result = {
+					...result,
+					content: afterResult.content ?? result.content,
+					details: afterResult.details ?? result.details,
+					usage: afterResult.usage ?? result.usage,
+					terminate: afterResult.terminate ?? result.terminate,
+				};
+				isError = afterResult.isError ?? isError;
+			}
+		} catch (error) {
+			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			isError = true;
+		}
+	}
+	return { toolCall: prepared.toolCall, result, isError };
+}</pre>
+
+<p><code>afterToolCall</code> can override <code>content</code>, <code>details</code>, <code>usage</code>, <code>terminate</code>, and <code>isError</code>. This gives the product layer and extensions a "post-hoc review" slot — for example, writing audit logs, modifying the content fed back to the model, or setting <code>terminate</code> to force the loop to stop.</p>
+
+<p>Finally, <code>createToolResultMessage</code> packages the final result into a <code>toolResult</code> message:</p>
+
+<pre class="code" data-lang="ts">function createToolResultMessage(finalized): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: finalized.toolCall.id,
+		toolName: finalized.toolCall.name,
+		content: finalized.result.content ?? [],
+		details: finalized.result.details,
+		usage: finalized.result.usage,
+		...(finalized.result.addedToolNames?.length ? { addedToolNames: finalized.result.addedToolNames } : {}),
+		isError: finalized.isError,
+		timestamp: Date.now(),
+	};
+}</pre>
+
+<p>The message is appended to the context and becomes input for the next model call. <code>addedToolNames</code> is an intriguing field: a tool can declare "after I run, please add these tools to the available set" — a backdoor for tools to dynamically extend the toolset.</p>
+
+<hr class="sep">
+
+<h2 id="concurrency">Concurrency: How Parallel Execution Happens Safely</h2>
+
+<p>The default is <code>toolExecution: "parallel"</code>. Parallel execution has a subtle design point — <strong>serial pre-checks, parallel execution</strong>:</p>
+
+<pre class="code" data-lang="ts">async function executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit) {
+	const finalizedCalls: FinalizedToolCallEntry[] = [];
+
+	for (const toolCall of toolCalls) {
+		await emit({ type: "tool_execution_start", toolCallId: toolCall.id, toolName: toolCall.name, args: toolCall.arguments });
+
+		// 预检（prepare）是串行的
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		if (preparation.kind === "immediate") {
+			// 立即结果直接收尾
+			const finalized = { toolCall, result: preparation.result, isError: preparation.isError };
+			await emitToolExecutionEnd(finalized, emit);
+			finalizedCalls.push(finalized);
+			continue;
+		}
+
+		// 真正的执行被包成一个 thunk，稍后并行跑
+		finalizedCalls.push(async () =&gt; {
+			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const finalized = await finalizeExecutedToolCall(currentContext, assistantMessage, preparation, executed, config, signal);
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		});
+	}
+
+	// 所有 thunk 并行执行
+	const orderedFinalizedCalls = await Promise.all(
+		finalizedCalls.map((entry) =&gt; (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+
+	// 结果按助手消息里的原始顺序发出
+	const messages: ToolResultMessage[] = [];
+	for (const finalized of orderedFinalizedCalls) {
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+	return { messages, terminate: shouldTerminateToolBatch(orderedFinalizedCalls) };
+}</pre>
+
+<p>Why "serial pre-checks, parallel execution"? Because the <code>beforeToolCall</code> hook inside <code>prepareToolCall</code> may have side effects (logging, approval prompts, state changes), and letting them happen deterministically in the order the model emitted them is far more predictable than letting them race. The actual execution (reading files, running commands) is what takes time, and parallelism pays off there. Hence:</p>
+
+<ul>
+<li><strong><code>tool_execution_start</code></strong> is emitted in the original order (pre-checks are serial)</li>
+<li><strong><code>tool_execution_end</code></strong> is emitted in <strong>completion order</strong> (whichever finishes first is emitted first, so the UI can update immediately)</li>
+<li><strong><code>toolResult</code> messages</strong> are appended to the context in <strong>original order</strong> (keeping the transcript deterministic)</li>
+</ul>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="parallel" data-w="880" data-h="460"></canvas></div>
+  <figcaption>Figure 3: Serial pre-checks, parallel execution. Events are emitted in completion order; <code>toolResult</code> messages are appended to the context in original order — the UI wants immediate feedback, but the transcript must stay deterministic.</figcaption>
+</figure>
+
+<p>This distinction between "events in completion order, messages in original order" is crucial: the UI wants immediate feedback (show whichever is ready first), but the transcript the model sees must be deterministic (the same input must produce the same message sequence, or caching and replay break down). Pi Agent uses <code>Promise.all</code> to keep execution order and array order in sync, making the message sequence deterministic.</p>
+
+<h3 id="terminate">The Terminate Signal</h3>
+
+<p>After a batch of tools finishes, <code>shouldTerminateToolBatch</code> decides whether to stop the loop:</p>
+
+<pre class="code" data-lang="ts">function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
+	return finalizedCalls.length &gt; 0 &amp;&amp; finalizedCalls.every((finalized) =&gt; finalized.result.terminate === true);
+}</pre>
+
+<p>Only when <strong>every</strong> final result sets <code>terminate: true</code> does the batch stop the loop. This is an "all votes required" rule: as long as one tool has not said "stop", the loop continues. It prevents a single tool from prematurely cutting off work still in progress.</p>
+
+<hr class="sep">
+
+<h2 id="mutex">File Mutex: What If Two Parallel Tools Write the Same File</h2>
+
+<p>Parallel execution carries a real danger: what if the model issues two <code>edit</code> calls in the same batch, both modifying the same file? With the two writes interleaving, the file could end up corrupted.</p>
+
+<p>Pi Agent's answer is a per-path mutex queue, <code>withFileMutationQueue</code> (<code>packages/agent/src/harness/tools/file-mutation-queue.ts</code>). At its core is a <code>WeakMap</code> keeping, per <code>ExecutionEnv</code>, a "path → promise chain" table:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/agent/src/harness/tools/file-mutation-queue.ts">const states = new WeakMap&lt;ExecutionEnv, MutationQueueState&gt;();
+
+export async function withFileMutationQueue&lt;T&gt;(env: ExecutionEnv, path: string, fn: () =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+	const state = getState(env);
+	const registration = state.registration.then(async () =&gt; {
+		const key = await getMutationQueueKey(env, path); // 规范化路径作为 key
+		const currentQueue = state.queues.get(key) ?? Promise.resolve();
+
+		let releaseNext = () =&gt; {};
+		const nextQueue = new Promise&lt;void&gt;((resolve) =&gt; { releaseNext = resolve; });
+		const chainedQueue = currentQueue.then(() =&gt; nextQueue);
+		state.queues.set(key, chainedQueue);
+		return { key, currentQueue, chainedQueue, releaseNext };
+	});
+	state.registration = registration.then(() =&gt; undefined, () =&gt; undefined);
+
+	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	await currentQueue; // 等前面的写操作完成
+	try {
+		return await fn();
+	} finally {
+		releaseNext(); // 放行下一个
+		if (state.queues.get(key) === chainedQueue) state.queues.delete(key);
+	}
+}</pre>
+
+<p>The mechanism is the classic "promise-chain mutex": every write targeting the same canonical path appends itself to the end of that path's current promise chain, first <code>await</code>ing <code>currentQueue</code> for its predecessors to finish, then calling <code>releaseNext()</code> to let the next one through. So parallel <code>edit</code>/<code>write</code> calls automatically serialize at the file layer, never interleaving.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="mutex" data-w="880" data-h="420"></canvas></div>
+  <figcaption>Figure 4: The per-path promise-chain mutex. The loop layer allows parallelism; the tool layer serializes writes to the same file by canonical path. Each layer does its own job.</figcaption>
+</figure>
+
+<p>Two details are worth noting. First, the key is the <strong>canonical path</strong> (<code>canonicalPath</code>) — so <code>./foo/bar.ts</code> and <code>/abs/foo/bar.ts</code> map to the same queue, and mutex protection is not lost just because the path was written differently. Second, using a <code>WeakMap</code> keyed by <code>ExecutionEnv</code> means different execution environments (say, different sandboxes) have their own independent queues, and the queues are cleaned up automatically when the environment is garbage-collected. <code>createEditTool</code> and <code>createWriteTool</code> wrap their execution bodies in this queue; <code>read</code> does not need to (reads do not conflict).</p>
+
+<p>This is a fine example of "solving concurrency at the right layer": the loop layer lets tools run in parallel (the payoff), and the tool layer eliminates write conflicts with per-path mutexes (the safety). Each layer does its own job.</p>
+
+<hr class="sep">
+
+<h2 id="builtin-tools">The Seven Built-in Tools</h2>
+
+<p>The product layer ships seven built-in tools, each with its own file under <code>packages/coding-agent/src/core/tools/</code>:</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Tool</th><th>File</th><th>Purpose</th><th>Enabled by default</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td><code>read.ts</code></td><td>Read files/images; supports offset/limit; auto-truncates</td><td>Yes</td></tr>
+<tr><td><code>bash</code></td><td><code>bash.ts</code></td><td>Run shell commands</td><td>Yes</td></tr>
+<tr><td><code>edit</code></td><td><code>edit.ts</code></td><td>Precise string-replacement edits</td><td>Yes</td></tr>
+<tr><td><code>write</code></td><td><code>write.ts</code></td><td>Write/create files</td><td>Yes</td></tr>
+<tr><td><code>grep</code></td><td><code>grep.ts</code></td><td>Search contents (read-only)</td><td>No</td></tr>
+<tr><td><code>find</code></td><td><code>find.ts</code></td><td>Find files (read-only)</td><td>No</td></tr>
+<tr><td><code>ls</code></td><td><code>ls.ts</code></td><td>List directories (read-only)</td><td>No</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The registry lives in <code>packages/coding-agent/src/core/tools/index.ts</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/index.ts">export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
+export const allToolNames: Set&lt;ToolName&gt; = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+export function createCodingToolDefinitions(cwd, options?)  // read, bash, edit, write
+export function createReadOnlyToolDefinitions(cwd, options?) // read, grep, find, ls</pre>
+
+<p>The default enabled set is <code>["read", "bash", "edit", "write"]</code> (set in <code>packages/coding-agent/src/core/sdk.ts</code>). <code>grep</code>/<code>find</code>/<code>ls</code> are available but off by default — since <code>bash</code> exists, the model can achieve the same results with the <code>rg</code>/<code>find</code>/<code>ls</code> commands; these three read-only tools are there for scenarios that want a more restricted toolset (enabled explicitly via <code>--tools</code>).</p>
+
+<p>Let's look at one concrete tool definition (<code>read.ts</code>, excerpt):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/coding-agent/src/core/tools/read.ts">const readSchema = Type.Object({
+	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+export function createReadToolDefinition(cwd, options?): ToolDefinition&lt;typeof readSchema, ReadToolDetails | undefined&gt; {
+	return {
+		name: "read",
+		label: "read",
+		description: `Read the contents of a file. Supports text files and images ...`,
+		promptSnippet: "Read file contents",
+		promptGuidelines: ["Use read to examine files instead of cat or sed."],
+		parameters: readSchema,
+		async execute(_toolCallId, { path, offset, limit }, signal?, _onUpdate?, ctx?) {
+			// 读文件/图片，截断过长内容
+		},
+		renderCall(args, theme, context) { /* 返回一个 pi-tui Text 组件 */ },
+		renderResult(result, options, theme, context) { /* 语法高亮预览 */ },
+	};
+}
+
+export function createReadTool(cwd, options?): AgentTool&lt;typeof readSchema&gt; {
+	return wrapToolDefinition(createReadToolDefinition(cwd, options));
+}</pre>
+
+<p>This definition states everything about the tool: the parameter schema (<code>readSchema</code>), the description for the model (<code>description</code>), the one-line summary in the prompt (<code>promptSnippet</code>), the guidelines when enabled (<code>promptGuidelines</code>), the execution logic (<code>execute</code>), and the two TUI renderers. <code>createReadTool</code> is just <code>wrapToolDefinition(createReadToolDefinition(...))</code> — projecting the rich definition onto a minimal <code>AgentTool</code>.</p>
+
+<p>Tools can also have pluggable <code>operations</code> (such as <code>ReadOperations</code>) that let file IO be delegated to a remote system (like SSH). This is a seam left for remote-execution scenarios; Chapter 15 returns to it.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>Pi Agent's tool system offers four transferable patterns for "designing an extensible tool/plugin mechanism".</p>
+
+<p><strong>Tools are self-describing; the orchestrator is ignorant.</strong> Let each tool declare its own parameter schema, concurrency mode, prompt snippet, and UI rendering; the orchestrator (the loop) only reads these declarations and "knows" no specific tool. The problem it solves: the central orchestrator becomes a god object that must be modified for every added tool. When tools are self-describing, adding tool N+1 requires zero changes to existing code.</p>
+
+<p><strong>Rich interface + minimal interface + thin wrapper.</strong> The core only needs a tool's execution capability; the product also needs prompt and rendering metadata — expressed as two interfaces, projected through one thin function. The problem it solves: the core being forced to carry product-layer concerns. When <code>AgentTool</code> does not know <code>renderCall</code> exists, the core can be reused in any UI-less environment (SDK, browser, daemon).</p>
+
+<p><strong>Serial pre-checks, parallel execution.</strong> Run the side-effectful pre-checks that need a deterministic order (validation, approval hooks) serially, and parallelize the time-consuming real execution. The problem it solves: either everything serial (slow) or everything parallel (racing pre-checks, nondeterministic transcripts). This split buys both parallel speed and deterministic ordering.</p>
+
+<p><strong>Solve concurrency at the right layer.</strong> The loop layer allows tools to run in parallel for speed; the tool layer eliminates write conflicts with per-path promise-chain mutexes. The problem it solves: either crudely serializing everything at the loop layer (sacrificing concurrency) or ignoring conflicts entirely (corrupting files). Only by sinking the mutex down to the layer of the actually shared resource can you have both concurrency and safety.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p>Pi Agent's tools are self-describing objects: the core knows the minimal <code>AgentTool</code>, the product uses the rich <code>ToolDefinition</code>, and <code>wrapToolDefinition</code> bridges the two. Every tool call goes through three stages — prepare (look up the tool, preprocess, validate, <code>beforeToolCall</code>), execute (run + progress reporting + exception capture), and finalize (<code>afterToolCall</code> post-hoc modification). For concurrency: serial pre-checks, parallel execution, events emitted in completion order while messages are appended in original order; write conflicts are eliminated by the per-canonical-path promise-chain mutex.</p>
+
+<p>The seven built-in tools (read/bash/edit/write/grep/find/ls) each spell out their parameters, description, prompt snippet, and renderers, with the first four enabled by default. Nowhere in the system is there central code that "knows all the tools" — which is exactly why it scales linearly.</p>
+
+<p>In the next chapter, we look at how the messages tools produce are organized into state — and Pi Agent's distinctive design of modeling the transcript as a forkable tree.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("two-faces", function (d) {
+  d.box({ id: "at", x: 40, y: 50, w: 270, h: 140, title: "AgentTool (minimal)", lines: ["label / prepareArguments / execute", "executionMode / param schema", "The only interface the core loop knows"], tone: "teal", titleSize: 13 });
+  d.box({ id: "wrap", x: 345, y: 90, w: 190, h: 70, title: "wrapToolDefinition", lines: ["Rich → minimal projection"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "td", x: 560, y: 50, w: 260, h: 140, title: "ToolDefinition (rich)", lines: ["+ promptSnippet / promptGuidelines", "+ renderCall / renderResult", "Interface used by product & extensions"], tone: "violet", titleSize: 13 });
+
+  d.arrow("td", "wrap", { from: "left", to: "right", label: "Project" });
+  d.arrow("wrap", "at", { from: "left", to: "right", label: "Minimal interface" });
+
+  d.box({ id: "loop", x: 40, y: 260, w: 270, h: 64, title: "Core loop (Agent)", lines: ["Consumes AgentTool as-is"], tone: "slate", titleSize: 12.5 });
+  d.box({ id: "reg", x: 560, y: 260, w: 260, h: 64, title: "Product layer / extensions", lines: ["Register custom tools as ToolDefinition"], tone: "slate", titleSize: 12.5 });
+
+  d.arrow("at", "loop", { from: "bottom", to: "top" });
+  d.arrow("td", "reg", { from: "bottom", to: "top" });
+
+  d.text("Core takes what it needs, product keeps the rest — no pollution", 430, 358, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("pipeline", function (d) {
+  d.box({ id: "call", x: 30, y: 50, w: 150, h: 70, title: "toolCall", lines: ["Tool call from the model"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "prepare", x: 230, y: 40, w: 200, h: 110, title: "Stage 1: prepare", lines: ["Look up tool → error if missing", "prepareArguments preprocessing", "validateToolArguments validation", "beforeToolCall hook (can block)"], tone: "teal", titleSize: 13 });
+  d.box({ id: "execute", x: 480, y: 40, w: 200, h: 110, title: "Stage 2: execute", lines: ["tool.execute(...) actually runs", "onUpdate → progress events", "exception → isError result"], tone: "accent", titleSize: 13 });
+  d.box({ id: "finalize", x: 720, y: 40, w: 160, h: 110, title: "Stage 3: finalize", lines: ["afterToolCall post-hoc edit", "override content / details", "usage / terminate / isError"], tone: "violet", titleSize: 12.5 });
+
+  d.arrow("call", "prepare", { from: "right", to: "left" });
+  d.arrow("prepare", "execute", { from: "right", to: "left" });
+  d.arrow("execute", "finalize", { from: "right", to: "left" });
+
+  d.box({ id: "msg", x: 350, y: 230, w: 200, h: 64, title: "createToolResultMessage", lines: ["Packages a toolResult message"], tone: "gold", titleSize: 12.5 });
+  d.box({ id: "ctx", x: 350, y: 320, w: 200, h: 60, title: "Appended to context", lines: ["Input for the next model call"], tone: "slate", titleSize: 12.5 });
+
+  d.arrow("finalize", "msg", { from: "bottom", to: "top", label: "Final result" });
+  d.arrow("msg", "ctx", { from: "bottom", to: "top" });
+
+  d.text('Failures are encoded into results (kind: "immediate" / isError: true), not thrown', 450, 395, { size: 12, color: d.theme.muted, halo: true });
+});
+
+PB.fig("parallel", function (d) {
+  d.sequence({
+    x: 10, y: 16, w: 860, rowH: 38, tailPad: 10,
+    participants: [
+      { id: "LOOP", label: "Agent loop", tone: "gold" },
+      { id: "T1", label: "Tool T1 (edit)", tone: "teal" },
+      { id: "T2", label: "Tool T2 (write)", tone: "accent" },
+      { id: "CTX", label: "Context (transcript)", tone: "violet" }
+    ],
+    steps: [
+      { kind: "note", label: "Assistant message has two toolCalls: T1 and T2 (original order)" },
+      { from: "LOOP", to: "T1", label: "tool_execution_start (T1) ① serial pre-checks, original order" },
+      { from: "LOOP", to: "T2", label: "tool_execution_start (T2)" },
+      { from: "LOOP", to: "T1", label: "execute (parallel)" },
+      { from: "LOOP", to: "T2", label: "execute (parallel)" },
+      { from: "T2", to: "LOOP", kind: "return", label: "tool_execution_end (first done, first emitted)" },
+      { from: "T1", to: "LOOP", kind: "return", label: "tool_execution_end" },
+      { from: "LOOP", to: "CTX", label: "toolResult messages (appended in original order)" },
+      { kind: "note", label: "Events in completion order, messages in original order: instant UI feedback, deterministic transcript" }
+    ]
+  });
+});
+
+PB.fig("mutex", function (d) {
+  d.group({ x: 20, y: 20, w: 190, h: 240, label: "Loop layer: parallel execution", tone: "gold" });
+  d.box({ id: "t1", x: 35, y: 45, w: 160, h: 52, title: "edit(foo.ts)", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "t2", x: 35, y: 120, w: 160, h: 52, title: "write(foo.ts)", tone: "gold", titleSize: 12.5 });
+  d.box({ id: "t3", x: 35, y: 195, w: 160, h: 52, title: "edit(bar.ts)", tone: "gold", titleSize: 12.5 });
+
+  d.group({ x: 290, y: 36, w: 280, h: 186, label: "Tool layer: per-path promise-chain mutex", tone: "teal" });
+  d.box({ id: "qfoo", x: 305, y: 60, w: 250, h: 66, title: "foo.ts queue", lines: ["edit → write auto-queue serially", "key = canonicalPath"], tone: "violet", titleSize: 12.5 });
+  d.box({ id: "qbar", x: 305, y: 150, w: 250, h: 52, title: "bar.ts queue", lines: ["No interference with foo.ts"], tone: "violet", titleSize: 12.5 });
+
+  d.group({ x: 620, y: 36, w: 240, h: 186, label: "File layer: writes never interleave", tone: "accent" });
+  d.box({ id: "f1", x: 635, y: 60, w: 210, h: 66, title: "foo.ts", lines: ["edit, write serialized to disk"], tone: "teal", titleSize: 12.5 });
+  d.box({ id: "f2", x: 635, y: 150, w: 210, h: 52, title: "bar.ts", lines: ["Runs independently"], tone: "teal", titleSize: 12.5 });
+
+  d.arrow("t1", "qfoo", { from: "right", to: "left" });
+  d.arrow("t2", "qfoo", { from: "right", to: "left" });
+  d.arrow("t3", "qbar", { from: "right", to: "left" });
+  d.arrow("qfoo", "f1", { from: "right", to: "left", label: "Serialized writes" });
+  d.arrow("qbar", "f2", { from: "right", to: "left" });
+
+  d.text("read needs no mutex (reads don't conflict); each ExecutionEnv has its own queue", 440, 320, { size: 12, color: d.theme.muted, halo: true });
+  d.text("WeakMap keyed by ExecutionEnv; queues are cleaned up when the env is GC'd", 440, 345, { size: 12, color: d.theme.muted, halo: true });
+});
+</script>
+</body>
+</html>

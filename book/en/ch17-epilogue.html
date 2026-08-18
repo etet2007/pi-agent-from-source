@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 17 · Epilogue: The Minimalist Bet | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch17">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part VII · Quality &amp; Conclusion</p>
+  <h1>Chapter 17: Epilogue — The Minimalist Bet</h1>
+  <p class="chapter-sub">A look back at six architectural bets: where each one wins, where the risk lies, and what the minimalist path truly costs</p>
+</header>
+
+<h2 id="hook">Where We Have Been</h2>
+
+<p>Let's step back and look at the road we've traveled from Chapter 1 to here.</p>
+
+<p>We started at the foundation of <code>pi-ai</code> (Chapter 2), watching it unify roughly 38 LLM providers through about 10 protocol adapters and encode failures into <code>EventStream</code>. We climbed the core loop of <code>pi-agent-core</code> (Chapter 3), that clean two-level nested state machine; took apart the tool system (Chapter 4) to see how self-describing tools go through prepare/execute/finalize; and understood state and the session tree (Chapter 5), the distinctive design that models the transcript as a forkable tree. We saw how the Harness layer (Chapter 6) provides persistent orchestration on top of the core, and how compaction (Chapter 7) keeps context in check without deleting history.</p>
+
+<p>Then we moved into the product layer: the bootstrap pipeline of the <code>pi</code> command (Chapter 8), the 3,333-line central orchestrator <code>AgentSession</code> (Chapter 9), the assembled system prompts and two-phase skill loading (Chapter 10), and the three operating modes sharing a single event stream (Chapter 11). We went deep into the fully homegrown terminal renderer (Chapter 12) and the input stack (Chapter 13), saw how the extension system gives the minimal core unbounded capability (Chapter 14), and examined two radically different remote-control designs (Chapter 15). Finally, we saw how pi-evals (Chapter 16) turns "is it getting better?" into a number.</p>
+
+<p>Behind all of this runs a single thread. This chapter makes it explicit: the six architectural bets Pi Agent made, where each one wins, where the risk lies, and what the minimalist path truly costs.</p>
+
+<hr class="sep">
+
+<h2 id="conservation">Conservation of Complexity</h2>
+
+<p>Let's restate the core observation first. The complexity a production-grade agent must handle is conserved — multi-provider, streaming, tools, concurrency, context growth, persistence, error recovery, rendering, extensions, security. These hard problems don't vanish just because you don't write code for them.</p>
+
+<p>The monolith approach (exemplified by Claude Code) sucks all of this into the core, turning it into a submarine of nearly two thousand files, with a real failure mode standing behind every <code>if</code>. Pi Agent instead chooses to push complexity <strong>to the edges</strong> — into extensions, containers, the optional daemon, and caller responsibility.</p>
+
+<p>Every chapter of this book is that principle unfolded in a specific domain. The six bets below are its most concentrated expression.</p>
+
+<hr class="sep">
+
+<h2 id="bet1">Bet One: Layering Is a Firewall</h2>
+
+<p><strong>The bet</strong>: split the system into packages with strictly one-way dependencies (<code>ai → agent → coding-agent</code>, with <code>tui</code> standalone), each layer depending only on the abstractions of the layer below.</p>
+
+<p><strong>Where it wins</strong>: complexity is stopped at the interfaces between layers. <code>pi-tui</code> doesn't even depend on <code>pi-ai</code>, so UI complexity can never leak into agent logic; <code>pi-ai</code> depends on no sibling package, so any LLM application can reuse it. Every layer can be taken away on its own.</p>
+
+<p><strong>The risk</strong>: layering has a cost — interfaces must be designed, cross-layer calls must detour, and sometimes one feature needs small changes in several layers. Over-layering makes simple things complicated. Pi Agent's nine packages are carefully divided, not split for the sake of splitting.</p>
+
+<p><strong>Transferable lesson</strong>: layer boundaries are firewalls for complexity. When you agonize over "where does this feature go," ask "which layer would it make depend on something it shouldn't."</p>
+
+<hr class="sep">
+
+<h2 id="bet2">Bet Two: Core Separated from Orchestration</h2>
+
+<p><strong>The bet</strong>: the core loop only emits events and only knows configuration slots; persistent orchestration (Harness) and product orchestration (AgentSession) are both <em>consumers</em> of the core, which doesn't know they exist.</p>
+
+<p><strong>Where it wins</strong>: the core is small enough to be reused by any orchestration strategy. <code>AgentHarness</code> is one strategy (general-purpose persistence), <code>AgentSession</code> another (product-grade), and SDK users can write their own. Because the core favors no strategy, every strategy can reuse it. The fact from Chapter 6 that "the product doesn't use AgentHarness" is precisely proof of this design's success — the core is small enough that the product can build a completely different orchestrator on top of it.</p>
+
+<p><strong>The risk</strong>: a core that is too small may push too much burden onto the orchestrator. Every orchestrator must re-handle persistence, compaction, and error recovery — things that could have been shared. Pi Agent offers an "official orchestration" in AgentHarness as a reference, but doesn't mandate it.</p>
+
+<p><strong>Transferable lesson</strong>: separate mechanism (the loop, the event stream) from strategy (how to orchestrate, how to persist). The mechanism should be small and stable so strategies can flourish.</p>
+
+<hr class="sep">
+
+<h2 id="bet3">Bet Three: Failure Is Data, Not an Exception</h2>
+
+<p><strong>The bet</strong>: <code>StreamFn</code> never throws; failures are encoded in the stream's terminal events; every IO in <code>ExecutionEnv</code> returns a <code>Result</code>; even the loop's collaborator callbacks are contracted to "must not throw"; unexpected errors are likewise converted into ordinary event sequences.</p>
+
+<p><strong>Where it wins</strong>: there is almost no <code>try/catch</code> in the loop. Error handling reduces to "check <code>stopReason</code>" or "check <code>result.ok</code>". Consumers of the streaming pipeline can always receive <code>agent_end</code> and can always reduce state to a consistent point. Complexity is pushed to the implementors of the contract (<code>pi-ai</code>'s two-level retry, <code>convertToLlm</code>'s safe fallback).</p>
+
+<p><strong>The risk</strong>: contract discipline demands that every implementor comply carefully. A <code>convertToLlm</code> that secretly throws would break the loop's assumptions. Pi Agent enforces this with documentation (the "must not throw" comments on every callback) and types (<code>Result</code>), but ultimately relies on discipline.</p>
+
+<p><strong>Transferable lesson</strong>: in asynchronous streaming systems, make failure data rather than control flow. When failure is a payload, error handling collapses into a single field check, and consumers never end up in an inconsistent state because of a mid-stream error.</p>
+
+<hr class="sep">
+
+<h2 id="bet4">Bet Four: The Session Is a Tree</h2>
+
+<p><strong>The bet</strong>: the transcript is not a flat array but an appendable, forkable tree of immutable entries; a leaf pointer marks the current position; compaction inserts summary nodes instead of deleting history.</p>
+
+<p><strong>Where it wins</strong>: going back = moving a pointer, forking = growing a new branch, compaction = a reversible view transform. Operations that are extremely awkward in a flat array all reduce to pointer operations in the tree model. The reason Chapter 7's compaction can "not delete history" and Chapter 5's fork/<code>/tree</code> feel natural is entirely this underlying choice. Separating storage from the context view (<code>defaultContextEntryTransform</code>) lets you "save tokens" and "see history" at the same time.</p>
+
+<p><strong>The risk</strong>: a tree is more complex than an array — storage must maintain parent edges, leaf markers, and materialized aggregates; context building must walk paths. The SQLite backend introduced materialized views and FTS indexes to keep performance. For the simple scenario of "users only converse linearly and never go back," this is over-engineering.</p>
+
+<p><strong>Transferable lesson</strong>: when "history" in your system must support going back, branching, and reversible compaction, model it as an immutable tree plus a position pointer. An interactive agent is exactly such a system — users constantly try things, go back, and fork.</p>
+
+<hr class="sep">
+
+<h2 id="bet5">Bet Five: Extensions Are Typed</h2>
+
+<p><strong>The bet</strong>: extensibility doesn't rely on runtime hook strings but on a strongly typed <code>ExtensionAPI</code> (about 40 kinds of events; tool/command/keybinding/flag/renderer registration); optional ecosystem capabilities like MCP stay out of the core and are left to extensions.</p>
+
+<p><strong>Where it wins</strong>: extension development gets compile-time safety and IDE support; extensions and built-ins are equals in the system (custom tools go through the same <code>ToolDefinition</code>); the core doesn't have to bake in MCP's eight transports and OAuth. Even "adding a new LLM provider" (llama.cpp) can be an extension. The core stays minimal while capability is nearly unbounded.</p>
+
+<p><strong>The risk</strong>: without built-in MCP, plugging into the MCP ecosystem out of the box is less convenient than a built-in approach and depends on community extensions. Typed extensions require extensions to be written in TypeScript — purely config-style lightweight extensions are carried by skills/templates/themes, but with limited capability.</p>
+
+<p><strong>Transferable lesson</strong>: make the extension surface a typed API rather than string hooks; push optional ecosystem capabilities outward into extensions. The core keeps only what is universally necessary; the long tail goes to the pluggable edge.</p>
+
+<hr class="sep">
+
+<h2 id="bet6">Bet Six: Security at the Boundary, Not Before Every Action</h2>
+
+<p><strong>The bet</strong>: no built-in per-tool permission approval; isolation is delegated to containers/sandboxes; security decisions are narrowed to a one-time "project trust" (whether to load the extensions/skills/AGENTS.md in the project).</p>
+
+<p><strong>Where it wins</strong>: no approval fatigue, no maintenance burden of seven permission modes, and the core doesn't have to "know" how dangerous each tool is. Security focus concentrates where the real danger is — loading potentially malicious project resources (extensions can register tools and intercept events; that is a huge attack surface).</p>
+
+<p><strong>The risk</strong>: this is the bet with the <strong>strictest boundary conditions</strong> of the six. Its premise is "you can control the execution environment." If pi runs bare on the user's host and can't be containerized, then it genuinely holds all the user's permissions — a single malicious bash call could cause damage. The README explicitly acknowledges this and offers three containerization modes. For scenarios that can't be containerized, per-action approval may still be necessary.</p>
+
+<p><strong>Transferable lesson</strong>: put security decisions at the boundary (one-time trust when entering a project) and make the execution environment itself safe (containers). But be honest about the premise — if your environment can't be isolated, this model doesn't apply. A minimalist security model has its applicability boundary; understanding the boundary matters more than imitating it.</p>
+
+<hr class="sep">
+
+<h2 id="costs">The Cost of Minimalism: An Honest Look</h2>
+
+<p>This book doesn't want to romanticize minimalism. Let's honestly look at what it costs.</p>
+
+<p><strong>First, a minimal core ≠ a minimal product.</strong> This is the easiest point to misunderstand. The core loop of <code>pi-agent-core</code> is indeed small (<code>agent-loop.ts</code> is a few hundred lines). But the product layer is anything but small: <code>AgentSession</code> is 3,333 lines, <code>InteractiveMode</code> 6,100, and <code>pi-tui</code>'s <code>Editor</code> 2,352. What is minimized is the <strong>core runtime</strong>, not the whole product. Everything a complete CLI product must handle — three modes, the extension system, project trust, slash commands, model switching, the TUI, input — is all there, nothing missing. Pi Agent's achievement isn't "little code" but "complexity placed in the right places": a clean core, a rich product, the two cleanly separated by an event stream and interfaces.</p>
+
+<p><strong>Second, someone has to bear the pushed-out complexity.</strong> Permissions are pushed to containers — users have to set up containers themselves. MCP is pushed to extensions — users have to find or write extensions themselves. Storage is pushed to backends — the default JSONL is simple but limited. Every push-out transfers a share of responsibility from "framework author" to "user." For users able to bear it (who can set up containers and write extensions), this is freedom; for users who just want it to work out of the box, it's a threshold. The minimalist path naturally favors power users who "know what they want."</p>
+
+<p><strong>Third, contract discipline is a hidden cost.</strong> "Failure is data," "must not throw," "tools are self-describing" — these contracts keep the core lean, but they are maintained by discipline, not enforced by the compiler (except for the typed parts). A new contributor writing a callback that throws can break the loop's assumptions. The many "never" and "always" rules in <code>AGENTS.md</code> are precisely the cost of maintaining that discipline.</p>
+
+<p><strong>Fourth, the two remote designs are a snapshot of evolution, not a final state.</strong> <code>pi-server</code> (JSON) and <code>pi-protocol</code> (CBOR) coexisting shows that the remote story is still evolving. This "pragmatic coexistence" makes sense today, but it will need to converge in the long run — otherwise maintaining two protocols becomes a burden. The minimalist philosophy is good at "not building in," but "how what's already built in converges" is another challenge.</p>
+
+<p>These costs aren't arguments against minimalism; they're a necessary part of understanding it. Minimalism isn't free — it trades "user threshold" and "discipline upkeep" for "core simplicity" and "extension freedom." Whether it's worth it depends on who your users are and how long your core needs to live.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p>If you take only ten lessons from this book, let them be these:</p>
+
+<ol>
+<li><strong>Complexity is conserved</strong>: complexity doesn't disappear, it moves. What determines a system's quality isn't how much complexity there is, but where it is placed.</li>
+<li><strong>Layering is a firewall</strong>: strictly one-way dependent layers stop complexity at interfaces, and each layer can be reused independently.</li>
+<li><strong>Mechanism separate from strategy</strong>: the core provides small, stable mechanisms while orchestration strategies evolve freely; a core that favors no strategy can be reused by every strategy.</li>
+<li><strong>Failure is data</strong>: in streaming systems, make failure an event/<code>Result</code> rather than an exception; error handling reduces to a field check.</li>
+<li><strong>Self-describing components</strong>: tools (or any plugin) declare their own schema, concurrency, rendering, and prompt; the orchestrator stays ignorant, so it scales linearly.</li>
+<li><strong>The session is a tree</strong>: when history needs going back/branching/reversible compaction, model it as an immutable tree plus a position pointer.</li>
+<li><strong>Two-phase loading</strong>: directories go into the prompt, contents are read on demand; the number of capabilities is no longer limited by prompt size.</li>
+<li><strong>The event stream is the contract</strong>: system progress is expressed as an event stream, and every way of using the system is just a projection of it; adding a new consumer = adding a new subscriber.</li>
+<li><strong>Typed extensions</strong>: the extension surface is a strongly typed API, and optional ecosystem capabilities are pushed into extensions; the core stays minimal while capability is nearly unbounded.</li>
+<li><strong>Let evals drive trade-offs</strong>: turn "is it getting better?" into a baseline × candidate comparison experiment; make architectural trade-offs verifiable hypotheses rather than beliefs.</li>
+</ol>
+
+<p>Not one of these ten is original to Pi Agent — they're all engineering patterns validated over and over. Pi Agent's value is that it applies this whole set of patterns <strong>consistently</strong> to a real, production-grade agent and proves that "minimal core + rich edges" is a viable path.</p>
+
+<hr class="sep">
+
+<h2 id="golden">The Golden Path, One More Look</h2>
+
+<p>In Chapter 1 we established the golden path. Now you know what lies under every segment of it:</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="golden" data-w="1100" data-h="660"></canvas></div>
+  <figcaption>Figure 1: The golden path, one more look — every participant is annotated with its chapter, and every segment is an independently reusable layer, a complexity pushed to the edge.</figcaption>
+</figure>
+
+<p>Every segment on this path is an independently reusable layer, a complexity pushed to the edge, a deliberate trade-off. When you understand why each segment is the way it is, you understand Pi Agent — not by memorizing its API, but by understanding its taste.</p>
+
+<hr class="sep">
+
+<h2 id="future">The Future of Agents, and Minimalism's Place</h2>
+
+<p>Finally, let's talk about the future.</p>
+
+<p>AI coding agents are still evolving rapidly. Models are getting stronger, context windows larger, and the tool ecosystem (MCP and so on) richer. Under these trends, will a "minimal core" become obsolete?</p>
+
+<p>I don't think so, but its form will change. As context windows grow, the urgency of compaction fades — but the session tree's value (branching, going back, reversibility) is independent of window size. As models get stronger, the need for per-tool approval diminishes — which actually vindicates Pi Agent's "security at the boundary" bet. As the tool ecosystem grows richer, building everything in becomes less and less realistic — which is exactly where the extension system shines.</p>
+
+<p>The deeper insight is: <strong>as the model itself takes on more and more of the "intelligence," the core value of an agent framework tilts toward "mechanism" rather than "strategy."</strong> The model will decide for itself which tools to use, how to orchestrate, and when to stop. What the framework needs to provide is a clean loop, reliable tool execution, persistable state, and pluggable extensions — precisely what the Pi Agent core provides. The stronger the model, the more dangerous it is to "hardcode strategy into the framework," and the more right it is to "provide mechanism and let the model/extensions improvise."</p>
+
+<p>From this angle, Pi Agent's minimalism isn't just engineering taste but a bet on a trend: <strong>bet that the intelligence of the future lives in the model, not in the framework's hardcoded logic.</strong> Only a minimal core can keep pace with the model's evolution; only pluggable strategy can accommodate uses that haven't been invented yet.</p>
+
+<p>Will this bet win? Nobody knows. But understanding why it is a <em>coherent, self-consistent, seriously executed</em> bet is itself what this book wants to give you.</p>
+
+<hr class="sep">
+
+<h2 id="summary">The Last Word</h2>
+
+<p>Pi Agent is not a Claude Code with "fewer features." It is another answer to another question.</p>
+
+<p>Claude Code answers: "How do you build as much capability as possible, safely, into as many users as possible?" Its answer is the monolith — a huge single codebase, elaborate permissions, everything built in.</p>
+
+<p>Pi Agent answers: "How do you keep the core minimal while letting capability extend without bound?" Its answer is a minimal core + typed extensions + container isolation + pluggable storage + optional remote.</p>
+
+<p>Both paths lead to production-grade agents. The choice between them comes down to who you believe should bear the complexity — the framework's author, or the framework's user.</p>
+
+<p>After reading this book, you may not agree with every trade-off Pi Agent makes. But you should be able to see clearly: behind every trade-off is a coherent line of reasoning and an explicit answer to "where should complexity live."</p>
+
+<p>And that, precisely, is the most essential work of architecture.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("golden", function (d) {
+  d.sequence({
+    x: 30, y: 16, w: 1040, rowH: 38, tailPad: 8,
+    participants: [
+      { id: "U", label: "User / TUI", tone: "accent" },
+      { id: "IM", label: "InteractiveMode", sub: "ch11", tone: "slate" },
+      { id: "AS", label: "AgentSession", sub: "ch9", tone: "teal" },
+      { id: "A", label: "Agent runLoop", sub: "ch3", tone: "gold" },
+      { id: "AI", label: "pi-ai", sub: "ch2", tone: "violet" },
+      { id: "T", label: "Tools", sub: "ch4", tone: "slate" },
+      { id: "S", label: "Session tree", sub: "ch5", tone: "violet" }
+    ],
+    steps: [
+      { from: "U", to: "IM", label: "Type prompt, Enter" },
+      { from: "IM", to: "AS", label: "prompt(text)" },
+      { from: "AS", to: "AS", kind: "self", label: "Ext. hooks / skill expand / templates (ch10,14)" },
+      { from: "AS", to: "A", label: "agent.prompt(messages)" },
+      { from: "A", to: "A", kind: "self", label: "convertToLlm (ch5)" },
+      { from: "A", to: "AI", label: "streamFn → streamSimple" },
+      { from: "AI", to: "A", kind: "return", label: "Streamed events (failures too)" },
+      { from: "A", to: "T", label: "executeToolCalls (parallel/exclusive)" },
+      { from: "T", to: "A", kind: "return", label: "ToolResultMessage" },
+      { from: "A", to: "AS", kind: "return", label: "AgentEvent" },
+      { from: "AS", to: "IM", kind: "return", label: "AgentSessionEvent" },
+      { from: "IM", to: "U", kind: "return", label: "Diff rendering (ch12)" },
+      { from: "AS", to: "S", label: "Persist to session tree" },
+      { kind: "note", label: "Compact if too long (ch7)" }
+    ]
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 2 · Talking to Models: The pi-ai Unified LLM Layer | Pi Agent Source Code Analysis</title>
+<link rel="stylesheet" href="../style.css?v=__CACHE_BUST__">
+</head>
+<body data-chapter="ch02">
+
+<div id="pb-main">
+<div class="pb-content-col">
+<article class="chapter">
+
+<header class="chapter-head">
+  <p class="chapter-kicker">Part I · Foundations</p>
+  <h1>Chapter 2: Talking to Models — The pi-ai Unified LLM Layer</h1>
+  <p class="chapter-sub">How to make roughly 38 LLM providers look like one: few protocols, many endpoints</p>
+</header>
+
+<h2 id="hook">An Underappreciated Problem</h2>
+
+<p>On the surface, "calling a large model" is simple: send an HTTP request, read a streaming response. But when you need to support OpenAI, Anthropic, Google, AWS Bedrock, Google Vertex, OpenRouter, Groq, xAI, DeepSeek… roughly 38 providers at once, the simple thing becomes tricky. Each provider has its own:</p>
+
+<ul>
+<li>request format (how messages are represented, how tools are declared, how thinking is toggled)</li>
+<li>streaming protocol (SSE event names, chunk structure, termination signals)</li>
+<li>authentication (API key, OAuth, AWS credentials, ADC files, environment variables)</li>
+<li>usage and billing semantics (cache reads/writes, reasoning tokens, tiered pricing)</li>
+<li>error semantics (which errors warrant a retry, which are permanent failures)</li>
+</ul>
+
+<p>If you wrote an end-to-end adapter for every provider, you'd end up with 38 subtly different implementations, and every new vendor would be a copy-paste disaster. <code>pi-ai</code> (<code>packages/ai</code>) exists to eliminate that duplication. Its <code>package.json</code> self-description reads:</p>
+
+<blockquote>
+<p>Unified LLM API with automatic model discovery and provider configuration.</p>
+</blockquote>
+
+<p>This chapter dissects how it pulls that off. At the core is a duality: <strong>protocols are few, endpoints are many.</strong></p>
+
+<hr class="sep">
+
+<h2 id="duality">The Core Duality: <code>Api</code> and <code>Provider</code></h2>
+
+<p><code>pi-ai</code> splits "talking to models" into two orthogonal concepts. This is the organizing principle for understanding the entire package.</p>
+
+<figure class="fig">
+  <div class="fig-box"><canvas data-fig="api-provider" data-w="940" data-h="620"></canvas></div>
+  <figcaption>Figure 1: Mapping Apis to Providers. About 10 wire protocols on the left; roughly 38 Providers on the right reuse them — arrows show a Provider bound to the protocol dialect it speaks.</figcaption>
+</figure>
+
+<p><strong><code>Api</code> (wire protocol)</strong> answers "how to talk to a <em>family</em> of servers." It lives in <code>packages/ai/src/api/*.ts</code>, about 10 of them: <code>openai-completions</code>, <code>openai-responses</code>, <code>openai-codex-responses</code>, <code>azure-openai-responses</code>, <code>anthropic-messages</code>, <code>bedrock-converse-stream</code>, <code>google-generative-ai</code>, <code>google-vertex</code>, <code>mistral-conversations</code>, <code>pi-messages</code>.</p>
+
+<p><strong><code>Provider</code> (a configured endpoint)</strong> answers "which concrete service to connect to." It lives in <code>packages/ai/src/providers/*.ts</code>, roughly 38 of them. A Provider carries an <code>id</code>, a <code>baseUrl</code>, auth configuration, a model catalog, and bindings to one or more <code>Api</code>s.</p>
+
+<p>The key reuse: <strong>many Providers speak the same dialect.</strong> OpenRouter, Groq, and Together all speak <code>openai-completions</code>/<code>openai-responses</code>. So about 10 protocol adapters unify roughly 38 vendors. To add a provider that "speaks the OpenAI dialect," you barely touch any protocol code — you just write a factory function and a model catalog.</p>
+
+<h3>A unified request input: <code>Context</code></h3>
+
+<p>No matter the provider, the loop feeds <code>pi-ai</code> the same <code>Context</code> (<code>packages/ai/src/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface Context {
+	systemPrompt?: string;
+	messages: Message[];
+	tools?: Tool[];
+}</pre>
+
+<p><code>Message</code> is a union type (<code>UserMessage | AssistantMessage | ToolResultMessage</code>) whose content blocks are normalized into <code>TextContent</code>, <code>ThinkingContent</code>, <code>ImageContent</code>, and <code>ToolCall</code>. Each provider's <code>Api</code> adapter is responsible for translating this unified representation into its own wire format — you'll see the translation details in the second half of this chapter.</p>
+
+<h3>A unified output: <code>AssistantMessage</code> and <code>Usage</code></h3>
+
+<p>Every provider's response is folded into the same <code>AssistantMessage</code>, which carries normalized usage and cost (<code>packages/ai/src/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cacheWrite1h?: number; // 仅 Anthropic 报告 1h 缓存写入的细分
+	reasoning?: number; // reasoning/thinking token，是 output 的子集
+	totalTokens: number;
+	cost: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+}
+
+export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted";</pre>
+
+<p>Note how <code>Usage</code> folds "cache reads/writes," "reasoning tokens," and "cost" into one unified accounting. This means the usage numbers upper layers (the Agent loop, product UI, evals) receive are comparable across providers — you don't need to know whether a call went to Anthropic or Groq to display token counts and spend correctly. <code>calculateCost(model, usage)</code> (<code>packages/ai/src/models.ts</code>) computes cost from a model's rates ($/M tokens) and tiered pricing, with a special case billing Anthropic's 1h cache writes at 2×.</p>
+
+<p>Normalizing <code>StopReason</code> is equally critical. Anthropic's <code>end_turn</code>, OpenAI's <code>stop</code>, and the various "reached a limit" and "tool triggered" signals are all mapped onto one of these six values. Recall from Chapter 1: the core loop only checks <code>stopReason === "error" | "aborted"</code> to handle failures and checks <code>toolUse</code> to decide whether to continue — it can be this concise precisely because <code>pi-ai</code> has already translated every vendor's dialect into this unified vocabulary.</p>
+
+<hr class="sep">
+
+<h2 id="factories"><code>Provider</code> and <code>Models</code>: Two Factories</h2>
+
+<h3>The <code>Provider</code> interface</h3>
+
+<p>A Provider's shape (<code>packages/ai/src/models.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/models.ts">export interface Provider&lt;TApi extends Api = Api&gt; {
+	readonly id: string;
+	readonly name: string;
+	readonly baseUrl?: string;
+	readonly headers?: ProviderHeaders;
+	readonly auth: ProviderAuth;
+	getModels(): readonly Model&lt;TApi&gt;[];
+	refreshModels?(context: RefreshModelsContext): Promise&lt;void&gt;;
+	filterModels?(models, credential): readonly Model&lt;TApi&gt;[];
+	stream&lt;T extends TApi&gt;(model, context, options?): AssistantMessageEventStream;
+	streamSimple(model, context, options?): AssistantMessageEventStream;
+}</pre>
+
+<p>Providers are built by the factory function <code>createProvider(input)</code>. The factory's core responsibility is <strong>API dispatch</strong>: the <code>api</code> parameter can be a single <code>ProviderStreams</code>, or a map keyed by <code>model.api</code> (when a provider speaks multiple dialects); <code>apiFor(model)</code> selects the right implementation, and if a model's <code>api</code> has no matching entry, <code>dispatch(...)</code> produces a streaming error.</p>
+
+<h3><code>ProviderStreams</code>: the uniform shape of every protocol module</h3>
+
+<p>Every <code>src/api/*.ts</code> module satisfies the same interface (<code>packages/ai/src/types.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/types.ts">export interface ProviderStreams {
+	stream(model: Model&lt;Api&gt;, context: Context, options?: StreamOptions): AssistantMessageEventStream;
+	streamSimple(model: Model&lt;Api&gt;, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+}</pre>
+
+<p><code>stream</code> is the full-featured version (exposing provider-specific options), while <code>streamSimple</code> is the minimal one (it's what the Agent loop uses). The module itself is the implementation of this interface — <code>anthropic-messages.ts</code> exports <code>stream</code> and <code>streamSimple</code>, which directly satisfy <code>ProviderStreams</code>. This "module-as-interface" convention lets protocol adapters be passed around as values and lazily wrapped.</p>
+
+<h3><code>Models</code>: the collection of providers</h3>
+
+<p><code>Models</code> (built by <code>createModels()</code>, <code>packages/ai/src/models.ts</code>) holds a <code>Map</code> of providers and is responsible for auth resolution and dispatch. <code>Models.stream()</code> looks up the provider that owns a model, applies auth/headers/environment variables, then calls <code>provider.stream(...)</code>. <code>complete()</code> is just a convenience wrapper around <code>stream(...).result()</code>. <code>builtinModels()</code> (<code>packages/ai/src/providers/all.ts</code>) registers all built-in providers.</p>
+
+<hr class="sep">
+
+<h2 id="eventstream"><code>EventStream</code>: the streaming primitive running through the stack</h2>
+
+<p><code>pi-ai</code>'s streaming responses aren't callbacks, nor RxJS-style Observables, but a minimal async-iterable primitive called <code>EventStream</code> (<code>packages/ai/src/utils/event-stream.ts</code>). It is the cornerstone of streaming throughout the whole system, and worth seeing in full:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/event-stream.ts">export class EventStream&lt;T, R = T&gt; implements AsyncIterable&lt;T&gt; {
+	private queue: T[] = [];
+	private waiting: ((value: IteratorResult&lt;T&gt;) =&gt; void)[] = [];
+	private done = false;
+	private finalResultPromise: Promise&lt;R&gt;;
+	private resolveFinalResult!: (result: R) =&gt; void;
+	private isComplete: (event: T) =&gt; boolean;
+	private extractResult: (event: T) =&gt; R;
+
+	constructor(isComplete: (event: T) =&gt; boolean, extractResult: (event: T) =&gt; R) {
+		this.isComplete = isComplete;
+		this.extractResult = extractResult;
+		this.finalResultPromise = new Promise((resolve) =&gt; {
+			this.resolveFinalResult = resolve;
+		});
+	}
+
+	push(event: T): void {
+		if (this.done) return;
+		if (this.isComplete(event)) {
+			this.done = true;
+			this.resolveFinalResult(this.extractResult(event));
+		}
+		const waiter = this.waiting.shift();
+		if (waiter) waiter({ value: event, done: false });
+		else this.queue.push(event);
+	}
+
+	async *[Symbol.asyncIterator](): AsyncIterator&lt;T&gt; {
+		while (true) {
+			if (this.queue.length &gt; 0) yield this.queue.shift()!;
+			else if (this.done) return;
+			else {
+				const result = await new Promise&lt;IteratorResult&lt;T&gt;&gt;((resolve) =&gt; this.waiting.push(resolve));
+				if (result.done) return;
+				yield result.value;
+			}
+		}
+	}
+
+	result(): Promise&lt;R&gt; {
+		return this.finalResultPromise;
+	}
+}</pre>
+
+<p>This class does exactly one thing: decouple "producer pushes events" from "consumer pulls events." Internally it's a queue plus a list of waiters — if a consumer is waiting, <code>push</code> delivers directly; otherwise it enqueues. It offers two ways to consume:</p>
+
+<ul>
+<li><code>for await (const event of stream)</code> — process incremental events one by one (this is what the TUI's incremental rendering uses)</li>
+<li><code>await stream.result()</code> — grab the final result directly (<code>complete()</code> and the loop's final message use this)</li>
+</ul>
+
+<p><code>AssistantMessageEventStream</code> is its specialization: completion is an event of type <code>done</code> or <code>error</code>, and the result extractor pulls the <code>AssistantMessage</code> out of <code>done</code>, or the error-carrying <code>AssistantMessage</code> out of <code>error</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/event-stream.ts">export class AssistantMessageEventStream extends EventStream&lt;AssistantMessageEvent, AssistantMessage&gt; {
+	constructor() {
+		super(
+			(event) =&gt; event.type === "done" || event.type === "error",
+			(event) =&gt; {
+				if (event.type === "done") return event.message;
+				else if (event.type === "error") return event.error;
+				throw new Error("Unexpected event type for final result");
+			},
+		);
+	}
+}</pre>
+
+<p>This is where the "failures are encoded into the stream" convention from Chapter 1 lives: an <code>error</code> event is not an exception but a legitimate terminal event of the stream, whose payload is an <code>AssistantMessage</code> with <code>stopReason: "error"</code>. <code>result()</code> still resolves normally on error (resolving to that error message) instead of rejecting. That's why upper layers never need to <code>try/catch</code> model calls.</p>
+
+<p>The event protocol itself is a discriminated union, <code>AssistantMessageEvent</code>: <code>start</code>, <code>text_start/delta/end</code>, <code>thinking_start/delta/end</code>, <code>toolcall_start/delta/end</code>, <code>done</code>, <code>error</code>. Each provider's adapter translates its native streaming events into this unified event vocabulary.</p>
+
+<hr class="sep">
+
+<h2 id="streaming">Streaming Parsing: Handwritten SSE and SDK Iterators</h2>
+
+<p>With the unified event protocol established, each <code>Api</code> adapter's job is to translate the provider's native stream into it. Two styles exist here, and the contrast is instructive.</p>
+
+<h3>Handwritten SSE: Anthropic</h3>
+
+<p>The Anthropic adapter (<code>packages/ai/src/api/anthropic-messages.ts</code>) is a model of hand-rolled SSE. Instead of relying on the SDK's streaming wrapper, it grabs the raw <code>ReadableStream</code> of the <code>Response</code> and parses server-sent events itself:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/anthropic-messages.ts">async function* iterateSseMessages(
+	body: ReadableStream&lt;Uint8Array&gt;,
+	signal?: AbortSignal,
+): AsyncGenerator&lt;ServerSentEvent&gt;
+
+function decodeSseLine(line: string, state: SseDecoderState): ServerSentEvent | null
+
+async function* iterateAnthropicEvents(
+	response: Response,
+	signal?: AbortSignal,
+): AsyncGenerator&lt;RawMessageStreamEvent&gt;</pre>
+
+<p><code>iterateSseMessages</code> reads chunks with <code>body.getReader()</code>, decodes them with <code>TextDecoder({ stream: true })</code> (correctly handling multi-byte characters that span chunks), splits into lines (<code>consumeLine</code>/<code>nextLineBreakIndex</code> handle all three of <code>\r</code>, <code>\n</code>, and <code>\r\n</code>), and reassembles SSE's <code>event:</code>/<code>data:</code> frames. <code>iterateAnthropicEvents</code> filters for Anthropic's event types, parses each <code>data</code> with <code>parseJsonWithRepair</code>, throws on <code>event: error</code>, and verifies that every <code>message_start</code> has a matching <code>message_stop</code>.</p>
+
+<p>Then the main <code>stream</code> function folds these raw events into the unified <code>AssistantMessage</code>: <code>message_start</code> seeds <code>usage</code>; <code>content_block_start/delta/stop</code> build up the <code>text</code>/<code>thinking</code>/<code>toolCall</code> blocks (tool arguments accumulate as <code>partialJson</code>, incrementally parsed with <code>parseStreamingJson</code>); <code>message_delta</code> updates <code>stopReason</code> (via <code>mapStopReason</code>) and the final usage.</p>
+
+<p>Notably, the request itself still goes through the official SDK, but is forced to return the raw <code>Response</code>:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/anthropic-messages.ts">client.messages.create({ ...params, stream: true }, { maxRetries: 0 }).asResponse()</pre>
+
+<p><code>maxRetries: 0</code> is deliberate — retries are taken over uniformly by <code>pi-ai</code>'s own <code>retryProviderRequest(...)</code> (see below), because the official SDK's retries don't respect <code>AbortSignal</code>.</p>
+
+<h3>SDK iterators: the OpenAI family</h3>
+
+<p>The OpenAI family's adapter (<code>packages/ai/src/api/openai-completions.ts</code>) takes the other route — it uses the official SDK's async iterator directly:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/openai-completions.ts">const response = await retryProviderRequest(
+	() =&gt; client.chat.completions.create(params, requestOptions).withResponse(),
+	...,
+);
+// ...
+for await (const chunk of openaiStream) {
+	// 把每个 chunk 翻译成统一的 AssistantMessageEvent
+}</pre>
+
+<p>Google, Mistral, Bedrock, and OpenAI Responses all follow the same module pattern (<code>stream</code> + <code>streamSimple</code>), each mapping native events onto the shared <code>AssistantMessageEvent</code> protocol.</p>
+
+<p>The two styles each have tradeoffs: handwritten SSE gives you full control (incremental JSON repair, precise termination validation) but you handle the protocol details yourself; SDK iterators save effort, but you're constrained by the SDK's behavior. <code>pi-ai</code> lets each protocol choose for itself — pragmatic minimalism in its own right: implementation means aren't forced to be uniform, only the outward contract is.</p>
+
+<h3>Lazy loading: keeping heavy SDKs out of startup</h3>
+
+<p>Every <code>src/api/*.ts</code> has a companion <code>*.lazy.ts</code>. <code>lazyApi(load)</code> (<code>packages/ai/src/api/lazy.ts</code>) wraps a dynamically <code>import()</code>ed protocol module as a <code>ProviderStreams</code>, so heavy SDKs (like <code>@anthropic-ai/sdk</code>) are only loaded the first time they're actually used:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/api/lazy.ts">export function lazyApi(load: () =&gt; Promise&lt;ProviderStreams&gt;): ProviderStreams</pre>
+
+<p><code>lazyStream(model, setup)</code> synchronously returns an <code>AssistantMessageEventStream</code> while running setup asynchronously behind it (auth, dynamic import), forwarding internal events via <code>forwardStream</code> and converting a setup failure into an <code>error</code> event. This is "failures are encoded into the stream" once again — even "failed to load the protocol module" isn't an exception, but a stream event.</p>
+
+<p>Lazy loading is critical to startup speed. Starting the <code>pi</code> command doesn't require loading the SDKs of all 10 protocols — only the one you actually use. Chapter 8 will show how the bootstrap pipeline benefits from this design.</p>
+
+<hr class="sep">
+
+<h2 id="new-provider">Adding a Provider: Three Files</h2>
+
+<p>The quality of an abstraction shows in how much code adding a new provider requires. The answer here: one factory file + one model catalog file + one line in the registry.</p>
+
+<p><strong>The factory</strong> (<code>packages/ai/src/providers/anthropic.ts</code> is the minimal template):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/providers/anthropic.ts">export function anthropicProvider(): Provider&lt;"anthropic-messages"&gt; {
+	return createProvider({
+		id: "anthropic",
+		name: "Anthropic",
+		baseUrl: "https://api.anthropic.com",
+		auth: {
+			apiKey: anthropicApiKeyAuth(),
+			oauth: lazyOAuth({ name: "Anthropic (Claude Pro/Max)", load: loadAnthropicOAuth }),
+		},
+		models: Object.values(ANTHROPIC_MODELS),
+		api: anthropicMessagesApi(), // 来自 ../api/anthropic-messages.lazy.ts
+	});
+}</pre>
+
+<p>The <code>auth.apiKey.resolve()</code> callback is where environment variables/credentials get translated into <code>{ apiKey }</code> or <code>{ headers }</code>. A provider speaking multiple dialects instead passes an <code>api</code> map keyed by <code>model.api</code>.</p>
+
+<p><strong>The model catalog</strong> (<code>packages/ai/src/providers/anthropic.models.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/providers/anthropic.models.ts">import values from "./data/anthropic.json" with { type: "json" };
+import { flattenModelCatalog, type ModelCatalog } from "../model-catalog.ts";
+
+export const ANTHROPIC_MODELS: ModelCatalog&lt;typeof values, "anthropic"&gt; =
+	flattenModelCatalog("anthropic", values);</pre>
+
+<p><code>flattenModelCatalog</code> (<code>packages/ai/src/model-catalog.ts</code>) merges the per-API-grouped JSON into a flat <code>{ [modelId]: Model }</code> map while preserving strong typing.</p>
+
+<p><strong>Registration</strong> (<code>packages/ai/src/providers/all.ts</code>): <code>builtinProviders()</code> instantiates the factories, and <code>builtinModels()</code> registers them into <code>Models</code>.</p>
+
+<p>That's all there is. If the provider you're adding speaks an existing dialect (say, yet another OpenAI-compatible service), you don't even need to write any protocol code.</p>
+
+<hr class="sep">
+
+<h2 id="models-dev">Model Metadata: Generated from models.dev</h2>
+
+<p>Each model's metadata (context window, max tokens, pricing, reasoning capability, input modalities) isn't handwritten — it's <strong>generated</strong>. The header of <code>packages/ai/src/models.generated.ts</code> reads:</p>
+
+<blockquote>
+<p>Do not edit manually - run 'npm run generate-models'.</p>
+</blockquote>
+
+<p>The generator <code>packages/ai/scripts/generate-models.ts</code> takes its primary data source from the <a href="https://models.dev">models.dev</a> API:</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/scripts/generate-models.ts">await fetch("https://models.dev/api.json")</pre>
+
+<p>It also queries live provider endpoints (the models APIs of NVIDIA, OpenRouter, AI-Gateway), maps <code>ModelsDevModel</code> (cost, limits, modalities, <code>reasoning_options</code>) into the internal <code>Model</code> shape, applies extensive per-provider manual corrections (long comments in the source document where models.dev data disagrees with reality), and finally writes out each provider's <code>data/&lt;id&gt;.json</code> plus the aggregated <code>models.generated.ts</code>.</p>
+
+<p>The <code>Model</code> record (<code>packages/ai/src/types.ts</code>) is the unified model metadata: <code>id, name, api, provider, baseUrl, reasoning, thinkingLevelMap?, input: ("text"|"image")[], cost: ModelCost, contextWindow, maxTokens, headers?, compat?</code>. The <code>compat</code> field is a conditional type that selects <code>OpenAICompletionsCompat</code> / <code>AnthropicMessagesCompat</code> / <code>BedrockCompat</code> etc. by <code>api</code> — these flag sets are where an individual <code>Api</code> adapter absorbs vendor quirks (like <code>thinkingFormat</code>, <code>supportsStrictMode</code>, <code>cacheControlFormat</code>).</p>
+
+<p>The value of this mechanism: the model catalog is <strong>data</strong>, not code. When a provider releases a new model or adjusts pricing, the update comes from a data refresh — not from changing code, passing review, and shipping a release. <code>AGENTS.md</code> even has a dedicated rule: never hand-edit <code>models.generated.ts</code>; edit <code>generate-models.ts</code> and regenerate instead.</p>
+
+<hr class="sep">
+
+<h2 id="tool-normalization">Cross-Provider Normalization of Tool Calls</h2>
+
+<p>Tools are the heart of an Agent, and every provider declares tools and returns tool calls in a different format. <code>pi-ai</code> normalizes in both directions.</p>
+
+<p>The <strong>unified tool input</strong> is <code>Tool { name; description; parameters: TSchema; constrainedSampling? }</code> (a TypeBox schema), the unified tool call is <code>ToolCall</code>, and the result is <code>ToolResultMessage</code>. Every <code>Api</code> adapter converts in both directions:</p>
+
+<ul>
+<li><strong>Anthropic</strong>: <code>convertTools(...)</code> builds <code>input_schema</code> (<code>{ type: "object", properties, required }</code>), adding <code>strict</code>/<code>eager_input_streaming</code>/<code>cache_control</code> per compat flags; <code>convertMessages(...)</code> handles thinking blocks and <code>tool_use</code>, and merges consecutive <code>toolResult</code>s into one <code>user</code> turn carrying a <code>tool_result</code> block; <code>normalizeToolCallId(id)</code> scrubs ids to the character set Anthropic allows (<code>id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64)</code>).</li>
+<li><strong>OpenAI</strong>: <code>convertTools(...)</code> emits <code>{ type: "function", function: {...} }</code>; <code>convertMessages(...)</code> handles OpenAI's message/tool-call/tool-result shapes.</li>
+</ul>
+
+<p>The <strong>shared normalization</strong> lives in <code>packages/ai/src/api/transform-messages.ts</code>: <code>transformMessages(messages, model, normalizeToolCallId)</code> runs before provider-specific conversion, and includes <code>downgradeUnsupportedImages</code> (replacing images with placeholder text when a model's <code>input</code> doesn't include <code>"image"</code>) plus tool-call id normalization. <code>constrained-sampling.ts</code> maps the unified <code>constrainedSampling</code> config onto a provider's <code>strict</code>/grammar behavior.</p>
+
+<p>One interesting detail: the Anthropic adapter has <code>toClaudeCodeName</code>/<code>fromClaudeCodeName</code>, which remap tool names to Claude Code's canonical casing when using OAuth tokens. This exists to match what Anthropic's server expects for certain tool names — a real, production-sourced quirk.</p>
+
+<hr class="sep">
+
+<h2 id="retries">Error Handling: Two Layers of Retry</h2>
+
+<p><code>pi-ai</code>'s retries are split into two layers, each owning its own slice.</p>
+
+<p><strong>Layer one: transport/SDK retries</strong> (<code>packages/ai/src/utils/provider-retry.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/provider-retry.ts">export async function retryProviderRequest&lt;T&gt;(
+	request: () =&gt; Promise&lt;T&gt;,
+	options: ProviderRetryOptions = {},
+): Promise&lt;T&gt;</pre>
+
+<p>It replicates the OpenAI/Anthropic SDKs' backoff logic, but makes the sleep interruptible by <code>AbortSignal</code> (the official SDKs ignore the signal, so the adapters call the SDK with <code>maxRetries: 0</code> and wrap this layer around it). <code>isRetryableProviderError</code> honors the <code>x-should-retry</code> header and retries 408/409/429/5xx; <code>getRetryDelayMs</code> reads <code>retry-after-ms</code>/<code>retry-after</code> first, then falls back to exponential backoff with jitter; delays beyond <code>maxRetryDelayMs</code> (default 60s) fail fast.</p>
+
+<p><strong>Layer two: assistant-level retries</strong> (<code>packages/ai/src/utils/retry.ts</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/retry.ts">export async function retryAssistantCall(
+	produce: () =&gt; Promise&lt;AssistantMessage&gt;,
+	policy: RetryPolicy | undefined,
+	signal: AbortSignal | undefined,
+	callbacks?: RetryCallbacks,
+): Promise&lt;AssistantMessage&gt;
+
+export function isRetryableAssistantError(message: AssistantMessage): boolean</pre>
+
+<p>This layer works at the <code>AssistantMessage</code> level. <code>isRetryableAssistantError</code> classifies with two regex sets: <code>RETRYABLE_PROVIDER_ERROR_PATTERN</code> (overloaded, rate-limited, 429/5xx, network/socket/timeout, stream ending early, gRPC <code>ResourceExhausted</code>, etc.) minus <code>NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN</code> (quota/billing/budget exhausted, like <code>insufficient_quota</code>). The subtraction is key: an exhausted quota shouldn't be retried (retrying would just waste time), while a transient overload should be.</p>
+
+<p>The division of labor between the two layers: the transport layer handles "the HTTP request itself failed," while the assistant layer handles "the request succeeded but the model returned a response indicating a transient problem." And every failure that never recovers is, by contract, encoded into the stream's <code>error</code> event — upper layers always see just a message with <code>stopReason: "error"</code>.</p>
+
+<h3>Token estimation</h3>
+
+<p><code>packages/ai/src/utils/estimate.ts</code> provides heuristic token estimation (<code>CHARS_PER_TOKEN = 4</code>, <code>ESTIMATED_IMAGE_CHARS = 4800</code>):</p>
+
+<pre class="code" data-lang="ts" data-file="packages/ai/src/utils/estimate.ts">export function estimateContextTokens(context: Context | readonly Message[]): ContextUsageEstimate</pre>
+
+<p>The clever part: it anchors on the authoritative <code>usage</code> the API reported in the most recent assistant response, and only estimates the messages added after that anchor (<code>getLastAssistantUsageInfo</code>). Estimation error is thus bounded to "what was added in the most recent round" instead of accumulating over the whole conversation. Real token counts come from the provider's <code>usage</code>; estimation only kicks in as a fallback when no authoritative number exists. Chapter 7's context compaction will lean on this function heavily.</p>
+
+<hr class="sep">
+
+<h2 id="entry">Restraint at the Public Entry Point</h2>
+
+<p><code>pi-ai</code>'s main entry, <code>packages/ai/src/index.ts</code>, is deliberately minimal and side-effect free — it only re-exports types and core helper functions, and does <strong>not</strong> export provider factories or the generated model catalog. Those live behind subpath exports: <code>@earendil-works/pi-ai/providers/*</code>, <code>/api/*</code>, <code>/compat</code>.</p>
+
+<p>This means merely <code>import { ... } from "@earendil-works/pi-ai"</code> won't trigger loading any provider SDK. Combined with lazy loading, <code>pi-ai</code> carries "pay only for what you use" all the way down to the module-system level: you load only what you use.</p>
+
+<hr class="sep">
+
+<h2 id="practice">Practical Takeaways</h2>
+
+<p><code>pi-ai</code> offers four transferable patterns for "how to unify multiple external services," applicable to any system that must adapt many third-party APIs.</p>
+
+<p><strong>Separate "protocols" from "endpoints."</strong> Identify the few "dialects" (protocols) your vendors share and write one adapter per dialect; model each concrete vendor as "endpoint = config + protocol binding." The problem it solves: N vendors × M capabilities = N×M adapter implementations. When protocols are few and endpoints are many, the amount of adapter code drops from multiplicative to additive.</p>
+
+<p><strong>Unify the usage and termination vocabulary.</strong> Normalize each vendor's token accounting, cache semantics, and stop reasons into a single <code>Usage</code> and <code>StopReason</code>. The problem it solves: upper-layer logic being forced to know every provider's quirks. When <code>StopReason</code> has only six values, the loop's stop decision collapses into a single field comparison.</p>
+
+<p><strong>Failure is data, not an exception.</strong> Use <code>EventStream</code> to encode errors as a terminal event of the stream, letting <code>result()</code> resolve normally even on error. The problem it solves: <code>try/catch</code> scattered through async streaming pipelines and consumers not knowing when to disconnect. When failure is a payload, error handling collapses into "check the type of the terminal event."</p>
+
+<p><strong>Catalogs are data, not code.</strong> Make frequently changing, externally sourced information (model lists, pricing) a generated artifact refreshed from an authoritative data source, rather than handwritten code. The problem it solves: changes in the outside world being forced through the code-release pipeline. When the model catalog is an output of <code>generate-models.ts</code>, updating pricing is a data refresh, not a code review.</p>
+
+<hr class="sep">
+
+<h2 id="summary">Summary</h2>
+
+<p><code>pi-ai</code> is the foundation of the whole system, answering one question: how do you make roughly 38 LLM providers look like one? The answer is a two-level <code>Api</code>/<code>Provider</code> abstraction — about 10 protocol adapters unify roughly 38 endpoints speaking a handful of dialects. A unified <code>Context</code> goes in; a unified <code>AssistantMessage</code> (with normalized <code>Usage</code> and <code>StopReason</code>) comes out; and in between, <code>EventStream</code> — an async-iterable primitive — carries both streaming and failure.</p>
+
+<p>It also models a restrained engineering taste: lazy loading keeps heavy SDKs out of startup, the model catalog is a generated artifact rather than handwritten code, retries are split into two layers each owning a slice, and the public entry point introduces no side effects. Together these choices serve one goal — giving the upper layers (the Agent loop) a simple, unified, never-throwing model interface.</p>
+
+<p>In the next chapter, we stand on this foundation and watch the Agent loop consume <code>StreamFn</code>, emit <code>AgentEvent</code>, execute tools, and decide when to stop.</p>
+
+<div id="pb-nav-holder"></div>
+</article>
+</div>
+</div>
+
+<script src="../common.js?v=__CACHE_BUST__"></script>
+<script>
+PB.fig("api-provider", function (d) {
+  d.group({ x: 40, y: 70, w: 340, h: 530, label: "Api (wire protocols, ~10)", tone: "accent", fill: d.theme.panel });
+  d.group({ x: 480, y: 70, w: 420, h: 530, label: "Provider (configured endpoints, ~38)", tone: "gold", fill: d.theme.panel });
+
+  d.box({ id: "A1", x: 60, y: 115, w: 300, h: 50, title: "openai-completions", tone: "accent", titleSize: 13 });
+  d.box({ id: "A2", x: 60, y: 185, w: 300, h: 50, title: "openai-responses", tone: "accent", titleSize: 13 });
+  d.box({ id: "A3", x: 60, y: 255, w: 300, h: 50, title: "anthropic-messages", tone: "accent", titleSize: 13 });
+  d.box({ id: "A4", x: 60, y: 325, w: 300, h: 50, title: "google-generative-ai", tone: "accent", titleSize: 13 });
+  d.box({ id: "A5", x: 60, y: 395, w: 300, h: 50, title: "bedrock-converse-stream", tone: "accent", titleSize: 13 });
+  d.box({ id: "A6", x: 60, y: 465, w: 300, h: 50, title: "mistral-conversations", tone: "accent", titleSize: 13 });
+  d.box({ id: "A7", x: 60, y: 535, w: 300, h: 50, title: "...", tone: "accent", titleSize: 13 });
+
+  d.box({ id: "P1", x: 500, y: 115, w: 380, h: 50, title: "openai", tone: "gold", titleSize: 13 });
+  d.box({ id: "P2", x: 500, y: 185, w: 380, h: 50, title: "openrouter", tone: "gold", titleSize: 13 });
+  d.box({ id: "P3", x: 500, y: 255, w: 380, h: 50, title: "groq", tone: "gold", titleSize: 13 });
+  d.box({ id: "P4", x: 500, y: 325, w: 380, h: 50, title: "together", tone: "gold", titleSize: 13 });
+  d.box({ id: "P5", x: 500, y: 395, w: 380, h: 50, title: "xai", tone: "gold", titleSize: 13 });
+  d.box({ id: "P6", x: 500, y: 465, w: 380, h: 50, title: "anthropic", tone: "gold", titleSize: 13 });
+  d.box({ id: "P7", x: 500, y: 535, w: 380, h: 50, title: "...", tone: "gold", titleSize: 13 });
+
+  d.arrow("P1", "A1", { from: "left", to: "right" });
+  d.arrow("P1", [360, 204], { from: "left", to: "center" });
+  d.arrow("P2", [360, 124], { from: "left", to: "center" });
+  d.arrow("P3", [360, 148], { from: "left", to: "center" });
+  d.arrow("P4", [360, 156], { from: "left", to: "center" });
+  d.arrow("P5", [360, 216], { from: "left", to: "center" });
+  d.arrow("P6", "A3", { from: "left", to: "right" });
+});
+</script>
+</body>
+</html>
