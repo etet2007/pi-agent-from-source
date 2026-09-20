@@ -1,0 +1,1098 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pi Agent 源码解析 · 把复杂性挡在核心之外</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,700&amp;family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&amp;family=IBM+Plex+Mono:wght@300;400;500;600&amp;family=Noto+Serif+SC:wght@300;400;500;600;700;900&amp;family=Noto+Sans+SC:wght@300;400;500;700;900&amp;display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* ============ 主题色(默认:🖋 墨水经典) ============
+       切换主题:从 references/themes.md 复制对应的 :root 块
+       整体替换这几行(--ink / --ink-rgb / --paper / --paper-rgb)
+       其他地方散落的 rgba() 都走 var(--ink-rgb) / var(--paper-rgb),无需逐处改 */
+    --ink:#0a1f3d;
+    --ink-rgb:10,31,61;
+    --paper:#f1f3f5;
+    --paper-rgb:241,243,245;
+    --paper-tint:#e4e8ec;
+    --ink-tint:#152a4a;
+
+    /* ============ 字体(跨主题固定) ============ */
+    --mono:"IBM Plex Mono",ui-monospace,monospace;
+    --serif-en:"Playfair Display","Source Serif 4",Georgia,serif;
+    --serif-body-en:"Source Serif 4",Georgia,serif;
+    --serif-zh:"Noto Serif SC",source-han-serif-sc,serif;
+    --sans-zh:"Noto Sans SC",source-han-sans-sc,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;overflow:hidden;background:var(--ink);color:var(--paper);font-family:var(--sans-zh);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+
+  /* ============ WebGL 双背景 ============ */
+  canvas.bg{position:fixed;inset:0;width:100vw;height:100vh;z-index:0;display:block;transition:opacity 1.2s ease}
+  canvas#bg-light{opacity:0}
+  canvas#bg-dark{opacity:1}
+  body.light-bg canvas#bg-light{opacity:1}
+  body.light-bg canvas#bg-dark{opacity:0}
+
+  /* ============ Deck 容器 + 翻页 ============ */
+  /* width: NSLIDES * 100vw，会在 JS 里动态矫正 */
+  #deck{position:fixed;inset:0;width:10000vw;height:100vh;display:flex;flex-wrap:nowrap;transition:transform .9s cubic-bezier(.77,0,.175,1);z-index:10;will-change:transform}
+  .slide{width:100vw;height:100vh;flex:0 0 100vw;position:relative;padding:6vh 6vw 10vh 6vw;display:flex;flex-direction:column;overflow:hidden}
+  .slide.light{color:var(--ink)}
+  .slide.dark{color:var(--paper)}
+
+  /* 默认页：遮罩较厚，保证文字可读 */
+  .slide::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;transition:background .7s ease}
+  .slide.light::before{background:rgba(var(--paper-rgb),.78);backdrop-filter:blur(3px)}
+  .slide.dark::before{background:rgba(var(--ink-rgb),.78);backdrop-filter:blur(3px)}
+  /* Hero 页：遮罩大幅降低，让 WebGL 背景明显透出 */
+  .slide.hero.light::before{background:rgba(var(--paper-rgb),.16);backdrop-filter:none}
+  .slide.hero.dark::before{background:rgba(var(--ink-rgb),.12);backdrop-filter:none}
+  /* Hero 页顶底微弱渐隐，保证 chrome/foot 区域可读 */
+  .slide.hero::after{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none}
+  .slide.hero.light::after{background:linear-gradient(180deg,rgba(var(--paper-rgb),.28) 0%,rgba(var(--paper-rgb),0) 14%,rgba(var(--paper-rgb),0) 86%,rgba(var(--paper-rgb),.28) 100%)}
+  .slide.hero.dark::after{background:linear-gradient(180deg,rgba(var(--ink-rgb),.32) 0%,rgba(var(--ink-rgb),0) 14%,rgba(var(--ink-rgb),0) 86%,rgba(var(--ink-rgb),.32) 100%)}
+
+  /* ============ Magazine chrome：顶部 meta + 底部 foot ============ */
+  .chrome{display:flex;justify-content:space-between;align-items:flex-start;font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;opacity:.7}
+  .chrome .left,.chrome .right{display:flex;gap:2.4em;align-items:center}
+  .chrome .sep{width:40px;height:1px;background:currentColor;opacity:.4}
+  .foot{margin-top:auto;display:flex;justify-content:space-between;align-items:flex-end;font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;opacity:.55}
+  .foot .title{font-family:var(--serif-zh);font-weight:400;letter-spacing:.05em;text-transform:none;opacity:.75;font-size:13px}
+
+  .tag{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.24em;text-transform:uppercase;padding:6px 14px;border:1px solid currentColor;opacity:.85}
+  .rule{width:100%;height:1px;background:currentColor;opacity:.25;margin:3vh 0}
+  .rule.v{width:1px;height:100%;margin:0}
+
+  /* ============ 字体规则 ============
+     · 衬线（Noto Serif SC / Playfair）：大标题、重点金句、数字
+     · 非衬线（Noto Sans SC）：正文描述、body、补充说明
+     · 等宽（IBM Plex Mono）：kicker、meta 小标签、foot 右侧
+  */
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.3em;text-transform:uppercase;opacity:.6;margin-bottom:2.6vh}
+  .display{font-family:var(--serif-en);font-weight:700;font-size:11vw;line-height:.92;letter-spacing:-.025em}
+  .display-zh{font-family:var(--serif-zh);font-weight:700;font-size:7.8vw;line-height:1.04;letter-spacing:-.005em}
+  .h1-zh{font-family:var(--serif-zh);font-weight:700;font-size:4.6vw;line-height:1.12;letter-spacing:-.005em}
+  .h2-zh{font-family:var(--serif-zh);font-weight:600;font-size:3.2vw;line-height:1.2;letter-spacing:0}
+  .h3-zh{font-family:var(--serif-zh);font-weight:500;font-size:1.9vw;line-height:1.35}
+  .body-zh{font-family:var(--sans-zh);font-weight:400;font-size:max(15px,1.22vw);line-height:1.75;opacity:.82;letter-spacing:.01em}
+  .body-serif{font-family:var(--serif-zh);font-weight:400;font-size:max(15px,1.3vw);line-height:1.65;opacity:.88}
+  .lead{font-family:var(--serif-zh);font-weight:400;font-size:1.9vw;line-height:1.4;opacity:.85}
+  .meta{font-family:var(--mono);font-size:max(11px,.88vw);letter-spacing:.16em;text-transform:uppercase;opacity:.6}
+  .big-num{font-family:var(--serif-en);font-weight:800;font-size:10vw;line-height:.85;letter-spacing:-.03em;font-feature-settings:"tnum"}
+  .mid-num{font-family:var(--serif-en);font-weight:700;font-size:5.5vw;line-height:.88;letter-spacing:-.02em;font-feature-settings:"tnum"}
+  .ghost{font-family:var(--serif-en);font-weight:900;font-size:34vw;line-height:.8;opacity:.06;letter-spacing:-.04em;position:absolute;font-feature-settings:"tnum"}
+  em{font-style:italic;font-family:var(--serif-en)}
+  .en{font-family:var(--serif-en);font-style:italic;font-weight:500}
+
+  /* ============ 布局工具 ============ */
+  .col{display:flex;flex-direction:column;gap:2.4vh}
+  .row{display:flex;align-items:center;gap:3vw}
+  .grid-6{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(2,1fr);gap:4vw 6vw;flex:1;align-content:center;padding:2vh 0}
+  .grid-9{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);gap:3vh 4vw;flex:1;align-content:center}
+  .grid-4{display:grid;grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(2,1fr);gap:4vh 6vw;flex:1;align-content:center}
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:4vw;flex:1;align-content:center}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:4vw;flex:1;align-items:center}
+  .split-55{display:grid;grid-template-columns:55fr 45fr;gap:5vw;flex:1;align-items:stretch}
+  .fill{flex:1}
+  .center{align-items:center;justify-content:center;text-align:center}
+  .bottom-left{position:absolute;left:6vw;bottom:9vh;max-width:50vw}
+  .bottom-right{position:absolute;right:6vw;bottom:9vh;max-width:50vw;text-align:right}
+  .top-right{position:absolute;right:6vw;top:6vh;text-align:right}
+
+  /* ============ Stat（数字矩阵） ============ */
+  .stat{display:flex;flex-direction:column;gap:1vh;align-items:flex-start}
+  .stat .n{font-family:var(--serif-en);font-weight:800;font-size:8vw;line-height:.88;letter-spacing:-.03em;font-feature-settings:"tnum"}
+  .stat .l{font-family:var(--sans-zh);font-size:max(13px,1.05vw);opacity:.7;margin-top:1vh;font-weight:400;line-height:1.5}
+  .stat .m{font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;opacity:.5;margin-bottom:.2vh}
+
+  /* ============ Callout（引用框） ============ */
+  .callout{padding:3vh 2.4vw;border-left:3px solid currentColor;position:relative;font-family:var(--serif-zh);font-size:max(15px,1.2vw);line-height:1.55;opacity:.92}
+  .slide.light .callout{background:rgba(var(--ink-rgb),.05)}
+  .slide.dark .callout{background:rgba(var(--paper-rgb),.06)}
+  .callout .cite{display:block;margin-top:1.6vh;font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;opacity:.6}
+  .callout .q-big{font-family:var(--serif-zh);font-weight:600;font-size:max(17px,1.6vw);line-height:1.42}
+
+  /* ============ Platform（平台卡） ============ */
+  .plat{display:flex;flex-direction:column;justify-content:flex-end;padding:2vh 0;border-top:1px solid currentColor;border-color:rgba(127,127,127,.35)}
+  .plat .name{font-family:var(--serif-zh);font-weight:700;font-size:1.8vw;margin-bottom:.6vh}
+  .plat .nb{font-family:var(--serif-en);font-weight:700;font-size:3.2vw;letter-spacing:-.02em;line-height:1;font-feature-settings:"tnum"}
+  .plat .sub{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;opacity:.55;margin-top:.6vh}
+  .plat .fill{font-family:var(--sans-zh);font-weight:300;font-size:2.4vw;opacity:.28;letter-spacing:-.01em;line-height:1}
+
+  /* ============ Rowline（表格行） ============ */
+  .rowline{display:grid;grid-template-columns:1fr 2fr 1fr;gap:2vw;padding:2.2vh 0;border-top:1px solid currentColor;align-items:center;border-color:rgba(127,127,127,.25)}
+  .rowline:last-child{border-bottom:1px solid currentColor;border-color:rgba(127,127,127,.25)}
+  .rowline .k{font-family:var(--serif-zh);font-weight:700;font-size:1.7vw}
+  .rowline .v{font-family:var(--sans-zh);font-weight:400;font-size:max(14px,1.2vw);opacity:.85;line-height:1.55}
+  .rowline .m{font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;opacity:.6;justify-self:end}
+
+  /* ============ Pillar（支柱卡片） ============ */
+  .pillar{display:flex;flex-direction:column;gap:1.8vh}
+  .pillar .ic{font-family:var(--serif-en);font-style:italic;font-size:2.6vw;opacity:.45;font-weight:400}
+  .pillar .ic svg{width:2.8vw;height:2.8vw;stroke-width:1.2;opacity:.7}
+  .pillar .t{font-family:var(--serif-zh);font-weight:700;font-size:2.4vw;line-height:1.1}
+  .pillar .d{font-family:var(--sans-zh);font-weight:400;font-size:max(14px,1.1vw);opacity:.76;line-height:1.6}
+
+  /* ============ Signature / Highlight ============ */
+  .sign{font-family:var(--serif-en);font-style:italic;font-weight:500;font-size:2vw;opacity:.7}
+  .hi{position:relative;display:inline}
+  .slide.dark .hi::after{content:"";position:absolute;left:-.1em;right:-.1em;bottom:-.05em;height:.28em;background:rgba(var(--paper-rgb),.15);z-index:-1}
+  .slide.light .hi::after{content:"";position:absolute;left:-.1em;right:-.1em;bottom:-.05em;height:.28em;background:rgba(var(--ink-rgb),.08);z-index:-1}
+
+  /* ============ Icons（Lucide via CDN） ============ */
+  .ico{width:1em;height:1em;display:inline-block;vertical-align:-.12em;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+  .ico-lg,.ico-md,.ico-sm{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+  .ico-lg{width:2.6vw;height:2.6vw;stroke-width:1.2;display:inline-block}
+  .ico-md{width:1.8vw;height:1.8vw;stroke-width:1.3;display:inline-block;vertical-align:-.4em}
+  .ico-sm{width:1.1vw;height:1.1vw;stroke-width:1.4;display:inline-block;vertical-align:-.15em;opacity:.7}
+
+  /* ============ 图片占位（虚线框，提示设计师位置） ============ */
+  .img-slot{border:1.5px dashed rgba(127,127,127,.4);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:1vh;padding:2vh 2vw;font-family:var(--mono);font-size:10px;letter-spacing:.28em;text-transform:uppercase;opacity:.55;position:relative;aspect-ratio:16/9;width:100%;max-height:56vh;margin-inline:auto;box-sizing:border-box}
+  .img-slot::before{content:"";position:absolute;inset:8px;border:1px solid currentColor;opacity:.2}
+  .img-slot .plus{font-size:2vw;font-weight:300;opacity:.5;letter-spacing:0}
+  .img-slot .label{position:relative;z-index:2;text-align:center}
+  .img-slot.r-4x3{aspect-ratio:4/3}
+  .img-slot.r-3x2{aspect-ratio:3/2}
+  .img-slot.r-1x1{aspect-ratio:1/1}
+
+  /* ============ 图片实填框（关键：固定高度 + 只裁底部） ============
+     重要约束：高度用内联 height:Nvh 精确控制，不要用 aspect-ratio（会撑破布局）
+     object-position:top center 保证严禁裁剪顶部和左右，只裁剪底部
+  */
+  .frame-img{overflow:hidden;position:relative;background:rgba(0,0,0,.04);box-sizing:border-box;width:100%;border-radius:4px}
+  .slide.dark .frame-img{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.12)}
+  .frame-img > img{width:100%;height:100%;object-fit:cover;object-position:top center;display:block}
+  .frame-cap{display:flex;justify-content:space-between;align-items:baseline;gap:1vw;margin-top:.8vh;font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;opacity:.72}
+  .frame-cap .pf{font-family:var(--serif-zh);font-weight:600;font-size:max(13px,1vw);letter-spacing:.04em;text-transform:none;opacity:.94}
+  .frame-cap .nb{font-family:var(--serif-en);font-style:italic;font-size:max(15px,1.2vw);letter-spacing:.02em;text-transform:none;opacity:.88}
+  .frame-cap .idx{font-family:var(--mono);opacity:.5}
+  figure.tile{display:flex;flex-direction:column;margin:0;min-width:0}
+  figure.tile > .frame-img{flex:0 0 auto}
+
+  /* ============ 导航 ============ */
+  #nav{position:fixed;left:50%;bottom:2.6vh;transform:translateX(-50%);z-index:30;display:flex;gap:10px;padding:8px 14px;border-radius:999px;background:rgba(0,0,0,.18);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+  #nav .dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.3);cursor:pointer;transition:all .3s ease;border:0;padding:0}
+  #nav .dot:hover{background:rgba(255,255,255,.5);transform:scale(1.15)}
+  #nav .dot.active{background:rgba(255,255,255,.95);width:22px;border-radius:999px}
+  body.light-bg #nav{background:rgba(255,255,255,.25)}
+  body.light-bg #nav .dot{background:rgba(var(--ink-rgb),.25)}
+  body.light-bg #nav .dot.active{background:rgba(var(--ink-rgb),.9)}
+  #hint{position:fixed;bottom:3vh;right:3vw;z-index:30;font-family:var(--mono);font-size:10px;letter-spacing:.2em;text-transform:uppercase;opacity:.4;mix-blend-mode:difference;color:#aaa}
+
+  /* ============================================================
+     ============ LAYOUTS API · 面向 agent 的类（v2）============
+     所有 layouts.md 中的骨架都基于下面这套命名。
+     如果你在 layouts.md 里看到某个类，它必须在下面有定义。
+     ============================================================ */
+
+  /* ---------- .frame：每页主内容容器 ---------- */
+  .frame{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  /* 当 .frame 同时加了 grid 类时，grid 的 display:grid 覆盖 flex */
+  .frame.grid-2-7-5,
+  .frame.grid-2-6-6,
+  .frame.grid-2-8-4,
+  .frame.grid-3-3,
+  .frame.grid-6{display:grid}
+
+  /* ---------- 标题层级（API 名称，衬线为主） ---------- */
+  .h-hero{
+    font-family:var(--serif-zh);
+    font-weight:900;
+    font-size:10vw;
+    line-height:.96;
+    letter-spacing:-.02em;
+  }
+  .h-xl{
+    font-family:var(--serif-zh);
+    font-weight:700;
+    font-size:6.2vw;
+    line-height:1.08;
+    letter-spacing:-.01em;
+  }
+  .h-sub{
+    font-family:var(--serif-zh);
+    font-weight:500;
+    font-size:3.1vw;
+    line-height:1.25;
+    letter-spacing:0;
+    opacity:.7;
+  }
+  .h-md{
+    font-family:var(--serif-zh);
+    font-weight:600;
+    font-size:2.3vw;
+    line-height:1.3;
+  }
+  /* 英文标题专用（Playfair 衬线） */
+  .h-hero-en,.h-xl-en{font-family:var(--serif-en);letter-spacing:-.025em}
+
+  /* ---------- lead 引语 ---------- */
+  .lead{
+    font-family:var(--serif-zh);
+    font-weight:400;
+    font-size:1.75vw;
+    line-height:1.5;
+    opacity:.86;
+  }
+
+  /* ---------- meta-row 底部元数据 ---------- */
+  .meta-row{
+    display:flex;
+    gap:1.2em;
+    align-items:baseline;
+    flex-wrap:wrap;
+    font-family:var(--mono);
+    font-size:max(12px,.92vw);
+    letter-spacing:.16em;
+    text-transform:uppercase;
+    opacity:.6;
+  }
+
+  /* ---------- stat-card（数据大字报用） ---------- */
+  .stat-card{
+    display:flex;
+    flex-direction:column;
+    gap:.8vh;
+    align-items:flex-start;
+    padding-top:1.6vh;
+    border-top:1px solid currentColor;
+    border-color:rgba(127,127,127,.3);
+  }
+  .stat-card .stat-label{
+    font-family:var(--mono);
+    font-size:max(10px,.78vw);
+    letter-spacing:.24em;
+    text-transform:uppercase;
+    opacity:.55;
+  }
+  .stat-card .stat-nb{
+    font-family:var(--serif-en);
+    font-weight:800;
+    font-size:5.8vw;
+    line-height:.9;
+    letter-spacing:-.03em;
+    font-feature-settings:"tnum";
+    margin-top:.4vh;
+  }
+  .stat-card .stat-nb .stat-unit{
+    font-family:var(--serif-zh);
+    font-weight:500;
+    font-size:.38em;
+    letter-spacing:0;
+    opacity:.72;
+    margin-left:.14em;
+  }
+  .stat-card .stat-note{
+    font-family:var(--sans-zh);
+    font-weight:400;
+    font-size:max(13px,1.05vw);
+    line-height:1.5;
+    opacity:.72;
+    margin-top:.6vh;
+  }
+  /* 当 stat-card 用于 grid-4（2x2），数字适度放大；若页面有标题+引文在上方，可内联 style 覆盖为更小值 */
+  .grid-4 .stat-card .stat-nb{font-size:5vw}
+  /* 当只有 3 个，字也可以稍大 */
+  .grid-3 .stat-card .stat-nb{font-size:6.8vw}
+
+  /* ---------- pipeline（流水线） ---------- */
+  .pipeline-section{
+    margin-top:4.4vh;
+    padding-top:2.8vh;
+    border-top:1px dashed rgba(127,127,127,.32);
+  }
+  .pipeline-section:first-of-type{
+    border-top:0;
+    padding-top:0;
+    margin-top:3vh;
+  }
+  .pipeline-label{
+    font-family:var(--mono);
+    font-size:max(11px,.85vw);
+    letter-spacing:.24em;
+    text-transform:uppercase;
+    opacity:.62;
+    margin-bottom:2.2vh;
+  }
+  .pipeline{
+    display:grid;
+    grid-template-columns:repeat(5,1fr);
+    gap:1.2vw;
+  }
+  .pipeline[data-cols="3"]{grid-template-columns:repeat(3,1fr)}
+  .pipeline[data-cols="4"]{grid-template-columns:repeat(4,1fr)}
+  .pipeline[data-cols="6"]{grid-template-columns:repeat(6,1fr)}
+  .step{
+    display:flex;
+    flex-direction:column;
+    gap:.8vh;
+    padding-top:1.4vh;
+    border-top:1px solid currentColor;
+    border-color:rgba(127,127,127,.35);
+  }
+  .step-nb{
+    font-family:var(--serif-en);
+    font-style:italic;
+    font-weight:500;
+    font-size:1.15vw;
+    opacity:.45;
+  }
+  .step-title{
+    font-family:var(--sans-zh);
+    font-weight:700;
+    font-size:1.55vw;
+    letter-spacing:.01em;
+    line-height:1.2;
+  }
+  .step-desc{
+    font-family:var(--sans-zh);
+    font-weight:400;
+    font-size:max(12px,.95vw);
+    line-height:1.45;
+    opacity:.72;
+  }
+
+  /* ---------- 网格（layouts.md 所用） ---------- */
+  /* 这些类独立挂到任何容器上都能生效，不依赖 .frame 复合选择器 */
+  .grid-2-7-5{display:grid;grid-template-columns:7fr 5fr;gap:3vw 4vh;align-items:start}
+  .grid-2-6-6{display:grid;grid-template-columns:1fr 1fr;gap:3vw 4vh;align-items:start}
+  .grid-2-8-4{display:grid;grid-template-columns:8fr 4fr;gap:3vw 4vh;align-items:start}
+  .grid-3-3{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    grid-auto-rows:minmax(0,1fr);
+    gap:2.4vh 2vw;
+  }
+  /* grid-6 已在旧样式里定义为 3x2，这里仅补 align */
+
+  /* ---------- 图片 frame-img（layouts.md 主命名） ---------- */
+  /* 在旧样式里已定义，这里补 img-cap 命名别名与增强 */
+  figure.frame-img{margin:0;display:flex;flex-direction:column;min-width:0}
+  .img-cap{
+    display:block;
+    margin-top:.8vh;
+    font-family:var(--mono);
+    font-size:max(10px,.8vw);
+    letter-spacing:.22em;
+    text-transform:uppercase;
+    opacity:.6;
+  }
+  /* callout src 命名别名 */
+  .callout-src{
+    display:block;
+    margin-top:1.6vh;
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.2em;
+    text-transform:uppercase;
+    opacity:.6;
+  }
+
+  /* ---------- chrome & foot 补位（layouts.md 简单写法） ---------- */
+  .chrome{font-family:var(--mono);font-size:max(11px,.78vw);letter-spacing:.2em;text-transform:uppercase;opacity:.62}
+  .foot{font-family:var(--mono);font-size:max(11px,.78vw);letter-spacing:.18em;text-transform:uppercase;opacity:.5}
+
+  /* ============ 动效系统(Motion One 驱动) ============
+     所有 [data-anim] 元素默认隐藏,进入页面时由 JS 逐个揭示。
+     - cascade(默认):按 DOM 顺序 stagger 120ms 淡入 + y:16→0
+     - hero(hero 页自动):慢一点的 stagger 180ms
+     - quote(含 [data-anim="line"]):逐行 600ms 淡入
+     - directional(含 [data-anim="left|right"]):左→分隔线→右
+     - pipeline(data-animate="pipeline"):Space/→ 手动推进
+     Motion One 没加载成功时(CDN 断 + 本地丢),所有 [data-anim] 会兜底显示。
+  */
+  [data-anim]{opacity:0}
+  [data-anim="left"]{transform:translateX(-24px)}
+  [data-anim="right"]{transform:translateX(24px)}
+  [data-anim="line"]{opacity:0;transform:translateY(10px)}
+  [data-animate="pipeline"] [data-anim]{opacity:.15}
+
+  /* ---------- 响应式降级 ---------- */
+  @media (max-width:900px){
+    .display{font-size:16vw}
+    .display-zh{font-size:12vw}
+    .h1-zh{font-size:7vw}
+    .h-hero{font-size:14vw}
+    .h-xl{font-size:9vw}
+    .pipeline{grid-template-columns:repeat(2,1fr)}
+    .grid-2-7-5,.grid-2-6-6,.grid-2-8-4{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bg-dark" class="bg"></canvas>
+<canvas id="bg-light" class="bg"></canvas>
+<div id="hint">← → 翻页 · ESC 索引 · N 讲稿</div>
+
+<div id="deck">
+
+<!-- ============================================================
+     SLIDES 插入区 · 在此处填充所有 <section class="slide ..."> 页面
+     每页模板参考 references/page-patterns.md
+     页面组件参考 references/components.md
+     ============================================================ -->
+
+<section class="slide hero dark">
+  <div class="chrome"><div>Source Reading · v0.83.0</div><div>01 / 18</div></div>
+  <div class="frame" style="display:grid;gap:3.6vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>九个包 · 一条循环 · 一种取舍</div>
+    <h1 class="h-hero" style="font-size:9.2vw;white-space:nowrap" data-anim>Pi Agent</h1>
+    <h2 class="h-sub" data-anim>源码解析：把复杂性挡在核心之外</h2>
+    <p class="lead" style="max-width:58vw" data-anim>从 LLM 边界、Agent Loop 到 AgentSession，读懂一个最小化编码 Agent 的架构选择。</p>
+    <div class="meta-row" data-anim><span>20–25 MIN</span><span>·</span><span>CHINESE TECH TALK</span></div>
+  </div>
+  <div class="foot"><div>基于 kuwii/pi-agent-from-source</div><div>2026 · SOURCE WALKTHROUGH</div></div>
+  <aside hidden><p>今天不做 Pi Agent 的功能清单，也不逐章复述源码书。我们只追一个问题：一个生产级编码 Agent，核心究竟可以小到什么程度？</p><p>Pi 的答案不是“少做功能”，而是重新安排复杂性的位置。接下来会沿着模型边界、Agent Loop、产品编排三层往外看。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Opening · The Question</div><div>02 / 18</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:8vh;align-items:center">
+    <div>
+      <div class="kicker" data-anim>先不要看功能表</div>
+      <h2 class="h-xl" style="font-size:6.6vw" data-anim>一个 Agent 的核心，<br>到底需要多大？</h2>
+      <p class="lead" style="margin-top:4vh;max-width:46vw" data-anim>模型会推理，工具会产生副作用，用户还会中途插话。复杂性天然存在。</p>
+    </div>
+    <div class="callout" data-anim><div class="q-big">真正的架构问题不是<br>“有没有复杂性”，而是<br><span class="hi">复杂性住在哪里</span>。</div><div class="callout-src">THE PLACEMENT OF COMPLEXITY</div></div>
+  </div>
+  <div class="foot"><div>问题设定 · 复杂性守恒</div><div>book/index.html</div></div>
+  <aside hidden><p>普通 CLI 是确定的：参数进去，动作出来。Agent CLI 不同，模型在运行时生成下一步，工具调用又会改变真实世界。</p><p>所以“把代码写少”并不会让风险自动消失。我们要观察的是：Pi 把什么留在核心，把什么交给外围，以及这些选择的代价。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Repository · Evidence</div><div>03 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>先建立规模感</div>
+    <h2 class="h-xl" style="font-size:5.6vw" data-anim>六个数字，一张地图</h2>
+    <div class="grid-6" style="margin-top:3vh;gap:3vw 5vw">
+      <div class="stat-card" data-anim><div class="stat-label">Workspace Units</div><div class="stat-nb">9</div><div class="stat-note">不计 install-lock，内部依赖无环</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Nested Loops</div><div class="stat-nb">2</div><div class="stat-note">工具轮 + follow-up 轮</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Core Events</div><div class="stat-nb">10</div><div class="stat-note">描述完整 Agent 生命周期</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Built-in Tools</div><div class="stat-nb">7</div><div class="stat-note">工具目录 7 个，默认启用其中 4 个</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">CLI Consumers</div><div class="stat-nb">3</div><div class="stat-note">TUI / print（含 JSON）/ RPC</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">AgentSession</div><div class="stat-nb">3.3K</div><div class="stat-note">产品复杂性集中地</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>代码事实 · 当前 checkout</div><div>pi-agent-src/packages</div></div>
+  <aside hidden><p>这六个数字先帮我们定位：Pi 不是一个“玩具循环”。当前工作区有九个包单元（不计 install-lock），内置工具目录有七个、默认启用四个；CLI 有 TUI、print（含 JSON）和 RPC 三条消费路径，SDK 则是另一种嵌入入口。</p><p>反差在于，核心循环只需要十种事件和两层 while；真正庞大的部分是三千多行的 AgentSession。最小化的是核心，不是整个产品。</p></aside>
+</section>
+
+<section class="slide hero light">
+  <div class="chrome"><div>Act I · Mechanism</div><div>04 / 18</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act I</div>
+    <h1 class="h-hero" style="font-size:8.2vw;white-space:nowrap" data-anim>最小核心</h1>
+    <p class="lead" style="max-width:55vw" data-anim>先把模型、循环、工具三件事讲清楚。</p>
+  </div>
+  <div class="foot"><div>机制先于产品</div><div>CORE MECHANISM</div></div>
+  <aside hidden><p>第一幕只看核心机制。暂时忘掉 TUI、会话文件、扩展市场，只看一次 prompt 如何变成模型响应、工具调用和下一轮。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Architecture · Dependency Stack</div><div>05 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>依赖方向就是架构</div>
+    <h2 class="h-xl" style="font-size:5.5vw" data-anim>九个包，不是一棵文件树</h2>
+    <div style="display:grid;grid-template-columns:1.1fr 1.5fr 1fr;gap:2vw;margin-top:5vh;align-items:stretch">
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">01</div><div class="t">基础机制</div><div class="d"><strong>pi-ai</strong><br>模型与流式协议<br><br><strong>pi-agent-core</strong><br>循环、事件、Harness</div></div>
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">02</div><div class="t">产品与界面</div><div class="d"><strong>pi-coding-agent</strong><br>CLI 与 AgentSession<br><br><strong>pi-tui</strong><br>独立终端渲染器</div></div>
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">03</div><div class="t">旁支能力</div><div class="d"><strong>protocol / client / server</strong><br>远程连接<br><br><strong>storage / evals</strong><br>存储与质量</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>九包单向依赖 · UI 与 LLM 解耦</div><div>packages/*/package.json</div></div>
+  <aside hidden><p>Pi 的第一层克制体现在包边界。pi-ai 不认识 Agent，pi-tui 也不认识 LLM；核心只依赖更低层抽象。</p><p>这意味着每层都能单独复用。远程、存储、评估是旁支，不反向侵入产品核心。层级本身就是复杂性的防火墙。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Boundary · StreamFn</div><div>06 / 18</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:6vh">
+    <div>
+      <div class="kicker" data-anim>模型世界只有一条缝</div>
+      <h2 class="h-xl" style="font-size:5.8vw" data-anim>StreamFn</h2>
+      <p class="lead" style="margin-top:3vh" data-anim>核心循环不认识 OpenAI、Anthropic 或 Google；它只接收一个返回事件流的函数。</p>
+      <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">失败不抛异常。<br>失败被编码进最后一条消息。</div><div class="callout-src">stopReason: error | aborted</div></div>
+    </div>
+    <pre data-anim style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.7;white-space:pre-wrap;padding:3vh 2vw;border-top:1px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>type StreamFn = (
+  model,
+  context,
+  options?
+) =&gt; AssistantMessageEventStream
+
+// done  → AssistantMessage
+// error → AssistantMessage</code></pre>
+  </div>
+  <div class="foot"><div>模型边界 · 以契约换循环简洁</div><div>packages/agent/src/types.ts</div></div>
+  <aside hidden><p>核心循环只通过 StreamFn 触碰模型层。具体提供商、认证、重试、流式协议，都被挡在这条边界外。</p><p>最关键的契约是“永不抛出”：失败也要收敛成 AssistantMessage。于是循环不必在每个模型调用周围堆 try/catch，只检查 stopReason。</p></aside>
+</section>
+
+<section class="slide light" data-animate="pipeline">
+  <div class="chrome"><div>Core · Agent Loop</div><div>07 / 18</div></div>
+  <div class="frame">
+    <div class="kicker">一次 prompt 的黄金路径</div>
+    <h2 class="h-xl" style="font-size:5.4vw">两层循环，五个动作</h2>
+    <div class="pipeline-section" style="margin-top:5vh">
+      <div class="pipeline-label">Inner Loop · tool calls + steering</div>
+      <div class="pipeline">
+        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">Inject</div><div class="step-desc">合并用户 prompt 与 steering</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">Stream</div><div class="step-desc">调用 StreamFn，增量发事件</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">Inspect</div><div class="step-desc">检查 stopReason 与 toolCall</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">Execute</div><div class="step-desc">执行工具，写回 toolResult</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">Continue</div><div class="step-desc">有调用就继续内层循环</div></div>
+      </div>
+    </div>
+    <div class="pipeline-section">
+      <div class="pipeline-label">Outer Loop · follow-up queue</div>
+      <div class="pipeline" data-cols="3">
+        <div class="step" data-anim="step"><div class="step-nb">A</div><div class="step-title">Would Stop</div><div class="step-desc">当前任务本来要结束</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">B</div><div class="step-title">Poll</div><div class="step-desc">读取排队的 follow-up</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">C</div><div class="step-title">Resume</div><div class="step-desc">有新任务则再次进入内层</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>按 → 逐步点亮</div><div>packages/agent/src/agent-loop.ts</div></div>
+  <aside hidden><p>内层循环负责“模型说还要用工具”和“用户在工作中插话”。外层循环负责 Agent 本来要停下时，再看看有没有 follow-up。</p><p>steering 是工作中插话，follow-up 是忙完后接下一件事。两个队列对应两层循环，产品体验直接映射到控制流。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Core · Tool Execution</div><div>08 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>工具不是一个裸函数</div>
+    <h2 class="h-xl" style="font-size:5.4vw" data-anim>Schema → Execute → Result</h2>
+    <div class="grid-3" style="margin-top:5vh;align-content:start">
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="braces" class="ico-lg"></i></div><div class="t">自描述</div><div class="d">名称、参数 schema、标签和执行逻辑放在同一个 AgentTool 契约里。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="git-branch" class="ico-lg"></i></div><div class="t">并发可声明</div><div class="d">默认可并行；任一调用声明 sequential，整批顺序执行。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="radio" class="ico-lg"></i></div><div class="t">进度事件化</div><div class="d">start / update / end 三类事件，让 UI 与执行解耦。</div></div>
+    </div>
+    <div class="callout" style="margin-top:5vh" data-anim><div class="q-big">新增第八个工具，不需要修改 Agent Loop。</div><div class="callout-src">OPEN / CLOSED AT THE TOOL BOUNDARY</div></div>
+  </div>
+  <div class="foot"><div>七个内置工具只是默认集合</div><div>agent-loop.ts · core/tools</div></div>
+  <aside hidden><p>循环只做三件事：按 schema 校验、执行、收集结果。工具是什么、如何渲染、能否并发，都由工具自己声明。</p><p>并发策略也很克制：配置要求串行，或者这一批里出现 sequential 工具，就顺序执行；否则可以并行。复杂性被内聚在边界，而不是扩散到循环。</p></aside>
+</section>
+
+<section class="slide hero light">
+  <div class="chrome"><div>Act II · Orchestration</div><div>09 / 18</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act II</div>
+    <h1 class="h-hero" style="font-size:7.3vw" data-anim>复杂性没有消失</h1>
+    <p class="lead" style="max-width:58vw" data-anim>它只是从“机制”移动到了“策略”。</p>
+  </div>
+  <div class="foot"><div>复杂性守恒</div><div>MECHANISM → POLICY</div></div>
+  <aside hidden><p>到这里核心确实很小，但生产功能一个也没凭空消失。第二幕要看这些复杂性具体去了哪里：Harness、AgentSession、会话树和运行模式。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Layers · Core / Harness / Product</div><div>10 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>同一个包里，也不强迫绑定</div>
+    <h2 class="h-xl" style="font-size:5.2vw" data-anim>三层，三种责任</h2>
+    <div class="grid-3" style="margin-top:5vh;align-content:start">
+      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">CORE</div><div class="t">机制</div><div class="d">Agent、两层循环、状态归约、十种事件。纯内存，可独立运行。</div></div>
+      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">HARNESS</div><div class="t">通用策略</div><div class="d">持久化会话树、压缩、分支摘要、skills、模板和内置工具。</div></div>
+      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">PRODUCT</div><div class="t">具体产品</div><div class="d">pi-coding-agent 绕过通用 Harness，自建 AgentSession 与 SessionManager。</div></div>
+    </div>
+    <p class="lead" style="margin-top:6vh;max-width:76vw" data-anim>框架提供机制，也提供一种默认策略；但不把这套策略焊死在核心上。</p>
+  </div>
+  <div class="foot"><div>最小核心允许上层定制编排</div><div>agent/src/harness · coding-agent/core</div></div>
+  <aside hidden><p>pi-agent-core 里既有纯净核心，也有可选 Harness。最值得注意的是，官方 CLI 产品没有直接使用通用 AgentHarness，而是在核心 Agent 上自建了 AgentSession。</p><p>这说明 Harness 只是可选策略，不是框架强加的命运。机制与策略分离之后，产品才能拥有自己的扩展、信任和模式管理。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>State · Session Tree</div><div>11 / 18</div></div>
+  <div class="frame grid-2-6-6" style="padding-top:6vh;align-items:center">
+    <div>
+      <div class="kicker" data-anim>历史不是一个可变数组</div>
+      <h2 class="h-xl" style="font-size:5.4vw" data-anim>会话是一棵树</h2>
+      <p class="lead" style="margin-top:3vh" data-anim>每条记录有 id 与 parentId；leaf 表示当前所在位置。</p>
+      <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">压缩不是删历史，<br>而是追加一条 summary 节点。</div><div class="callout-src">APPEND-ONLY SESSION MODEL</div></div>
+    </div>
+    <pre data-anim style="font-family:var(--mono);font-size:max(13px,1.15vw);line-height:1.9;padding:3vh 2vw;border-left:2px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>root
+ └─ user: task
+    └─ assistant: tool call
+       ├─ toolResult
+       │  └─ assistant: answer  ← leaf
+       └─ branch_summary
+          └─ user: new direction
+
+moveTo(entryId) → 改变当前位置
+compact()       → 追加摘要入口</code></pre>
+  </div>
+  <div class="foot"><div>回溯、分支、压缩成为一等能力</div><div>agent/src/harness/session</div></div>
+  <aside hidden><p>如果历史只是数组，回退常常意味着复制或删除。Pi 用 parentId 把会话记录组织成树，leaf 指向当前分支。</p><p>moveTo 只改变当前位置；压缩追加摘要条目而不是销毁原记录。这让 fork、回溯、分支摘要都能建立在同一个数据模型上。</p></aside>
+</section>
+
+<section class="slide light" data-animate="pipeline">
+  <div class="chrome"><div>Product · AgentSession</div><div>12 / 18</div></div>
+  <div class="frame">
+    <div class="kicker">用户按下回车之后</div>
+    <h2 class="h-xl" style="font-size:5.2vw">prompt() 是一只漏斗</h2>
+    <div class="pipeline-section" style="margin-top:6vh">
+      <div class="pipeline-label">Product concerns are resolved before the core sees a message</div>
+      <div class="pipeline">
+        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">Intercept</div><div class="step-desc">扩展有机会改写或拦截输入</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">Expand</div><div class="step-desc">展开 skill、模板与资源</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">Validate</div><div class="step-desc">检查模型、认证与运行状态</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">Compact</div><div class="step-desc">需要时整理上下文</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">Dispatch</div><div class="step-desc">把干净消息交给核心 Agent</div></div>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:6vh" data-anim><div class="q-big">核心保持小，是因为产品复杂性被集中管理。</div><div class="callout-src">AgentSession · 3.3K LINES</div></div>
+  </div>
+  <div class="foot"><div>按 → 逐步点亮</div><div>core/agent-session.ts</div></div>
+  <aside hidden><p>AgentSession 是产品层的中央编排器。用户输入并不会直接丢给模型，而是先经过扩展、skill 和模板展开、认证与模型校验、压缩判断。</p><p>只有当产品关注点都处理完，核心才收到干净消息。这不是复杂性变少，而是复杂性被集中到一个明确的产品边界。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Projection · Three Modes</div><div>13 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>同一条 AgentSessionEvent 流</div>
+    <h2 class="h-xl" style="font-size:5.4vw" data-anim>三种消费方式</h2>
+    <div class="grid-3" style="margin-top:5vh;align-content:start">
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="terminal" class="ico-lg"></i></div><div class="t">TUI</div><div class="d">把事件翻译成可交互终端组件，复杂度主要来自“与人交互”。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="file-output" class="ico-lg"></i></div><div class="t">Print</div><div class="d">输出纯文本或 JSON Lines，给脚本和流水线消费。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="network" class="ico-lg"></i></div><div class="t">RPC</div><div class="d">stdin/stdout 上收命令、发事件，供 IDE 或守护进程驱动。</div></div>
+    </div>
+    <p class="lead" style="margin-top:6vh" data-anim>新增一种呈现方式，不需要改 Agent Loop。</p>
+  </div>
+  <div class="foot"><div>事件流即产品层契约</div><div>coding-agent/src/modes</div></div>
+  <aside hidden><p>三种模式共享同一个 AgentSession，只是消费事件的方式不同。TUI 渲染组件，print 写 stdout，RPC 把操作和事件序列化成 JSON 行。</p><p>这条边界的价值在于：新增 IDE 集成或后台服务时，不需要复制 Agent 逻辑，只写新的消费者。</p></aside>
+</section>
+
+<section class="slide hero dark">
+  <div class="chrome"><div>Act III · Trade-offs</div><div>14 / 18</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act III</div>
+    <h1 class="h-hero" style="font-size:8vw;white-space:nowrap" data-anim>边界与赌注</h1>
+    <p class="lead" style="max-width:58vw" data-anim>最小化不是免费午餐，也不是普遍最优。</p>
+  </div>
+  <div class="foot"><div>把代价一起讲清楚</div><div>TRADE-OFFS</div></div>
+  <aside hidden><p>最后一幕讨论两个最容易被口号化的地方：扩展和安全。Pi 的路线有明确优势，也把更多责任交给了使用者和执行环境。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Extension · Typed Surface</div><div>15 / 18</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:6vh">
+    <div>
+      <div class="kicker" data-anim>没有 MCP，不等于没有扩展性</div>
+      <h2 class="h-xl" style="font-size:5.6vw" data-anim>ExtensionAPI</h2>
+      <p class="lead" style="margin-top:3vh" data-anim>扩展直接运行在同一 TypeScript 进程里，获得编译期类型与完整产品上下文。</p>
+      <div class="meta-row" style="margin-top:4vh" data-anim><span>33 TYPED ON(...) OVERLOADS</span><span>·</span><span>SOURCE 7846534</span></div>
+    </div>
+    <div>
+      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerTool</div><div class="v">增加模型可调用能力</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerCommand</div><div class="v">增加斜杠命令</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerShortcut</div><div class="v">增加交互入口</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerFlag</div><div class="v">扩展 CLI 配置面</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>收益：强类型、低协议成本 · 代价：进程内耦合</div><div>core/extensions/types.ts</div></div>
+  <aside hidden><p>Pi 不内置 MCP，而是把扩展性集中到 ExtensionAPI。扩展可以注册工具、命令、快捷键和 flag，并订阅三十三个强类型 on 入口。</p><p>收益是类型安全和低协议成本；代价是扩展与产品运行在同一进程，跨语言和跨进程生态需要额外桥接。它是取舍，不是单方面胜利。</p></aside>
+</section>
+
+<section class="slide dark" data-animate="directional">
+  <div class="chrome"><div>Security · Trust Boundary</div><div>16 / 18</div></div>
+  <div class="frame" style="padding-top:5vh">
+    <div class="kicker" data-anim>最刺眼的差异</div>
+    <h2 class="h-xl" style="font-size:5.2vw;margin-bottom:4vh" data-anim>逐工具审批 vs 环境隔离</h2>
+    <div class="grid-2-6-6" style="gap:4vw">
+      <div data-anim="left" style="padding:2.5vh 2vw;border-left:3px solid currentColor;opacity:.58">
+        <div class="kicker">In-process Permission</div><h3 class="h-md">每个动作前判断</h3>
+        <p class="body-zh" style="margin-top:3vh">细粒度审批、权限模式、工具级规则。适合直接运行在用户主机且必须限制动作的场景。</p>
+      </div>
+      <div data-anim="right" style="padding:2.5vh 2vw;border-left:3px solid currentColor">
+        <div class="kicker">Pi's Bet</div><h3 class="h-md">先把环境变安全</h3>
+        <p class="body-zh" style="margin-top:3vh">项目级信任只管资源加载；执行隔离依赖容器、VM 或沙箱。默认进程拥有启动用户的权限。</p>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:5vh" data-anim><div class="q-big">不能控制执行环境时，逐动作审批仍然可能是必要的。</div><div class="callout-src">APPLICABILITY BOUNDARY</div></div>
+  </div>
+  <div class="foot"><div>最小化安全模型有明确前提</div><div>coding-agent/docs/security.md</div></div>
+  <aside hidden><p>Pi 没有内置逐工具权限系统。项目级信任只决定是否加载项目本地设置、资源与扩展，它不是沙箱；面对不受信任务，源码文档建议把整个进程放进容器、VM、微虚拟机或策略沙箱。</p><p>这把权限系统从核心拿掉；但如果 Agent 裸跑在用户主机上，它就拥有启动用户的权限。无法控制执行环境时，不应机械照搬这条路线。</p></aside>
+</section>
+
+<section class="slide hero light" data-animate="quote">
+  <div class="chrome"><div>Takeaway · Architecture</div><div>17 / 18</div></div>
+  <div class="frame" style="display:grid;gap:4vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>读完源码，留下三句话</div>
+    <blockquote style="font-family:var(--serif-zh);font-weight:700;font-size:4.5vw;line-height:1.24;max-width:80vw">
+      <span data-anim="line" style="display:block">边界比功能表重要。</span>
+      <span data-anim="line" style="display:block">事件流比 UI 形态稳定。</span>
+      <span data-anim="line" style="display:block">复杂性只会移动，不会消失。</span>
+    </blockquote>
+    <div class="meta-row" data-anim><span>MECHANISM</span><span>·</span><span>CONTRACT</span><span>·</span><span>TRADE-OFF</span></div>
+  </div>
+  <div class="foot"><div>可迁移的架构判断</div><div>TAKEAWAY</div></div>
+  <aside hidden><p>第一，先看边界与依赖方向，再看功能数量。第二，稳定的事件契约能让 TUI、脚本和 RPC 共用一套 Agent 逻辑。</p><p>第三，任何“最小化”都必须回答复杂性去了哪里。外推是有效设计，但外围责任必须有人真正承担。</p></aside>
+</section>
+
+<section class="slide hero dark">
+  <div class="chrome"><div>Closing · Discussion</div><div>18 / 18</div></div>
+  <div class="frame" style="display:grid;gap:6vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>The Question</div>
+    <h1 class="h-hero" style="font-size:7vw;line-height:1.12"><span data-anim style="display:block">你的系统里，</span><span data-anim style="display:block">复杂性应该</span><span data-anim style="display:block">住在哪里？</span></h1>
+    <p class="lead" style="max-width:56vw" data-anim>不是删掉它，而是让它待在最容易理解、替换和验证的位置。</p>
+    <div class="meta-row" data-anim><span>Q &amp; A</span><span>·</span><span>CC BY 4.0 SOURCE NOTES</span></div>
+  </div>
+  <div class="foot"><div>谢谢 · 源码与书稿均在本地仓库</div><div>END</div></div>
+  <aside hidden><p>最后把问题留给自己的项目：哪些复杂性必须进入核心，哪些应该是可选策略，哪些必须由部署环境承担？</p><p>判断标准不是“代码更少”，而是边界是否清晰、责任是否有人承担、失败是否能被验证。谢谢。</p></aside>
+</section>
+
+</div>
+
+<div id="nav"></div>
+
+<script>
+/* =============== WebGL 双背景 ===============
+   深色页：Holographic Dispersion（全息色散 · 钛金暗流）—— 彩虹微扰、鼠标径向涟漪
+   浅色页：Spiral Vortex（旋转涡流 · 银色珍珠）—— domain-warp 流动、无中心
+   修改风格请参考 references/webgl-backgrounds.md
+*/
+const VS = `attribute vec2 position;void main(){gl_Position=vec4(position,0.0,1.0);}`;
+
+const FS_DARK = `precision highp float;
+uniform vec2 u_resolution;uniform float u_time;uniform vec2 u_mouse;
+vec3 palette(float t,vec3 a,vec3 b,vec3 c,vec3 d){return a+b*cos(6.28318*(c*t+d));}
+void main(){
+  vec2 uv=gl_FragCoord.xy/u_resolution.xy;
+  vec2 p=uv*2.0-1.0;p.x*=u_resolution.x/u_resolution.y;
+  vec2 m=u_mouse*2.0-1.0;m.x*=u_resolution.x/u_resolution.y;
+  float md=length(p-m);
+  float mr=sin(md*15.0-u_time*4.0)*exp(-md*3.0);p+=mr*0.08;
+  vec2 p0=p;
+  for(float i=1.0;i<4.0;i++){
+    p.x+=0.1/i*sin(i*3.0*p.y+u_time*0.4)+0.05;
+    p.y+=0.1/i*cos(i*2.0*p.x+u_time*0.3)-0.05;
+  }
+  float r=length(p);float ang=atan(p.y,p.x);
+  vec3 a=vec3(0.12,0.12,0.13);
+  vec3 b=vec3(0.03,0.04,0.05);
+  vec3 c=vec3(1.0,1.0,1.0);
+  vec3 d=vec3(0.1,0.2,0.4);
+  vec3 col=palette(r*1.5+p0.x*0.5+u_time*0.1,a,b,c,d);
+  float disp=sin(r*25.0-u_time*1.5+ang*2.0)*0.5+0.5;
+  col+=vec3(disp*0.015,disp*0.01,disp*0.02);
+  float hi=pow(sin(p.x*4.0+p.y*3.0+u_time)*0.5+0.5,8.0);
+  col+=hi*0.08;
+  vec3 base=vec3(0.05,0.05,0.06);
+  col=mix(base,col,0.85);
+  gl_FragColor=vec4(col,1.0);
+}`;
+
+const FS_LIGHT = `precision highp float;
+uniform vec2 u_resolution;uniform float u_time;uniform vec2 u_mouse;
+float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float noise(vec2 p){
+  vec2 i=floor(p),f=fract(p);
+  float a=hash(i),b=hash(i+vec2(1,0));
+  float c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  vec2 u=f*f*(3.0-2.0*f);
+  return mix(a,b,u.x)+(c-a)*u.y*(1.0-u.x)+(d-b)*u.x*u.y;
+}
+float fbm(vec2 p){
+  float v=0.0,a=0.5;
+  mat2 m=mat2(0.80,0.60,-0.60,0.80);
+  for(int i=0;i<5;i++){v+=a*noise(p);p=m*p*2.02;a*=0.5;}
+  return v;
+}
+void main(){
+  vec2 uv=gl_FragCoord.xy/u_resolution.xy;
+  vec2 p=uv;p.x*=u_resolution.x/u_resolution.y;
+  vec2 m=u_mouse;m.x*=u_resolution.x/u_resolution.y;
+  vec2 md=p-m;float dl=length(md);
+  p+=normalize(md+vec2(0.0001))*exp(-dl*5.0)*0.03;
+  vec2 q=vec2(fbm(p*1.8+u_time*0.07),fbm(p*1.8+vec2(5.2,1.3)+u_time*0.06));
+  vec2 r=vec2(fbm(p*2.0+q*1.3+vec2(1.7,9.2)+u_time*0.05),
+              fbm(p*2.0+q*1.3+vec2(8.3,2.8)+u_time*0.04));
+  float f=fbm(p*2.2+r*1.5);
+  vec3 silverDark=vec3(0.86,0.85,0.84);
+  vec3 paper=vec3(0.955,0.945,0.925);
+  vec3 col=mix(silverDark,paper,f);
+  float ph=r.x*2.2+u_time*0.35;
+  col+=vec3(0.78,0.62,0.92)*sin(ph)*0.055;
+  col+=vec3(0.55,0.72,0.95)*sin(ph*0.8+2.0)*0.05;
+  float hl=smoothstep(0.48,0.92,f);
+  col+=hl*0.06;
+  gl_FragColor=vec4(col,1.0);
+}`;
+
+const mouse={x:0.5,y:0.5};
+addEventListener('mousemove',e=>{mouse.x=e.clientX/innerWidth;mouse.y=e.clientY/innerHeight});
+
+function bootGL(canvasId, fsSrc){
+  const canvas=document.getElementById(canvasId);
+  const gl=canvas.getContext('webgl',{alpha:false,antialias:true});
+  if(!gl) return ()=>false;
+  const mk=(t,s)=>{const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);return sh};
+  const prog=gl.createProgram();
+  gl.attachShader(prog,mk(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,mk(gl.FRAGMENT_SHADER,fsSrc));
+  gl.linkProgram(prog);gl.useProgram(prog);
+  const buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);
+  const pos=gl.getAttribLocation(prog,'position');
+  gl.enableVertexAttribArray(pos);gl.vertexAttribPointer(pos,2,gl.FLOAT,false,0,0);
+  const lRes=gl.getUniformLocation(prog,'u_resolution');
+  const lT=gl.getUniformLocation(prog,'u_time');
+  const lM=gl.getUniformLocation(prog,'u_mouse');
+  const resize=()=>{
+    const d=Math.min(window.devicePixelRatio||1,2);
+    canvas.width=innerWidth*d;canvas.height=innerHeight*d;
+    gl.viewport(0,0,canvas.width,canvas.height);
+  };
+  addEventListener('resize',resize);resize();
+  return (tSec)=>{
+    gl.uniform2f(lRes,canvas.width,canvas.height);
+    gl.uniform1f(lT,tSec);
+    gl.uniform2f(lM,mouse.x,1-mouse.y);
+    gl.drawArrays(gl.TRIANGLES,0,6);
+    return true;
+  };
+}
+const drawDark=bootGL('bg-dark',FS_DARK);
+const drawLight=bootGL('bg-light',FS_LIGHT);
+const t0=Date.now();
+(function loop(){
+  const t=(Date.now()-t0)/1000;
+  drawDark(t);drawLight(t);
+  requestAnimationFrame(loop);
+})();
+
+// =============== 导航（翻页 / 圆点 / 键盘 / 滚轮 / 触屏） ===============
+const deck=document.getElementById('deck');
+const slides=deck.querySelectorAll('.slide');
+const nav=document.getElementById('nav');
+let idx=0,total=slides.length,lock=false;
+
+// 关键：矫正 deck 宽度为 total * 100vw，否则翻页会错位
+deck.style.width=(total*100)+'vw';
+
+slides.forEach((s,i)=>{
+  const b=document.createElement('button');
+  b.className='dot';b.dataset.i=i;b.setAttribute('aria-label','Page '+(i+1));
+  b.onclick=()=>go(i);
+  nav.appendChild(b);
+});
+
+function go(n){
+  if(lock)return;
+  idx=Math.max(0,Math.min(total-1,n));
+  deck.style.transform=`translateX(${-idx*100}vw)`;
+  nav.querySelectorAll('.dot').forEach((d,i)=>d.classList.toggle('active',i===idx));
+  /* 主题切换：优先读 data-theme，其次从 class（light/dark）推断 */
+  const el=slides[idx];
+  const th=el.dataset.theme || (el.classList.contains('light')?'light':(el.classList.contains('dark')?'dark':'dark'));
+  document.body.classList.toggle('light-bg',th==='light');
+  if(window.__updateNotes) window.__updateNotes();
+  /* 动效：翻页过渡中段触发当前页的入场动画（由 motion-boot 注册） */
+  if(window.__playSlide) setTimeout(()=>window.__playSlide(idx), 450);
+  lock=true;setTimeout(()=>lock=false,700);
+}
+
+/* =============== ESC 索引视图 =============== */
+let overviewOn=false;
+const ov=document.createElement('div');
+ov.id='overview';
+ov.style.cssText='position:fixed;inset:0;z-index:100;background:rgba(var(--ink-rgb),.92);backdrop-filter:blur(12px);display:none;overflow-y:auto;padding:4vh 4vw';
+document.body.appendChild(ov);
+
+function buildOverview(){
+  ov.innerHTML='';
+  const grid=document.createElement('div');
+  grid.style.cssText='display:grid;grid-template-columns:repeat(4,1fr);gap:2vh 1.6vw;max-width:90vw;margin:0 auto';
+  slides.forEach((s,i)=>{
+    const card=document.createElement('div');
+    card.style.cssText='cursor:pointer;border-radius:6px;overflow:hidden;border:2px solid '+(i===idx?'rgba(var(--paper-rgb),.8)':'rgba(var(--paper-rgb),.15)')+';transition:border-color .2s';
+    card.onmouseenter=()=>card.style.borderColor='rgba(var(--paper-rgb),.6)';
+    card.onmouseleave=()=>card.style.borderColor=i===idx?'rgba(var(--paper-rgb),.8)':'rgba(var(--paper-rgb),.15)';
+    const wrap=document.createElement('div');
+    wrap.style.cssText='width:100%;aspect-ratio:16/9;overflow:hidden;position:relative;pointer-events:none;background:'+(s.classList.contains('light')?'var(--paper)':'var(--ink)');
+    const clone=s.cloneNode(true);
+    clone.style.cssText='width:100vw;height:100vh;transform:scale('+(1/4.5)+');transform-origin:top left;position:absolute;top:0;left:0;pointer-events:none';
+    clone.querySelectorAll('[data-anim]').forEach(el=>{
+      el.style.opacity='1';
+      el.style.transform='none';
+    });
+    wrap.appendChild(clone);
+    const label=document.createElement('div');
+    label.style.cssText='padding:6px 10px;font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--paper);opacity:.7';
+    label.textContent=(i+1)+' / '+total;
+    card.appendChild(wrap);
+    card.appendChild(label);
+    card.onclick=()=>{toggleOverview();go(i)};
+    grid.appendChild(card);
+  });
+  ov.appendChild(grid);
+}
+
+function toggleOverview(){
+  overviewOn=!overviewOn;
+  if(overviewOn){buildOverview();ov.style.display='block';}
+  else{ov.style.display='none';}
+}
+
+addEventListener('keydown',e=>{
+  if(e.key.toLowerCase()==='n'){e.preventDefault();toggleNotes();return;}
+  if(e.key==='Escape'){e.preventDefault();toggleOverview();return;}
+  if(overviewOn)return;
+  if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' '||e.key==='ArrowDown'){
+    if(window.__pipeAdvance && window.__pipeAdvance()) return;
+    go(idx+1);
+    return;
+  }
+  if(e.key==='ArrowLeft'||e.key==='PageUp'||e.key==='ArrowUp')go(idx-1);
+  if(e.key==='Home')go(0);
+  if(e.key==='End')go(total-1);
+});
+
+let wheelTO=null,wheelAcc=0;
+addEventListener('wheel',e=>{
+  wheelAcc+=e.deltaY+e.deltaX;
+  if(Math.abs(wheelAcc)>50){
+    if(wheelAcc>0 && window.__pipeAdvance && window.__pipeAdvance()){
+      wheelAcc=0;
+    }else{
+      go(idx+(wheelAcc>0?1:-1));wheelAcc=0;
+    }
+  }
+  clearTimeout(wheelTO);wheelTO=setTimeout(()=>wheelAcc=0,150);
+},{passive:true});
+
+let tx=0,ty=0;
+addEventListener('touchstart',e=>{tx=e.touches[0].clientX;ty=e.touches[0].clientY},{passive:true});
+addEventListener('touchend',e=>{
+  const dx=(e.changedTouches[0].clientX-tx);
+  const dy=(e.changedTouches[0].clientY-ty);
+  if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)){
+    if(dx<0 && window.__pipeAdvance && window.__pipeAdvance()) return;
+    go(idx+(dx<0?1:-1));
+  }
+},{passive:true});
+
+/* =============== 演讲者备注（N 键开关） =============== */
+const notesPanel=document.createElement('div');
+notesPanel.id='speaker-notes';
+notesPanel.style.cssText='position:fixed;right:2vw;bottom:7vh;z-index:80;width:min(44vw,720px);max-height:42vh;overflow:auto;padding:2.4vh 2vw;border:1px solid rgba(255,255,255,.22);border-radius:6px;background:rgba(7,18,35,.94);color:#f1f3f5;backdrop-filter:blur(14px);font-family:var(--sans-zh);font-size:max(14px,1.05vw);line-height:1.75;display:none';
+document.body.appendChild(notesPanel);
+let notesOn=false;
+function updateNotes(){
+  const source=slides[idx]?.querySelector('aside[hidden]');
+  notesPanel.innerHTML=source?'<div style="font-family:var(--mono);font-size:10px;letter-spacing:.2em;opacity:.58;margin-bottom:1.4vh">SPEAKER NOTES · '+String(idx+1).padStart(2,'0')+' / '+total+'</div>'+source.innerHTML:'';
+}
+function toggleNotes(){notesOn=!notesOn;notesPanel.style.display=notesOn?'block':'none';updateNotes();}
+window.__updateNotes=()=>{if(notesOn)updateNotes();};
+
+go(0);
+</script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script>lucide.createIcons();</script>
+
+<!-- ============ Motion One 动效引擎（本地优先,CDN 兜底） ============
+     加载策略:先 ./assets/motion.min.js(本地,离线可用),失败 fallback 到 jsDelivr CDN
+     加载完成后挂 window.__playSlide / window.__pipeAdvance,
+     导航脚本会在翻页中段调用 __playSlide(idx),键盘/滚轮/触屏会在翻页前调用 __pipeAdvance()
+     双双失败时会兜底把所有 [data-anim] 设为可见,不让动效破坏阅读
+-->
+<script type="module">
+let motion;
+try {
+  motion = await import('./assets/motion.min.js');
+} catch(e1) {
+  try {
+    motion = await import('https://cdn.jsdelivr.net/npm/motion@11.11.17/+esm');
+  } catch(e2) {
+    console.warn('[motion] local + CDN both failed, disabling animations', e1, e2);
+    document.querySelectorAll('[data-anim]').forEach(el=>{el.style.opacity='1';el.style.transform='none'});
+    document.querySelectorAll('[data-animate="pipeline"] [data-anim]').forEach(el=>el.style.opacity='1');
+  }
+}
+
+if(motion){
+  const { animate, stagger } = motion;
+  const EASE = [.22, 1, .36, 1];
+  const slides = [...document.querySelectorAll('.slide')];
+  let pipeStep = -1;
+  let lastIdx = -1;
+
+  function resetAnims(slide){
+    slide.querySelectorAll('[data-anim]').forEach(el=>{
+      el.style.opacity='';
+      el.style.transform='';
+    });
+  }
+
+  function playSlide(i){
+    const slide = slides[i];
+    if(!slide) return;
+    lastIdx = i;
+    const recipe = slide.dataset.animate || (slide.classList.contains('hero') ? 'hero' : 'cascade');
+
+    if(recipe === 'pipeline'){
+      pipeStep = -1;
+      slide.querySelectorAll('[data-anim]').forEach(el=>{
+        el.style.opacity='0.15';
+        el.style.transform='none';
+      });
+      return;
+    }
+
+    resetAnims(slide);
+    const all = [...slide.querySelectorAll('[data-anim]')];
+    if(!all.length) return;
+
+    if(recipe === 'directional'){
+      const lefts  = all.filter(el=>el.dataset.anim==='left');
+      const divs   = all.filter(el=>el.dataset.anim==='divider');
+      const rights = all.filter(el=>el.dataset.anim==='right');
+      const others = all.filter(el=>!['left','right','divider'].includes(el.dataset.anim));
+      if(others.length) animate(others, {opacity:[0,1], y:[12,0]}, {duration:.6, delay:stagger(.1, {start:.15}), easing:EASE});
+      if(lefts.length)  animate(lefts,  {opacity:[0,1], x:[-24,0]}, {duration:.8, delay:.35, easing:EASE});
+      if(divs.length)   animate(divs,   {opacity:[0,.25]},          {duration:.5, delay:.9});
+      if(rights.length) animate(rights, {opacity:[0,1], x:[24,0]},  {duration:.8, delay:1.0, easing:EASE});
+      return;
+    }
+
+    if(recipe === 'quote'){
+      const lines = all.filter(el=>el.dataset.anim==='line');
+      const others = all.filter(el=>el.dataset.anim!=='line');
+      if(others.length) animate(others, {opacity:[0,1], y:[8,0]},    {duration:.6, delay:stagger(.12, {start:.2}), easing:EASE});
+      if(lines.length)  animate(lines,  {opacity:[.35,1], y:[10,0]}, {duration:.8, delay:stagger(.55, {start:.5}), easing:EASE});
+      return;
+    }
+
+    if(recipe === 'hero'){
+      animate(all, {opacity:[0,1], y:[14,0]}, {duration:.9, delay:stagger(.16, {start:.2}), easing:EASE});
+      return;
+    }
+
+    // default: cascade
+    animate(all, {opacity:[0,1], y:[16,0]}, {duration:.75, delay:stagger(.1, {start:.15}), easing:EASE});
+  }
+
+  function pipeAdvance(){
+    const slide = slides[lastIdx];
+    if(!slide || slide.dataset.animate !== 'pipeline') return false;
+    const steps  = [...slide.querySelectorAll('[data-anim="step"]')];
+    const arrows = [...slide.querySelectorAll('[data-anim="arrow"]')];
+    if(pipeStep >= steps.length - 1) return false;
+    pipeStep++;
+    animate(steps[pipeStep], {opacity:[0.15,1], y:[8,0]}, {duration:.5, easing:EASE});
+    if(pipeStep > 0 && arrows[pipeStep-1]){
+      animate(arrows[pipeStep-1], {opacity:[0.15,.7]}, {duration:.3, delay:.15});
+    }
+    return true;
+  }
+
+  window.__playSlide = playSlide;
+  window.__pipeAdvance = pipeAdvance;
+
+  // 首屏:go(0) 已跑过(同步),没来得及触发动效 → 这里补一下
+  playSlide(0);
+}
+</script>
+</body>
+</html>
