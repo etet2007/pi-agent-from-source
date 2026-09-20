@@ -392,6 +392,26 @@
     opacity:.6;
   }
 
+  /* ---------- source trace（源码跟读页） ---------- */
+  .trace-path{display:flex;align-items:center;gap:.7vw;flex-wrap:wrap;font-family:var(--mono);font-size:max(10px,.72vw);letter-spacing:.06em;margin:1.4vh 0 2.2vh;opacity:.72}
+  .trace-path .node{padding:.55vh .7vw;border:1px solid currentColor;border-color:rgba(127,127,127,.32)}
+  .trace-path .active{font-weight:600;opacity:1;background:rgba(127,127,127,.12)}
+  .trace-path .arrow{opacity:.45}
+  .trace-grid{display:grid;grid-template-columns:7fr 5fr;gap:2.2vw;min-height:0;align-items:stretch}
+  .source-panel,.evidence-panel{min-height:0;border-top:1px solid currentColor;border-color:rgba(127,127,127,.32);padding-top:1.5vh}
+  .panel-label{font-family:var(--mono);font-size:max(10px,.72vw);letter-spacing:.2em;text-transform:uppercase;opacity:.58;margin-bottom:1vh}
+  .source-code{font-family:var(--mono);font-size:max(10px,.76vw);line-height:1.5;white-space:pre-wrap;tab-size:2;padding:1.5vh 1.2vw;background:rgba(127,127,127,.08);overflow:hidden}
+  .source-code .ln{display:inline-block;width:2.8em;opacity:.38;user-select:none}
+  .source-code .focus{display:block;margin:0 -.7vw;padding:0 .7vw;border-left:3px solid currentColor;background:rgba(127,127,127,.13)}
+  .trace-stack{display:flex;flex-direction:column;gap:1.4vh;min-height:0}
+  .trace-card{padding:1.4vh 1.2vw;border-left:2px solid currentColor;background:rgba(127,127,127,.07)}
+  .trace-card .event{font-family:var(--mono);font-size:max(10px,.78vw);line-height:1.55;white-space:pre-wrap}
+  .trace-card .explain{font-family:var(--sans-zh);font-size:max(12px,.94vw);line-height:1.55;opacity:.78;margin-top:.6vh}
+  .state-diff{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:1vw;margin-top:1.5vh;padding-top:1.5vh;border-top:1px dashed rgba(127,127,127,.34);font-family:var(--mono);font-size:max(10px,.78vw);line-height:1.45}
+  .state-diff .before,.state-diff .after{padding:1.1vh 1vw;background:rgba(127,127,127,.07)}
+  .state-diff .after{font-weight:600}
+  .trace-takeaway{margin-top:1.5vh;font-family:var(--serif-zh);font-size:max(14px,1.08vw);line-height:1.5;padding-left:1vw;border-left:3px solid currentColor}
+
   /* ---------- chrome & foot 补位（layouts.md 简单写法） ---------- */
   .chrome{font-family:var(--mono);font-size:max(11px,.78vw);letter-spacing:.2em;text-transform:uppercase;opacity:.62}
   .foot{font-family:var(--mono);font-size:max(11px,.78vw);letter-spacing:.18em;text-transform:uppercase;opacity:.5}
@@ -420,6 +440,8 @@
     .h-xl{font-size:9vw}
     .pipeline{grid-template-columns:repeat(2,1fr)}
     .grid-2-7-5,.grid-2-6-6,.grid-2-8-4{grid-template-columns:1fr}
+    .trace-grid{grid-template-columns:1fr 1fr}
+    .source-code{font-size:10px}
   }
 </style>
 </head>
@@ -438,20 +460,20 @@
      ============================================================ -->
 
 <section class="slide hero dark">
-  <div class="chrome"><div>Pi Agent · Beginner Walkthrough</div><div>01 / 24</div></div>
+  <div class="chrome"><div>Pi Agent · Beginner Walkthrough</div><div>01 / 30</div></div>
   <div class="frame" style="display:grid;gap:3.4vh;align-content:center;min-height:80vh">
     <div class="kicker" data-anim>零基础 · 从一句话追到源码</div>
     <h1 class="h-hero" style="font-size:9.2vw;white-space:nowrap" data-anim>Pi Agent</h1>
     <h2 class="h-sub" data-anim>一句话，怎样变成一串可验证的行动？</h2>
     <p class="lead" style="max-width:68vw" data-anim>我们会跟着一个具体任务，看 Pi 如何询问模型、读取文件、修改内容、运行测试、保存历史，并把每一步显示给用户。</p>
-    <div class="meta-row" data-anim><span>30–35 MIN</span><span>·</span><span>NO AGENT BACKGROUND REQUIRED</span></div>
+    <div class="meta-row" data-anim><span>40–45 MIN</span><span>·</span><span>NO AGENT BACKGROUND REQUIRED</span></div>
   </div>
   <div class="foot"><div>基于源码提交 7846534</div><div>SOURCE-BACKED WALKTHROUGH</div></div>
   <aside hidden><p>这次不假设你知道 Agent、Tool Calling 或事件流。我们只跟着一句普通任务，从用户按下回车开始，一步一步看到它怎样完成。</p><p>重点不是背类名，而是建立一条可以迁移到其他 Agent 的工作链路。</p></aside>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Orientation · Learning Goals</div><div>02 / 24</div></div>
+  <div class="chrome"><div>Orientation · Learning Goals</div><div>02 / 30</div></div>
   <div class="frame" style="padding-top:4vh">
     <div class="kicker" data-anim>先知道终点</div>
     <h2 class="h-xl" style="font-size:5.2vw" data-anim>看完，你能回答四个问题</h2>
@@ -468,7 +490,7 @@
 </section>
 
 <section class="slide dark" data-animate="directional">
-  <div class="chrome"><div>Mental Model · Chat vs Agent</div><div>03 / 24</div></div>
+  <div class="chrome"><div>Mental Model · Chat vs Agent</div><div>03 / 30</div></div>
   <div class="frame" style="padding-top:4vh">
     <div class="kicker" data-anim>先拆掉第一个误解</div>
     <h2 class="h-xl" style="font-size:5.2vw;margin-bottom:3vh" data-anim>Agent 不是“更会聊天”</h2>
@@ -491,7 +513,7 @@
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Running Example · One Task</div><div>04 / 24</div></div>
+  <div class="chrome"><div>Running Example · One Task</div><div>04 / 30</div></div>
   <div class="frame grid-2-7-5" style="padding-top:5vh">
     <div style="display:flex;flex-direction:column;gap:2.5vh">
       <div>
@@ -514,7 +536,7 @@
 </section>
 
 <section class="slide dark" data-animate="pipeline">
-  <div class="chrome"><div>System Map · End to End</div><div>05 / 24</div></div>
+  <div class="chrome"><div>System Map · End to End</div><div>05 / 30</div></div>
   <div class="frame">
     <div class="kicker">先看全景，再逐层放大</div>
     <h2 class="h-xl" style="font-size:5vw">一句话的完整旅程</h2>
@@ -536,7 +558,7 @@
 </section>
 
 <section class="slide hero light">
-  <div class="chrome"><div>Act I · Core Mechanism</div><div>06 / 24</div></div>
+  <div class="chrome"><div>Act I · Core Mechanism</div><div>06 / 30</div></div>
   <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
     <div class="kicker" data-anim>Act I</div>
     <h1 class="h-hero" style="font-size:8.2vw;white-space:nowrap" data-anim>核心循环</h1>
@@ -547,7 +569,7 @@
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Vocabulary · Five Roles</div><div>07 / 24</div></div>
+  <div class="chrome"><div>Vocabulary · Five Roles</div><div>07 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>先把名字和责任对上</div>
     <h2 class="h-xl" style="font-size:4.9vw" data-anim>五个角色，各做一件事</h2>
@@ -564,7 +586,7 @@
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Boundary · StreamFn</div><div>08 / 24</div></div>
+  <div class="chrome"><div>Boundary · StreamFn</div><div>08 / 30</div></div>
   <div class="frame grid-2-7-5" style="padding-top:5vh">
     <div>
       <div class="kicker" data-anim>模型入口只有一条缝</div>
@@ -586,7 +608,7 @@
 </section>
 
 <section class="slide light" data-animate="directional">
-  <div class="chrome"><div>Tool Calling · Proposal vs Execution</div><div>09 / 24</div></div>
+  <div class="chrome"><div>Tool Calling · Proposal vs Execution</div><div>09 / 30</div></div>
   <div class="frame" style="padding-top:4vh">
     <div class="kicker" data-anim>模型不会直接碰文件</div>
     <h2 class="h-xl" style="font-size:4.9vw;margin-bottom:3vh" data-anim>Tool Call 只是行动提议</h2>
@@ -615,7 +637,7 @@
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Events · Observable Lifecycle</div><div>10 / 24</div></div>
+  <div class="chrome"><div>Events · Observable Lifecycle</div><div>10 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>执行过程必须能被看见</div>
     <h2 class="h-xl" style="font-size:4.8vw" data-anim>十种事件，描述完整生命周期</h2>
@@ -632,7 +654,7 @@
 </section>
 
 <section class="slide light" data-animate="pipeline">
-  <div class="chrome"><div>Core · Agent Loop</div><div>11 / 24</div></div>
+  <div class="chrome"><div>Core · Agent Loop</div><div>11 / 30</div></div>
   <div class="frame">
     <div class="kicker">一次 Run 为什么会有很多轮</div>
     <h2 class="h-xl" style="font-size:4.9vw">两层循环，各管一种“继续”</h2>
@@ -659,7 +681,7 @@
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Running Example · Round One</div><div>12 / 24</div></div>
+  <div class="chrome"><div>Running Example · Round One</div><div>12 / 30</div></div>
   <div class="frame grid-2-7-5" style="padding-top:4.5vh">
     <div>
       <div class="kicker" data-anim>第一轮 · 先获得事实</div>
@@ -684,7 +706,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Tool Runtime · Validation and Execution</div><div>13 / 24</div></div>
+  <div class="chrome"><div>Tool Runtime · Validation and Execution</div><div>13 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>工具不是随便调用一个函数</div>
     <h2 class="h-xl" style="font-size:4.8vw" data-anim>一次 Tool Call 要过四道门</h2>
@@ -701,7 +723,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Running Example · Rounds Two and Three</div><div>14 / 24</div></div>
+  <div class="chrome"><div>Running Example · Rounds Two and Three</div><div>14 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>同一个任务，继续循环</div>
     <h2 class="h-xl" style="font-size:4.7vw" data-anim>读完以后，模型才知道怎么改</h2>
@@ -717,7 +739,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Control Flow · Stop and New Input</div><div>15 / 24</div></div>
+  <div class="chrome"><div>Control Flow · Stop and New Input</div><div>15 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>什么时候停，什么时候继续</div>
     <h2 class="h-xl" style="font-size:4.8vw" data-anim>三种“没有结束”</h2>
@@ -733,7 +755,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide hero dark">
-  <div class="chrome"><div>Act II · Product Layer</div><div>16 / 24</div></div>
+  <div class="chrome"><div>Act II · Product Layer</div><div>16 / 30</div></div>
   <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
     <div class="kicker" data-anim>Act II</div>
     <h1 class="h-hero" style="font-size:7.7vw;white-space:nowrap" data-anim>核心之外</h1>
@@ -744,7 +766,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide light" data-animate="pipeline">
-  <div class="chrome"><div>Product · AgentSession</div><div>17 / 24</div></div>
+  <div class="chrome"><div>Product · AgentSession</div><div>17 / 30</div></div>
   <div class="frame">
     <div class="kicker">用户按下回车之后，核心还没开始</div>
     <h2 class="h-xl" style="font-size:4.7vw">prompt() 先把产品问题处理完</h2>
@@ -765,7 +787,7 @@ turn_end</code></pre>
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>State · Session Tree</div><div>18 / 24</div></div>
+  <div class="chrome"><div>State · Session Tree</div><div>18 / 30</div></div>
   <div class="frame grid-2-6-6" style="padding-top:4.5vh;align-items:center">
     <div>
       <div class="kicker" data-anim>一次 Run 结束后，历史还要活着</div>
@@ -790,7 +812,7 @@ moveTo(entryId) → 切换当前位置</code></pre>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Projection · One Session, Many Consumers</div><div>19 / 24</div></div>
+  <div class="chrome"><div>Projection · One Session, Many Consumers</div><div>19 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>执行逻辑只有一份，呈现方式可以很多</div>
     <h2 class="h-xl" style="font-size:4.7vw" data-anim>同一事件流，四种入口</h2>
@@ -806,10 +828,225 @@ moveTo(entryId) → 切换当前位置</code></pre>
   <aside hidden><p>事件流是产品层的稳定契约。同一任务可以在人类界面、流水线或 IDE 中运行，而无需重写执行逻辑。</p></aside>
 </section>
 
+<section class="slide hero dark">
+  <div class="chrome"><div>Act III · Source Trace</div><div>20 / 30</div></div>
+  <div class="frame" style="display:grid;gap:4.5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>这一幕不再只讲概念</div>
+    <h1 class="h-hero" style="font-size:7.2vw;white-space:nowrap" data-anim>沿调用链读源码</h1>
+    <p class="lead" style="max-width:74vw" data-anim>每一页同时看四件事：进入哪个函数、关键代码做了什么、外部能观察到什么、状态怎样变化。</p>
+    <div class="meta-row" data-anim><span>PROMPT</span><span>→</span><span>LOOP</span><span>→</span><span>MODEL / TOOL</span><span>→</span><span>SESSION</span></div>
+  </div>
+  <div class="foot"><div>只追一条真实路径，不从 packages 目录逐文件扫</div><div>CALL CHAIN · EVIDENCE · STATE</div></div>
+  <aside hidden><p>接下来把刚才的架构地图落到真实源码。不要试图一次看懂所有分支，我们只追“修改 README 并运行测试”这一条执行链。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Source Trace · Product to Core</div><div>21 / 30</div></div>
+  <div class="frame" style="padding-top:2.2vh">
+    <div class="kicker" data-anim>第一跳 · 用户输入怎样进入核心</div>
+    <h2 class="h-xl" style="font-size:3.9vw" data-anim>从 prompt 到 runAgentLoop</h2>
+    <div class="trace-path" data-anim><span class="node active">AgentSession.prompt</span><span class="arrow">→</span><span class="node">Agent.prompt</span><span class="arrow">→</span><span class="node">runPromptMessages</span><span class="arrow">→</span><span class="node">runAgentLoop</span></div>
+    <div class="trace-grid">
+      <div class="source-panel" data-anim>
+        <div class="panel-label">SOURCE EXCERPT · … = ELIDED · agent-session.ts + agent.ts</div>
+        <pre class="source-code"><code><span class="ln">1114</span>async prompt(text: string, options?: PromptOptions) {
+<span class="ln">1131</span>  // extensions may intercept or transform input
+<span class="ln">1134</span>  if (this._extensionRunner.hasHandlers("input")) {
+<span class="ln">1135</span>    const inputResult = await this._extensionRunner.emitInput(...);
+<span class="ln">1151</span>  // expand Skills and prompt templates
+<span class="ln">1154</span>  expandedText = this._expandSkillCommand(expandedText);
+
+<span class="ln">339</span>async prompt(input: string | AgentMessage | AgentMessage[]) {
+<span class="focus"><span class="ln">345</span>  const messages = this.normalizePromptInput(input, images);
+<span class="ln">346</span>  await this.runPromptMessages(messages);</span>
+<span class="ln">398</span>private async runPromptMessages(messages: AgentMessage[]) {
+<span class="focus"><span class="ln">403</span>  await runAgentLoop(messages, this.createContextSnapshot(),
+<span class="ln">407</span>    (event) =&gt; this.processEvents(event), signal, ...);</span>
+<span class="ln">411</span>}</code></pre>
+      </div>
+      <div class="evidence-panel trace-stack" data-anim>
+        <div><div class="panel-label">OBSERVABLE TRACE</div><div class="trace-card"><div class="event">input
+  text: "请在 README 增加安装说明…"
+
+agent_start</div><div class="explain">产品层先处理扩展、Skills 与模板；核心 Agent 收到的已经是规范化消息。</div></div></div>
+        <div class="state-diff"><div class="before">string<br>+ images?</div><div>→</div><div class="after">AgentMessage[]<br>+ Context snapshot</div></div>
+        <div class="trace-takeaway">这一跳解决的是“准备输入”，还没有调用模型。</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>下一跳：runAgentLoop 把消息交给两层循环</div><div>agent-session.ts:1114 · agent.ts:339,398</div></div>
+  <aside hidden><p>先区分两个同名 prompt：AgentSession.prompt 处理产品规则，Agent.prompt 把输入规范化并进入核心。真正的循环从 runAgentLoop 开始。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Source Trace · Control Flow</div><div>22 / 30</div></div>
+  <div class="frame" style="padding-top:2.2vh">
+    <div class="kicker" data-anim>第二跳 · 为什么工具执行后还会回来</div>
+    <h2 class="h-xl" style="font-size:3.9vw" data-anim>runLoop 把结果送回下一轮</h2>
+    <div class="trace-path" data-anim><span class="node">runAgentLoop</span><span class="arrow">→</span><span class="node active">runLoop</span><span class="arrow">→</span><span class="node">streamAssistantResponse</span><span class="arrow">↔</span><span class="node">executeToolCalls</span></div>
+    <div class="trace-grid">
+      <div class="source-panel" data-anim>
+        <div class="panel-label">SOURCE EXCERPT · … = ELIDED · agent-loop.ts:169–224</div>
+        <pre class="source-code"><code><span class="ln">169</span>// Outer loop: queued follow-up messages
+<span class="focus"><span class="ln">170</span>while (true) {
+<span class="ln">171</span>  let hasMoreToolCalls = true;</span>
+
+<span class="ln">173</span>  // Inner loop: tools and steering messages
+<span class="focus"><span class="ln">174</span>  while (hasMoreToolCalls || pendingMessages.length &gt; 0) {</span>
+<span class="ln">176</span>    await emit({ type: "turn_start" });
+<span class="ln">193</span>    const message = await streamAssistantResponse(...);
+<span class="ln">203</span>    const toolCalls = message.content.filter(
+<span class="ln">204</span>      (c) =&gt; c.type === "toolCall");
+<span class="focus"><span class="ln">214</span>    const batch = await executeToolCalls(...);
+<span class="ln">218</span>    for (const result of batch.messages) {
+<span class="ln">219</span>      currentContext.messages.push(result);
+<span class="ln">224</span>    await emit({ type: "turn_end", message, toolResults });</span>
+<span class="ln">274</span>await emit({ type: "agent_end", messages: newMessages });</code></pre>
+      </div>
+      <div class="evidence-panel trace-stack" data-anim>
+        <div><div class="panel-label">OBSERVABLE TRACE</div><div class="trace-card"><div class="event">turn_start
+message_end  toolCall=read
+tool_execution_start  read
+tool_execution_end
+turn_end
+turn_start  ← 再问模型</div><div class="explain">只要模型仍然提出 Tool Call，内层循环就不会结束。</div></div></div>
+        <div class="state-diff"><div class="before">Context<br>用户任务</div><div>→</div><div class="after">Context<br>+ Tool Result</div></div>
+        <div class="trace-takeaway">循环不是重复原问题，而是在更新后的 Context 上继续推理。</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>下一跳：streamAssistantResponse 把模型流转换成 AgentEvent</div><div>agent-loop.ts:155–275</div></div>
+  <aside hidden><p>把注意力放在三行：调用模型、提取 Tool Call、把 Tool Result 写回 Context。其他分支都可以先折叠。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Source Trace · Model Stream</div><div>23 / 30</div></div>
+  <div class="frame" style="padding-top:2.2vh">
+    <div class="kicker" data-anim>第三跳 · 模型输出怎样被界面看见</div>
+    <h2 class="h-xl" style="font-size:3.9vw" data-anim>一个流，被翻译成三类消息事件</h2>
+    <div class="trace-path" data-anim><span class="node">runLoop</span><span class="arrow">→</span><span class="node active">streamAssistantResponse</span><span class="arrow">→</span><span class="node">message_start</span><span class="node">message_update</span><span class="node">message_end</span></div>
+    <div class="trace-grid">
+      <div class="source-panel" data-anim>
+        <div class="panel-label">SOURCE EXCERPT · … = ELIDED · agent-loop.ts:294–358</div>
+        <pre class="source-code"><code><span class="ln">294</span>// AgentMessage[] → provider-compatible Message[]
+<span class="ln">295</span>const llmMessages = await config.convertToLlm(messages);
+<span class="focus"><span class="ln">308</span>const response = await streamFunction(config.model, llmContext, {
+<span class="ln">311</span>  signal,
+<span class="ln">312</span>});</span>
+
+<span class="ln">317</span>for await (const event of response) {
+<span class="ln">319</span>  case "start":
+<span class="ln">323</span>    await emit({ type: "message_start", ... });
+<span class="ln">326</span>  case "text_delta":
+<span class="focus"><span class="ln">336</span>    partialMessage = event.partial;
+<span class="ln">338</span>    await emit({ type: "message_update", ... });</span>
+<span class="ln">346</span>  case "done":
+<span class="focus"><span class="ln">357</span>    await emit({ type: "message_end", message: finalMessage });
+<span class="ln">358</span>    return finalMessage;</span>
+<span class="ln">360</span>}</code></pre>
+      </div>
+      <div class="evidence-panel trace-stack" data-anim>
+        <div><div class="panel-label">OBSERVABLE TRACE</div><div class="trace-card"><div class="event">message_start  content=[]
+message_update content=["我先读取…"]
+message_update content=[toolCall: read]
+message_end    stopReason=toolUse</div><div class="explain">TUI 的逐字显示来自 message_update；工具请求也在同一个 assistant message 中逐步形成。</div></div></div>
+        <div class="state-diff"><div class="before">provider stream<br>start / delta / done</div><div>→</div><div class="after">AssistantMessage<br>持续替换 partial</div></div>
+        <div class="trace-takeaway">界面看见的是 AgentEvent，不需要理解各模型厂商的流协议。</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>下一跳：message_end 中出现 Tool Call，runLoop 转向工具执行</div><div>agent-loop.ts:281–365</div></div>
+  <aside hidden><p>这里是模型适配层和 Agent 事件层的交界。模型厂商的 delta 被统一成 Pi 自己的 message_update。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Source Trace · Tool Runtime</div><div>24 / 30</div></div>
+  <div class="frame" style="padding-top:2.2vh">
+    <div class="kicker" data-anim>第四跳 · Tool Call 怎样变成真实副作用</div>
+    <h2 class="h-xl" style="font-size:3.9vw" data-anim>先选择执行策略，再逐个完成工具</h2>
+    <div class="trace-path" data-anim><span class="node">runLoop</span><span class="arrow">→</span><span class="node active">executeToolCalls</span><span class="arrow">→</span><span class="node">prepare</span><span class="arrow">→</span><span class="node">execute</span><span class="arrow">→</span><span class="node">finalize</span></div>
+    <div class="trace-grid">
+      <div class="source-panel" data-anim>
+        <div class="panel-label">SOURCE EXCERPT · … = ELIDED · agent-loop.ts:411–474</div>
+        <pre class="source-code"><code><span class="ln">418</span>const toolCalls = assistantMessage.content.filter(
+<span class="ln">419</span>  (c) =&gt; c.type === "toolCall");
+<span class="ln">422</span>if (config.toolExecution === "sequential" || hasSequential) {
+<span class="ln">423</span>  return executeToolCallsSequential(...);
+<span class="ln">425</span>return executeToolCallsParallel(...);
+
+<span class="ln">444</span>for (const toolCall of toolCalls) {
+<span class="focus"><span class="ln">445</span>  await emit({ type: "tool_execution_start",
+<span class="ln">448</span>    toolName: toolCall.name, args: toolCall.arguments });</span>
+<span class="ln">452</span>  const preparation = await prepareToolCall(...);
+<span class="ln">461</span>  const executed = await executePreparedToolCall(...);
+<span class="ln">462</span>  finalized = await finalizeExecutedToolCall(...);
+<span class="focus"><span class="ln">472</span>  await emitToolExecutionEnd(finalized, emit);
+<span class="ln">473</span>  const toolResultMessage = createToolResultMessage(finalized);</span>
+<span class="ln">476</span>  messages.push(toolResultMessage);
+<span class="ln">481</span>}</code></pre>
+      </div>
+      <div class="evidence-panel trace-stack" data-anim>
+        <div><div class="panel-label">OBSERVABLE TRACE</div><div class="trace-card"><div class="event">tool_execution_start
+  toolName: "read"
+  args: { path: "README.md" }
+
+tool_execution_end
+  isError: false
+  result: "# Pi Agent…"</div><div class="explain">模型只提供名字和参数；程序负责找工具、校验、执行并形成 Tool Result。</div></div></div>
+        <div class="state-diff"><div class="before">AssistantMessage<br>Tool Call</div><div>→</div><div class="after">ToolResultMessage<br>content + isError</div></div>
+        <div class="trace-takeaway">真实副作用发生在 Tool.execute，不发生在模型内部。</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>下一跳：Tool Result 写回 Context，触发下一轮模型判断</div><div>agent-loop.ts:411–485</div></div>
+  <aside hidden><p>这一页把“模型会调用工具”拆成真实步骤。注意工具可以串行或并行，但最终都会变成同一种 ToolResultMessage。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Source Trace · Persistence</div><div>25 / 30</div></div>
+  <div class="frame" style="padding-top:2.2vh">
+    <div class="kicker" data-anim>第五跳 · 内存中的消息怎样成为可恢复历史</div>
+    <h2 class="h-xl" style="font-size:3.9vw" data-anim>AgentSession 订阅事件并持久化</h2>
+    <div class="trace-path" data-anim><span class="node">AgentEvent</span><span class="arrow">→</span><span class="node active">_handleAgentEvent</span><span class="arrow">→</span><span class="node">message_end</span><span class="arrow">→</span><span class="node">SessionManager.appendMessage</span></div>
+    <div class="trace-grid">
+      <div class="source-panel" data-anim>
+        <div class="panel-label">SOURCE EXCERPT · … = ELIDED · agent-session.ts:391–393, 618–641</div>
+        <pre class="source-code"><code><span class="ln">391</span>// Subscribe for persistence, extensions, compaction, retry
+<span class="focus"><span class="ln">393</span>this._unsubscribeAgent =
+<span class="ln">393</span>  this.agent.subscribe(this._handleAgentEvent);</span>
+
+<span class="ln">618</span>// Emit to extensions first
+<span class="ln">619</span>await this._emitExtensionEvent(event);
+<span class="ln">621</span>// Notify all listeners
+<span class="ln">622</span>this._emit(event.type === "agent_end" ? ... : event);
+
+<span class="focus"><span class="ln">625</span>if (event.type === "message_end") {</span>
+<span class="ln">635</span>  if (event.message.role === "user" ||
+<span class="ln">637</span>      event.message.role === "assistant" ||
+<span class="ln">638</span>      event.message.role === "toolResult") {
+<span class="focus"><span class="ln">641</span>    this.sessionManager.appendMessage(event.message);</span>
+<span class="ln">642</span>  }
+<span class="ln">643</span>}</code></pre>
+      </div>
+      <div class="evidence-panel trace-stack" data-anim>
+        <div><div class="panel-label">OBSERVABLE TRACE</div><div class="trace-card"><div class="event">message_end  role=user
+message_end  role=assistant
+message_end  role=toolResult
+                 │
+                 └─ appendMessage()</div><div class="explain">同一个事件先给扩展和 UI，再由 AgentSession 根据角色决定是否写入 Session。</div></div></div>
+        <div class="state-diff"><div class="before">Agent memory<br>当前 Run 的消息</div><div>→</div><div class="after">Session tree<br>可恢复、分支、压缩</div></div>
+        <div class="trace-takeaway">核心循环只维护当前 Context；产品层负责把过程变成长期历史。</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>调用链闭环：输入 → 模型 → 工具 → 结果 → 历史</div><div>agent-session.ts:393,625–641</div></div>
+  <aside hidden><p>这一步解释了 Agent 与 Session 为什么必须分层：Agent 负责实时运行，AgentSession 监听结果并交给 SessionManager 持久化。</p></aside>
+</section>
+
 <section class="slide hero light">
-  <div class="chrome"><div>Act III · Extension and Safety</div><div>20 / 24</div></div>
+  <div class="chrome"><div>Act IV · Extension and Safety</div><div>26 / 30</div></div>
   <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>Act III</div>
+    <div class="kicker" data-anim>Act IV</div>
     <h1 class="h-hero" style="font-size:7.8vw;white-space:nowrap" data-anim>边界取舍</h1>
     <p class="lead" style="max-width:68vw" data-anim>Pi 把核心做小，也把更多选择留给扩展作者和运行环境。理解收益时，必须同时理解代价。</p>
   </div>
@@ -818,7 +1055,7 @@ moveTo(entryId) → 切换当前位置</code></pre>
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Extension · Typed Surface</div><div>21 / 24</div></div>
+  <div class="chrome"><div>Extension · Typed Surface</div><div>27 / 30</div></div>
   <div class="frame grid-2-7-5" style="padding-top:4.5vh">
     <div>
       <div class="kicker" data-anim>没有内置 MCP，不等于不能扩展</div>
@@ -839,7 +1076,7 @@ moveTo(entryId) → 切换当前位置</code></pre>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Security · Three Different Questions</div><div>22 / 24</div></div>
+  <div class="chrome"><div>Security · Three Different Questions</div><div>28 / 30</div></div>
   <div class="frame" style="padding-top:3.5vh">
     <div class="kicker" data-anim>不要把“信任”误解成“沙箱”</div>
     <h2 class="h-xl" style="font-size:4.8vw" data-anim>三层安全边界</h2>
@@ -855,7 +1092,7 @@ moveTo(entryId) → 切换当前位置</code></pre>
 </section>
 
 <section class="slide dark">
-  <div class="chrome"><div>Reading Guide · Five Source Anchors</div><div>23 / 24</div></div>
+  <div class="chrome"><div>Reading Guide · Five Source Anchors</div><div>29 / 30</div></div>
   <div class="frame" style="padding-top:3vh">
     <div class="kicker" data-anim>现在再打开源码，就不会迷路</div>
     <h2 class="h-xl" style="font-size:4.6vw" data-anim>按执行顺序读五个入口</h2>
@@ -872,7 +1109,7 @@ moveTo(entryId) → 切换当前位置</code></pre>
 </section>
 
 <section class="slide hero dark" data-animate="quote">
-  <div class="chrome"><div>Closing · The Whole Journey</div><div>24 / 24</div></div>
+  <div class="chrome"><div>Closing · The Whole Journey</div><div>30 / 30</div></div>
   <div class="frame" style="display:grid;gap:3.6vh;align-content:center;min-height:80vh">
     <div class="kicker" data-anim>最后，把贯穿任务再走一遍</div>
     <blockquote style="font-family:var(--serif-zh);font-weight:700;font-size:4.3vw;line-height:1.24;max-width:86vw">
@@ -1135,7 +1372,7 @@ window.__updateNotes=()=>{if(notesOn)updateNotes();};
 go(0);
 </script>
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-<script>lucide.createIcons();</script>
+<script>if(window.lucide) window.lucide.createIcons();</script>
 
 <!-- ============ Motion One 动效引擎（本地优先,CDN 兜底） ============
      加载策略:先 ./assets/motion.min.js(本地,离线可用),失败 fallback 到 jsDelivr CDN
