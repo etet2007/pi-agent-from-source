@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pi Agent 源码解析 · 把复杂性挡在核心之外</title>
+<title>Pi Agent 如何工作 · 零基础源码导览</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,700&amp;family=Source+Serif+4:ital,opsz,wght@0,8..60,300;0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&amp;family=IBM+Plex+Mono:wght@300;400;500;600&amp;family=Noto+Serif+SC:wght@300;400;500;600;700;900&amp;family=Noto+Sans+SC:wght@300;400;500;700;900&amp;display=swap" rel="stylesheet">
 <style>
   :root{
-    /* ============ 主题色(默认:🖋 墨水经典) ============
+    /* ============ 主题色:靛蓝瓷 ============
        切换主题:从 references/themes.md 复制对应的 :root 块
        整体替换这几行(--ink / --ink-rgb / --paper / --paper-rgb)
        其他地方散落的 rgba() 都走 var(--ink-rgb) / var(--paper-rgb),无需逐处改 */
@@ -438,307 +438,453 @@
      ============================================================ -->
 
 <section class="slide hero dark">
-  <div class="chrome"><div>Source Reading · v0.83.0</div><div>01 / 18</div></div>
-  <div class="frame" style="display:grid;gap:3.6vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>九个包 · 一条循环 · 一种取舍</div>
+  <div class="chrome"><div>Pi Agent · Beginner Walkthrough</div><div>01 / 24</div></div>
+  <div class="frame" style="display:grid;gap:3.4vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>零基础 · 从一句话追到源码</div>
     <h1 class="h-hero" style="font-size:9.2vw;white-space:nowrap" data-anim>Pi Agent</h1>
-    <h2 class="h-sub" data-anim>源码解析：把复杂性挡在核心之外</h2>
-    <p class="lead" style="max-width:58vw" data-anim>从 LLM 边界、Agent Loop 到 AgentSession，读懂一个最小化编码 Agent 的架构选择。</p>
-    <div class="meta-row" data-anim><span>20–25 MIN</span><span>·</span><span>CHINESE TECH TALK</span></div>
+    <h2 class="h-sub" data-anim>一句话，怎样变成一串可验证的行动？</h2>
+    <p class="lead" style="max-width:68vw" data-anim>我们会跟着一个具体任务，看 Pi 如何询问模型、读取文件、修改内容、运行测试、保存历史，并把每一步显示给用户。</p>
+    <div class="meta-row" data-anim><span>30–35 MIN</span><span>·</span><span>NO AGENT BACKGROUND REQUIRED</span></div>
   </div>
-  <div class="foot"><div>基于 kuwii/pi-agent-from-source</div><div>2026 · SOURCE WALKTHROUGH</div></div>
-  <aside hidden><p>今天不做 Pi Agent 的功能清单，也不逐章复述源码书。我们只追一个问题：一个生产级编码 Agent，核心究竟可以小到什么程度？</p><p>Pi 的答案不是“少做功能”，而是重新安排复杂性的位置。接下来会沿着模型边界、Agent Loop、产品编排三层往外看。</p></aside>
+  <div class="foot"><div>基于源码提交 7846534</div><div>SOURCE-BACKED WALKTHROUGH</div></div>
+  <aside hidden><p>这次不假设你知道 Agent、Tool Calling 或事件流。我们只跟着一句普通任务，从用户按下回车开始，一步一步看到它怎样完成。</p><p>重点不是背类名，而是建立一条可以迁移到其他 Agent 的工作链路。</p></aside>
 </section>
 
 <section class="slide light">
-  <div class="chrome"><div>Opening · The Question</div><div>02 / 18</div></div>
-  <div class="frame grid-2-7-5" style="padding-top:8vh;align-items:center">
+  <div class="chrome"><div>Orientation · Learning Goals</div><div>02 / 24</div></div>
+  <div class="frame" style="padding-top:4vh">
+    <div class="kicker" data-anim>先知道终点</div>
+    <h2 class="h-xl" style="font-size:5.2vw" data-anim>看完，你能回答四个问题</h2>
+    <p class="lead" style="margin:2vh 0 3vh;max-width:80vw" data-anim>不需要先学 TypeScript。每个问题都会先用生活语言解释，再落到源码位置。</p>
     <div>
-      <div class="kicker" data-anim>先不要看功能表</div>
-      <h2 class="h-xl" style="font-size:6.6vw" data-anim>一个 Agent 的核心，<br>到底需要多大？</h2>
-      <p class="lead" style="margin-top:4vh;max-width:46vw" data-anim>模型会推理，工具会产生副作用，用户还会中途插话。复杂性天然存在。</p>
-    </div>
-    <div class="callout" data-anim><div class="q-big">真正的架构问题不是<br>“有没有复杂性”，而是<br><span class="hi">复杂性住在哪里</span>。</div><div class="callout-src">THE PLACEMENT OF COMPLEXITY</div></div>
-  </div>
-  <div class="foot"><div>问题设定 · 复杂性守恒</div><div>book/index.html</div></div>
-  <aside hidden><p>普通 CLI 是确定的：参数进去，动作出来。Agent CLI 不同，模型在运行时生成下一步，工具调用又会改变真实世界。</p><p>所以“把代码写少”并不会让风险自动消失。我们要观察的是：Pi 把什么留在核心，把什么交给外围，以及这些选择的代价。</p></aside>
-</section>
-
-<section class="slide dark">
-  <div class="chrome"><div>Repository · Evidence</div><div>03 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>先建立规模感</div>
-    <h2 class="h-xl" style="font-size:5.6vw" data-anim>六个数字，一张地图</h2>
-    <div class="grid-6" style="margin-top:3vh;gap:3vw 5vw">
-      <div class="stat-card" data-anim><div class="stat-label">Workspace Units</div><div class="stat-nb">9</div><div class="stat-note">不计 install-lock，内部依赖无环</div></div>
-      <div class="stat-card" data-anim><div class="stat-label">Nested Loops</div><div class="stat-nb">2</div><div class="stat-note">工具轮 + follow-up 轮</div></div>
-      <div class="stat-card" data-anim><div class="stat-label">Core Events</div><div class="stat-nb">10</div><div class="stat-note">描述完整 Agent 生命周期</div></div>
-      <div class="stat-card" data-anim><div class="stat-label">Built-in Tools</div><div class="stat-nb">7</div><div class="stat-note">工具目录 7 个，默认启用其中 4 个</div></div>
-      <div class="stat-card" data-anim><div class="stat-label">CLI Consumers</div><div class="stat-nb">3</div><div class="stat-note">TUI / print（含 JSON）/ RPC</div></div>
-      <div class="stat-card" data-anim><div class="stat-label">AgentSession</div><div class="stat-nb">3.3K</div><div class="stat-note">产品复杂性集中地</div></div>
+      <div class="rowline" data-anim><div class="k">01 · 模型</div><div class="v">模型只会生成文本，为什么却能读文件、改代码、运行命令？</div><div class="m">MODEL → TOOL</div></div>
+      <div class="rowline" data-anim><div class="k">02 · 循环</div><div class="v">为什么一次用户输入，可能触发三次模型回复和多次工具执行？</div><div class="m">AGENT LOOP</div></div>
+      <div class="rowline" data-anim><div class="k">03 · 会话</div><div class="v">历史、分支和压缩怎样保存，为什么它们不应该塞进核心循环？</div><div class="m">SESSION</div></div>
+      <div class="rowline" data-anim><div class="k">04 · 界面</div><div class="v">同一套执行过程，怎样同时服务终端、脚本、JSON 和 IDE？</div><div class="m">EVENTS</div></div>
     </div>
   </div>
-  <div class="foot"><div>代码事实 · 当前 checkout</div><div>pi-agent-src/packages</div></div>
-  <aside hidden><p>这六个数字先帮我们定位：Pi 不是一个“玩具循环”。当前工作区有九个包单元（不计 install-lock），内置工具目录有七个、默认启用四个；CLI 有 TUI、print（含 JSON）和 RPC 三条消费路径，SDK 则是另一种嵌入入口。</p><p>反差在于，核心循环只需要十种事件和两层 while；真正庞大的部分是三千多行的 AgentSession。最小化的是核心，不是整个产品。</p></aside>
-</section>
-
-<section class="slide hero light">
-  <div class="chrome"><div>Act I · Mechanism</div><div>04 / 18</div></div>
-  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>Act I</div>
-    <h1 class="h-hero" style="font-size:8.2vw;white-space:nowrap" data-anim>最小核心</h1>
-    <p class="lead" style="max-width:55vw" data-anim>先把模型、循环、工具三件事讲清楚。</p>
-  </div>
-  <div class="foot"><div>机制先于产品</div><div>CORE MECHANISM</div></div>
-  <aside hidden><p>第一幕只看核心机制。暂时忘掉 TUI、会话文件、扩展市场，只看一次 prompt 如何变成模型响应、工具调用和下一轮。</p></aside>
-</section>
-
-<section class="slide light">
-  <div class="chrome"><div>Architecture · Dependency Stack</div><div>05 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>依赖方向就是架构</div>
-    <h2 class="h-xl" style="font-size:5.5vw" data-anim>九个包，不是一棵文件树</h2>
-    <div style="display:grid;grid-template-columns:1.1fr 1.5fr 1fr;gap:2vw;margin-top:5vh;align-items:stretch">
-      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">01</div><div class="t">基础机制</div><div class="d"><strong>pi-ai</strong><br>模型与流式协议<br><br><strong>pi-agent-core</strong><br>循环、事件、Harness</div></div>
-      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">02</div><div class="t">产品与界面</div><div class="d"><strong>pi-coding-agent</strong><br>CLI 与 AgentSession<br><br><strong>pi-tui</strong><br>独立终端渲染器</div></div>
-      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:2vh"><div class="ic">03</div><div class="t">旁支能力</div><div class="d"><strong>protocol / client / server</strong><br>远程连接<br><br><strong>storage / evals</strong><br>存储与质量</div></div>
-    </div>
-  </div>
-  <div class="foot"><div>九包单向依赖 · UI 与 LLM 解耦</div><div>packages/*/package.json</div></div>
-  <aside hidden><p>Pi 的第一层克制体现在包边界。pi-ai 不认识 Agent，pi-tui 也不认识 LLM；核心只依赖更低层抽象。</p><p>这意味着每层都能单独复用。远程、存储、评估是旁支，不反向侵入产品核心。层级本身就是复杂性的防火墙。</p></aside>
-</section>
-
-<section class="slide dark">
-  <div class="chrome"><div>Boundary · StreamFn</div><div>06 / 18</div></div>
-  <div class="frame grid-2-7-5" style="padding-top:6vh">
-    <div>
-      <div class="kicker" data-anim>模型世界只有一条缝</div>
-      <h2 class="h-xl" style="font-size:5.8vw" data-anim>StreamFn</h2>
-      <p class="lead" style="margin-top:3vh" data-anim>核心循环不认识 OpenAI、Anthropic 或 Google；它只接收一个返回事件流的函数。</p>
-      <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">失败不抛异常。<br>失败被编码进最后一条消息。</div><div class="callout-src">stopReason: error | aborted</div></div>
-    </div>
-    <pre data-anim style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.7;white-space:pre-wrap;padding:3vh 2vw;border-top:1px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>type StreamFn = (
-  model,
-  context,
-  options?
-) =&gt; AssistantMessageEventStream
-
-// done  → AssistantMessage
-// error → AssistantMessage</code></pre>
-  </div>
-  <div class="foot"><div>模型边界 · 以契约换循环简洁</div><div>packages/agent/src/types.ts</div></div>
-  <aside hidden><p>核心循环只通过 StreamFn 触碰模型层。具体提供商、认证、重试、流式协议，都被挡在这条边界外。</p><p>最关键的契约是“永不抛出”：失败也要收敛成 AssistantMessage。于是循环不必在每个模型调用周围堆 try/catch，只检查 stopReason。</p></aside>
-</section>
-
-<section class="slide light" data-animate="pipeline">
-  <div class="chrome"><div>Core · Agent Loop</div><div>07 / 18</div></div>
-  <div class="frame">
-    <div class="kicker">一次 prompt 的黄金路径</div>
-    <h2 class="h-xl" style="font-size:5.4vw">两层循环，五个动作</h2>
-    <div class="pipeline-section" style="margin-top:5vh">
-      <div class="pipeline-label">Inner Loop · tool calls + steering</div>
-      <div class="pipeline">
-        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">Inject</div><div class="step-desc">合并用户 prompt 与 steering</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">Stream</div><div class="step-desc">调用 StreamFn，增量发事件</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">Inspect</div><div class="step-desc">检查 stopReason 与 toolCall</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">Execute</div><div class="step-desc">执行工具，写回 toolResult</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">Continue</div><div class="step-desc">有调用就继续内层循环</div></div>
-      </div>
-    </div>
-    <div class="pipeline-section">
-      <div class="pipeline-label">Outer Loop · follow-up queue</div>
-      <div class="pipeline" data-cols="3">
-        <div class="step" data-anim="step"><div class="step-nb">A</div><div class="step-title">Would Stop</div><div class="step-desc">当前任务本来要结束</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">B</div><div class="step-title">Poll</div><div class="step-desc">读取排队的 follow-up</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">C</div><div class="step-title">Resume</div><div class="step-desc">有新任务则再次进入内层</div></div>
-      </div>
-    </div>
-  </div>
-  <div class="foot"><div>按 → 逐步点亮</div><div>packages/agent/src/agent-loop.ts</div></div>
-  <aside hidden><p>内层循环负责“模型说还要用工具”和“用户在工作中插话”。外层循环负责 Agent 本来要停下时，再看看有没有 follow-up。</p><p>steering 是工作中插话，follow-up 是忙完后接下一件事。两个队列对应两层循环，产品体验直接映射到控制流。</p></aside>
-</section>
-
-<section class="slide dark">
-  <div class="chrome"><div>Core · Tool Execution</div><div>08 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>工具不是一个裸函数</div>
-    <h2 class="h-xl" style="font-size:5.4vw" data-anim>Schema → Execute → Result</h2>
-    <div class="grid-3" style="margin-top:5vh;align-content:start">
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="braces" class="ico-lg"></i></div><div class="t">自描述</div><div class="d">名称、参数 schema、标签和执行逻辑放在同一个 AgentTool 契约里。</div></div>
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="git-branch" class="ico-lg"></i></div><div class="t">并发可声明</div><div class="d">默认可并行；任一调用声明 sequential，整批顺序执行。</div></div>
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="radio" class="ico-lg"></i></div><div class="t">进度事件化</div><div class="d">start / update / end 三类事件，让 UI 与执行解耦。</div></div>
-    </div>
-    <div class="callout" style="margin-top:5vh" data-anim><div class="q-big">新增第八个工具，不需要修改 Agent Loop。</div><div class="callout-src">OPEN / CLOSED AT THE TOOL BOUNDARY</div></div>
-  </div>
-  <div class="foot"><div>七个内置工具只是默认集合</div><div>agent-loop.ts · core/tools</div></div>
-  <aside hidden><p>循环只做三件事：按 schema 校验、执行、收集结果。工具是什么、如何渲染、能否并发，都由工具自己声明。</p><p>并发策略也很克制：配置要求串行，或者这一批里出现 sequential 工具，就顺序执行；否则可以并行。复杂性被内聚在边界，而不是扩散到循环。</p></aside>
-</section>
-
-<section class="slide hero light">
-  <div class="chrome"><div>Act II · Orchestration</div><div>09 / 18</div></div>
-  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>Act II</div>
-    <h1 class="h-hero" style="font-size:7.3vw" data-anim>复杂性没有消失</h1>
-    <p class="lead" style="max-width:58vw" data-anim>它只是从“机制”移动到了“策略”。</p>
-  </div>
-  <div class="foot"><div>复杂性守恒</div><div>MECHANISM → POLICY</div></div>
-  <aside hidden><p>到这里核心确实很小，但生产功能一个也没凭空消失。第二幕要看这些复杂性具体去了哪里：Harness、AgentSession、会话树和运行模式。</p></aside>
-</section>
-
-<section class="slide light">
-  <div class="chrome"><div>Layers · Core / Harness / Product</div><div>10 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>同一个包里，也不强迫绑定</div>
-    <h2 class="h-xl" style="font-size:5.2vw" data-anim>三层，三种责任</h2>
-    <div class="grid-3" style="margin-top:5vh;align-content:start">
-      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">CORE</div><div class="t">机制</div><div class="d">Agent、两层循环、状态归约、十种事件。纯内存，可独立运行。</div></div>
-      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">HARNESS</div><div class="t">通用策略</div><div class="d">持久化会话树、压缩、分支摘要、skills、模板和内置工具。</div></div>
-      <div class="pillar" data-anim style="padding-top:2vh;border-top:3px solid currentColor"><div class="ic">PRODUCT</div><div class="t">具体产品</div><div class="d">pi-coding-agent 绕过通用 Harness，自建 AgentSession 与 SessionManager。</div></div>
-    </div>
-    <p class="lead" style="margin-top:6vh;max-width:76vw" data-anim>框架提供机制，也提供一种默认策略；但不把这套策略焊死在核心上。</p>
-  </div>
-  <div class="foot"><div>最小核心允许上层定制编排</div><div>agent/src/harness · coding-agent/core</div></div>
-  <aside hidden><p>pi-agent-core 里既有纯净核心，也有可选 Harness。最值得注意的是，官方 CLI 产品没有直接使用通用 AgentHarness，而是在核心 Agent 上自建了 AgentSession。</p><p>这说明 Harness 只是可选策略，不是框架强加的命运。机制与策略分离之后，产品才能拥有自己的扩展、信任和模式管理。</p></aside>
-</section>
-
-<section class="slide dark">
-  <div class="chrome"><div>State · Session Tree</div><div>11 / 18</div></div>
-  <div class="frame grid-2-6-6" style="padding-top:6vh;align-items:center">
-    <div>
-      <div class="kicker" data-anim>历史不是一个可变数组</div>
-      <h2 class="h-xl" style="font-size:5.4vw" data-anim>会话是一棵树</h2>
-      <p class="lead" style="margin-top:3vh" data-anim>每条记录有 id 与 parentId；leaf 表示当前所在位置。</p>
-      <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">压缩不是删历史，<br>而是追加一条 summary 节点。</div><div class="callout-src">APPEND-ONLY SESSION MODEL</div></div>
-    </div>
-    <pre data-anim style="font-family:var(--mono);font-size:max(13px,1.15vw);line-height:1.9;padding:3vh 2vw;border-left:2px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>root
- └─ user: task
-    └─ assistant: tool call
-       ├─ toolResult
-       │  └─ assistant: answer  ← leaf
-       └─ branch_summary
-          └─ user: new direction
-
-moveTo(entryId) → 改变当前位置
-compact()       → 追加摘要入口</code></pre>
-  </div>
-  <div class="foot"><div>回溯、分支、压缩成为一等能力</div><div>agent/src/harness/session</div></div>
-  <aside hidden><p>如果历史只是数组，回退常常意味着复制或删除。Pi 用 parentId 把会话记录组织成树，leaf 指向当前分支。</p><p>moveTo 只改变当前位置；压缩追加摘要条目而不是销毁原记录。这让 fork、回溯、分支摘要都能建立在同一个数据模型上。</p></aside>
-</section>
-
-<section class="slide light" data-animate="pipeline">
-  <div class="chrome"><div>Product · AgentSession</div><div>12 / 18</div></div>
-  <div class="frame">
-    <div class="kicker">用户按下回车之后</div>
-    <h2 class="h-xl" style="font-size:5.2vw">prompt() 是一只漏斗</h2>
-    <div class="pipeline-section" style="margin-top:6vh">
-      <div class="pipeline-label">Product concerns are resolved before the core sees a message</div>
-      <div class="pipeline">
-        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">Intercept</div><div class="step-desc">扩展有机会改写或拦截输入</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">Expand</div><div class="step-desc">展开 skill、模板与资源</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">Validate</div><div class="step-desc">检查模型、认证与运行状态</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">Compact</div><div class="step-desc">需要时整理上下文</div></div>
-        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">Dispatch</div><div class="step-desc">把干净消息交给核心 Agent</div></div>
-      </div>
-    </div>
-    <div class="callout" style="margin-top:6vh" data-anim><div class="q-big">核心保持小，是因为产品复杂性被集中管理。</div><div class="callout-src">AgentSession · 3.3K LINES</div></div>
-  </div>
-  <div class="foot"><div>按 → 逐步点亮</div><div>core/agent-session.ts</div></div>
-  <aside hidden><p>AgentSession 是产品层的中央编排器。用户输入并不会直接丢给模型，而是先经过扩展、skill 和模板展开、认证与模型校验、压缩判断。</p><p>只有当产品关注点都处理完，核心才收到干净消息。这不是复杂性变少，而是复杂性被集中到一个明确的产品边界。</p></aside>
-</section>
-
-<section class="slide dark">
-  <div class="chrome"><div>Projection · Three Modes</div><div>13 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>同一条 AgentSessionEvent 流</div>
-    <h2 class="h-xl" style="font-size:5.4vw" data-anim>三种消费方式</h2>
-    <div class="grid-3" style="margin-top:5vh;align-content:start">
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="terminal" class="ico-lg"></i></div><div class="t">TUI</div><div class="d">把事件翻译成可交互终端组件，复杂度主要来自“与人交互”。</div></div>
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="file-output" class="ico-lg"></i></div><div class="t">Print</div><div class="d">输出纯文本或 JSON Lines，给脚本和流水线消费。</div></div>
-      <div class="pillar" data-anim><div class="ic"><i data-lucide="network" class="ico-lg"></i></div><div class="t">RPC</div><div class="d">stdin/stdout 上收命令、发事件，供 IDE 或守护进程驱动。</div></div>
-    </div>
-    <p class="lead" style="margin-top:6vh" data-anim>新增一种呈现方式，不需要改 Agent Loop。</p>
-  </div>
-  <div class="foot"><div>事件流即产品层契约</div><div>coding-agent/src/modes</div></div>
-  <aside hidden><p>三种模式共享同一个 AgentSession，只是消费事件的方式不同。TUI 渲染组件，print 写 stdout，RPC 把操作和事件序列化成 JSON 行。</p><p>这条边界的价值在于：新增 IDE 集成或后台服务时，不需要复制 Agent 逻辑，只写新的消费者。</p></aside>
-</section>
-
-<section class="slide hero dark">
-  <div class="chrome"><div>Act III · Trade-offs</div><div>14 / 18</div></div>
-  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>Act III</div>
-    <h1 class="h-hero" style="font-size:8vw;white-space:nowrap" data-anim>边界与赌注</h1>
-    <p class="lead" style="max-width:58vw" data-anim>最小化不是免费午餐，也不是普遍最优。</p>
-  </div>
-  <div class="foot"><div>把代价一起讲清楚</div><div>TRADE-OFFS</div></div>
-  <aside hidden><p>最后一幕讨论两个最容易被口号化的地方：扩展和安全。Pi 的路线有明确优势，也把更多责任交给了使用者和执行环境。</p></aside>
-</section>
-
-<section class="slide light">
-  <div class="chrome"><div>Extension · Typed Surface</div><div>15 / 18</div></div>
-  <div class="frame grid-2-7-5" style="padding-top:6vh">
-    <div>
-      <div class="kicker" data-anim>没有 MCP，不等于没有扩展性</div>
-      <h2 class="h-xl" style="font-size:5.6vw" data-anim>ExtensionAPI</h2>
-      <p class="lead" style="margin-top:3vh" data-anim>扩展直接运行在同一 TypeScript 进程里，获得编译期类型与完整产品上下文。</p>
-      <div class="meta-row" style="margin-top:4vh" data-anim><span>33 TYPED ON(...) OVERLOADS</span><span>·</span><span>SOURCE 7846534</span></div>
-    </div>
-    <div>
-      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerTool</div><div class="v">增加模型可调用能力</div></div>
-      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerCommand</div><div class="v">增加斜杠命令</div></div>
-      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerShortcut</div><div class="v">增加交互入口</div></div>
-      <div class="rowline" style="grid-template-columns:1fr 1.5fr" data-anim><div class="k">registerFlag</div><div class="v">扩展 CLI 配置面</div></div>
-    </div>
-  </div>
-  <div class="foot"><div>收益：强类型、低协议成本 · 代价：进程内耦合</div><div>core/extensions/types.ts</div></div>
-  <aside hidden><p>Pi 不内置 MCP，而是把扩展性集中到 ExtensionAPI。扩展可以注册工具、命令、快捷键和 flag，并订阅三十三个强类型 on 入口。</p><p>收益是类型安全和低协议成本；代价是扩展与产品运行在同一进程，跨语言和跨进程生态需要额外桥接。它是取舍，不是单方面胜利。</p></aside>
+  <div class="foot"><div>阅读目标 · 从会用到会解释</div><div>LEARNING MAP</div></div>
+  <aside hidden><p>如果结束时你能把这四个问题讲给别人听，就已经掌握了 Pi 的主干。源码细节很多，但它们都挂在这四个问题下面。</p></aside>
 </section>
 
 <section class="slide dark" data-animate="directional">
-  <div class="chrome"><div>Security · Trust Boundary</div><div>16 / 18</div></div>
-  <div class="frame" style="padding-top:5vh">
-    <div class="kicker" data-anim>最刺眼的差异</div>
-    <h2 class="h-xl" style="font-size:5.2vw;margin-bottom:4vh" data-anim>逐工具审批 vs 环境隔离</h2>
+  <div class="chrome"><div>Mental Model · Chat vs Agent</div><div>03 / 24</div></div>
+  <div class="frame" style="padding-top:4vh">
+    <div class="kicker" data-anim>先拆掉第一个误解</div>
+    <h2 class="h-xl" style="font-size:5.2vw;margin-bottom:3vh" data-anim>Agent 不是“更会聊天”</h2>
     <div class="grid-2-6-6" style="gap:4vw">
-      <div data-anim="left" style="padding:2.5vh 2vw;border-left:3px solid currentColor;opacity:.58">
-        <div class="kicker">In-process Permission</div><h3 class="h-md">每个动作前判断</h3>
-        <p class="body-zh" style="margin-top:3vh">细粒度审批、权限模式、工具级规则。适合直接运行在用户主机且必须限制动作的场景。</p>
+      <div data-anim="left" style="padding:2.3vh 2vw;border-left:3px solid currentColor;opacity:.62">
+        <div class="kicker">Chatbot</div>
+        <h3 class="h-md">输入一句话，输出一段话</h3>
+        <p class="body-zh" style="margin-top:2vh">模型看到消息后生成回答。它可以告诉你“应该修改 README”，但它自己没有文件系统，也没有真的改任何东西。</p>
       </div>
-      <div data-anim="right" style="padding:2.5vh 2vw;border-left:3px solid currentColor">
-        <div class="kicker">Pi's Bet</div><h3 class="h-md">先把环境变安全</h3>
-        <p class="body-zh" style="margin-top:3vh">项目级信任只管资源加载；执行隔离依赖容器、VM 或沙箱。默认进程拥有启动用户的权限。</p>
+      <div data-anim="right" style="padding:2.3vh 2vw;border-left:3px solid currentColor">
+        <div class="kicker">Agent</div>
+        <h3 class="h-md">边思考，边请求程序行动</h3>
+        <p class="body-zh" style="margin-top:2vh">程序把工具说明交给模型；模型提出结构化 Tool Call；程序执行后把 Tool Result 再交回模型，直到任务结束。</p>
       </div>
     </div>
-    <div class="callout" style="margin-top:5vh" data-anim><div class="q-big">不能控制执行环境时，逐动作审批仍然可能是必要的。</div><div class="callout-src">APPLICABILITY BOUNDARY</div></div>
+    <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">模型负责“决定下一步”，程序负责“真的去做”。</div><div class="callout-src">DECISION IS NOT EXECUTION</div></div>
   </div>
-  <div class="foot"><div>最小化安全模型有明确前提</div><div>coding-agent/docs/security.md</div></div>
-  <aside hidden><p>Pi 没有内置逐工具权限系统。项目级信任只决定是否加载项目本地设置、资源与扩展，它不是沙箱；面对不受信任务，源码文档建议把整个进程放进容器、VM、微虚拟机或策略沙箱。</p><p>这把权限系统从核心拿掉；但如果 Agent 裸跑在用户主机上，它就拥有启动用户的权限。无法控制执行环境时，不应机械照搬这条路线。</p></aside>
+  <div class="foot"><div>Agent = Model + Tools + Loop + State</div><div>packages/agent/src/types.ts</div></div>
+  <aside hidden><p>这条边界非常重要。模型不会直接访问你的电脑；它只能生成一个请求。真正的权限、校验和副作用都发生在程序侧。</p></aside>
 </section>
 
-<section class="slide hero light" data-animate="quote">
-  <div class="chrome"><div>Takeaway · Architecture</div><div>17 / 18</div></div>
-  <div class="frame" style="display:grid;gap:4vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>读完源码，留下三句话</div>
-    <blockquote style="font-family:var(--serif-zh);font-weight:700;font-size:4.5vw;line-height:1.24;max-width:80vw">
-      <span data-anim="line" style="display:block">边界比功能表重要。</span>
-      <span data-anim="line" style="display:block">事件流比 UI 形态稳定。</span>
-      <span data-anim="line" style="display:block">复杂性只会移动，不会消失。</span>
-    </blockquote>
-    <div class="meta-row" data-anim><span>MECHANISM</span><span>·</span><span>CONTRACT</span><span>·</span><span>TRADE-OFF</span></div>
+<section class="slide light">
+  <div class="chrome"><div>Running Example · One Task</div><div>04 / 24</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:5vh">
+    <div style="display:flex;flex-direction:column;gap:2.5vh">
+      <div>
+        <div class="kicker" data-anim>后面所有概念都回到这句话</div>
+        <h2 class="h-xl" style="font-size:5vw" data-anim>一项真实任务</h2>
+      </div>
+      <div class="callout" data-anim><div class="q-big">“请在 README 增加安装说明，<br>然后运行测试。”</div><div class="callout-src">USER PROMPT</div></div>
+      <p class="body-zh" data-anim>这句话包含两个目标：先修改文件，再验证结果。Pi 必须先了解现状，才能决定如何改；改完以后，还要观察测试输出。</p>
+    </div>
+    <div>
+      <div class="rowline" style="grid-template-columns:.55fr 2fr" data-anim><div class="k">读</div><div class="v">读取 README，获得现有内容</div></div>
+      <div class="rowline" style="grid-template-columns:.55fr 2fr" data-anim><div class="k">改</div><div class="v">用 edit 或 write 写入安装说明</div></div>
+      <div class="rowline" style="grid-template-columns:.55fr 2fr" data-anim><div class="k">测</div><div class="v">用 bash 启动测试命令</div></div>
+      <div class="rowline" style="grid-template-columns:.55fr 2fr" data-anim><div class="k">答</div><div class="v">说明改了什么、测试是否通过</div></div>
+      <p class="body-zh" style="margin-top:2.6vh" data-anim><strong>关键：</strong>这不是一口气完成，而是“模型 → 工具 → 模型 → 工具”的多轮协作。</p>
+    </div>
   </div>
-  <div class="foot"><div>可迁移的架构判断</div><div>TAKEAWAY</div></div>
-  <aside hidden><p>第一，先看边界与依赖方向，再看功能数量。第二，稳定的事件契约能让 TUI、脚本和 RPC 共用一套 Agent 逻辑。</p><p>第三，任何“最小化”都必须回答复杂性去了哪里。外推是有效设计，但外围责任必须有人真正承担。</p></aside>
+  <div class="foot"><div>贯穿案例 · README + tests</div><div>ONE TASK · MANY TURNS</div></div>
+  <aside hidden><p>后面看到任何类型名或循环，都把它放回这个任务。这样抽象不会漂在空中。</p></aside>
+</section>
+
+<section class="slide dark" data-animate="pipeline">
+  <div class="chrome"><div>System Map · End to End</div><div>05 / 24</div></div>
+  <div class="frame">
+    <div class="kicker">先看全景，再逐层放大</div>
+    <h2 class="h-xl" style="font-size:5vw">一句话的完整旅程</h2>
+    <p class="body-zh" style="margin-top:1.5vh;max-width:84vw">下面六步会在后续页面逐一展开。先记住：核心循环只管协调，产品功能分布在它的前后两侧。</p>
+    <div class="pipeline-section" style="margin-top:3vh">
+      <div class="pipeline" data-cols="6">
+        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">输入</div><div class="step-desc">CLI / TUI 收到用户任务</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">准备</div><div class="step-desc">AgentSession 展开资源并检查状态</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">决策</div><div class="step-desc">Agent Loop 把 Context 交给模型</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">行动</div><div class="step-desc">程序执行 read / edit / bash</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">记录</div><div class="step-desc">消息与结果写入 Session</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">06</div><div class="step-title">呈现</div><div class="step-desc">事件被 TUI / JSON / RPC 消费</div></div>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">看源码时，先问“这段代码位于哪一步”，再看细节。</div><div class="callout-src">A MAP PREVENTS GETTING LOST</div></div>
+  </div>
+  <div class="foot"><div>按 → 逐步点亮六个阶段</div><div>main.ts · sdk.ts · agent-loop.ts</div></div>
+  <aside hidden><p>这张图是整场分享的地图。你不需要马上记住类名，只要先记住六个动词：输入、准备、决策、行动、记录、呈现。</p></aside>
+</section>
+
+<section class="slide hero light">
+  <div class="chrome"><div>Act I · Core Mechanism</div><div>06 / 24</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act I</div>
+    <h1 class="h-hero" style="font-size:8.2vw;white-space:nowrap" data-anim>核心循环</h1>
+    <p class="lead" style="max-width:66vw" data-anim>先只看最小问题：模型如何提出行动，程序如何执行，再把结果交回模型。</p>
+  </div>
+  <div class="foot"><div>Model ↔ Tool</div><div>CORE MECHANISM</div></div>
+  <aside hidden><p>这一幕暂时不讲持久化、扩展和界面。我们把系统缩小到能完成一个任务的最小闭环。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Vocabulary · Five Roles</div><div>07 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>先把名字和责任对上</div>
+    <h2 class="h-xl" style="font-size:4.9vw" data-anim>五个角色，各做一件事</h2>
+    <div style="margin-top:2vh">
+      <div class="rowline" data-anim><div class="k">Model</div><div class="v">输入 Context，输出文本或 Tool Call；负责判断下一步。</div><div class="m">DECIDE</div></div>
+      <div class="rowline" data-anim><div class="k">Tool</div><div class="v">输入结构化参数，执行真实副作用，输出 Tool Result。</div><div class="m">ACT</div></div>
+      <div class="rowline" data-anim><div class="k">Agent</div><div class="v">在内存里保存当前状态，并运行“模型 ↔ 工具”的循环。</div><div class="m">COORDINATE</div></div>
+      <div class="rowline" data-anim><div class="k">Session</div><div class="v">把多次 Run 串成历史，增加分支、压缩、资源和产品状态。</div><div class="m">REMEMBER</div></div>
+      <div class="rowline" data-anim><div class="k">UI</div><div class="v">消费事件，把同一过程渲染成 TUI、文本、JSON 或 RPC。</div><div class="m">PRESENT</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>不要把 Agent、Session 和 UI 当成同一个东西</div><div>types.ts · agent.ts · agent-session.ts</div></div>
+  <aside hidden><p>初学源码最容易把这五层混在一起。只要先把责任拆开，后面的类名就会有位置。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Boundary · StreamFn</div><div>08 / 24</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:5vh">
+    <div>
+      <div class="kicker" data-anim>模型入口只有一条缝</div>
+      <h2 class="h-xl" style="font-size:5.4vw" data-anim>StreamFn</h2>
+      <p class="lead" style="margin-top:2vh" data-anim>Agent Loop 不直接认识 OpenAI、Anthropic 或 Google。它只调用一个统一函数，并持续接收模型事件。</p>
+      <p class="body-zh" style="margin-top:2.5vh" data-anim><strong>输入：</strong>model、context、options。<br><strong>输出：</strong>AssistantMessageEventStream。</p>
+    </div>
+    <div>
+      <pre data-anim style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.7;white-space:pre-wrap;padding:2.6vh 2vw;border-top:1px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>type StreamFn = (
+  model,
+  context,
+  options?
+) =&gt; AssistantMessageEventStream</code></pre>
+      <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">失败也要变成最后一条 AssistantMessage，而不是把循环炸断。</div><div class="callout-src">stopReason: error | aborted</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>换模型提供商，不需要改 Agent Loop</div><div>packages/agent/src/types.ts</div></div>
+  <aside hidden><p>StreamFn 是模型适配层和核心循环之间的契约。它让“调用哪个厂商”和“循环怎么跑”成为两个问题。</p></aside>
+</section>
+
+<section class="slide light" data-animate="directional">
+  <div class="chrome"><div>Tool Calling · Proposal vs Execution</div><div>09 / 24</div></div>
+  <div class="frame" style="padding-top:4vh">
+    <div class="kicker" data-anim>模型不会直接碰文件</div>
+    <h2 class="h-xl" style="font-size:4.9vw;margin-bottom:3vh" data-anim>Tool Call 只是行动提议</h2>
+    <div class="grid-2-6-6" style="gap:4vw">
+      <div data-anim="left" style="padding:2.2vh 2vw;border-left:3px solid currentColor">
+        <div class="kicker">Model Output</div>
+        <h3 class="h-md">Tool Call</h3>
+        <pre style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.65;margin-top:2vh;white-space:pre-wrap"><code>{
+  "name": "read",
+  "arguments": {
+    "path": "README.md"
+  }
+}</code></pre>
+      </div>
+      <div data-anim="right" style="padding:2.2vh 2vw;border-left:3px solid currentColor">
+        <div class="kicker">Program Output</div>
+        <h3 class="h-md">Tool Result</h3>
+        <p class="body-zh" style="margin-top:2vh">程序先按 schema 校验参数，再执行 read。文件内容、错误状态和细节被包装成结果消息，追加回 Context。</p>
+        <p class="body-zh" style="margin-top:2vh"><strong>模型下一轮看到的是结果，不是直接访问磁盘。</strong></p>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">安全边界和真实副作用都在程序侧，不在模型内部。</div></div>
+  </div>
+  <div class="foot"><div>请求与执行分离</div><div>AgentToolCall · AgentToolResult</div></div>
+  <aside hidden><p>Tool Call 可以理解为模型填写的一张申请单。程序有机会校验、拦截、执行或返回错误。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Events · Observable Lifecycle</div><div>10 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>执行过程必须能被看见</div>
+    <h2 class="h-xl" style="font-size:4.8vw" data-anim>十种事件，描述完整生命周期</h2>
+    <p class="body-zh" style="margin:1.6vh 0 2.5vh;max-width:86vw" data-anim>事件不是“日志字符串”，而是带类型和数据的结构。界面不用猜文本，就能知道模型正在输出、工具刚开始，还是整次 Run 已结束。</p>
+    <div class="grid-4" style="gap:2.4vh 4vw">
+      <div class="stat-card" data-anim><div class="stat-label">Agent · 2</div><div class="stat-note"><strong>agent_start</strong><br><strong>agent_end</strong><br>一次完整 Run 的边界</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Turn · 2</div><div class="stat-note"><strong>turn_start</strong><br><strong>turn_end</strong><br>一次模型回复与工具结果</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Message · 3</div><div class="stat-note"><strong>message_start / update / end</strong><br>支持逐字流式显示</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">Tool · 3</div><div class="stat-note"><strong>tool_execution_start / update / end</strong><br>支持进度与结果</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>事件让执行逻辑与界面解耦</div><div>packages/agent/src/types.ts · AgentEvent</div></div>
+  <aside hidden><p>十个事件按四层组织，比背十个名字容易。它们同时是可观测性和 UI 解耦的基础。</p></aside>
+</section>
+
+<section class="slide light" data-animate="pipeline">
+  <div class="chrome"><div>Core · Agent Loop</div><div>11 / 24</div></div>
+  <div class="frame">
+    <div class="kicker">一次 Run 为什么会有很多轮</div>
+    <h2 class="h-xl" style="font-size:4.9vw">两层循环，各管一种“继续”</h2>
+    <div class="pipeline-section" style="margin-top:3.2vh">
+      <div class="pipeline-label">Inner Loop · 当前任务还需要工具吗？</div>
+      <div class="pipeline" data-cols="4">
+        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">问模型</div><div class="step-desc">把 Context 与工具说明发给模型</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">看回复</div><div class="step-desc">文本、停止原因或 Tool Call</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">执行工具</div><div class="step-desc">把 Tool Result 追加进 Context</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">再次询问</div><div class="step-desc">只要还有工具请求就继续</div></div>
+      </div>
+    </div>
+    <div class="pipeline-section">
+      <div class="pipeline-label">Outer Loop · 当前任务结束后还有新消息吗？</div>
+      <div class="pipeline" data-cols="3">
+        <div class="step" data-anim="step"><div class="step-nb">A</div><div class="step-title">准备结束</div><div class="step-desc">本轮已经没有 Tool Call</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">B</div><div class="step-title">读取 Follow-up</div><div class="step-desc">用户排队的新任务仍可接上</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">C</div><div class="step-title">真正结束</div><div class="step-desc">队列为空才发出 agent_end</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><div>按 → 逐步点亮 · 内层管工具，外层管后续</div><div>packages/agent/src/agent-loop.ts</div></div>
+  <aside hidden><p>两层 while 不是炫技。它们分别对应两种产品体验：当前任务中继续调用工具，以及当前任务后继续处理排队消息。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Running Example · Round One</div><div>12 / 24</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:4.5vh">
+    <div>
+      <div class="kicker" data-anim>第一轮 · 先获得事实</div>
+      <h2 class="h-xl" style="font-size:4.9vw" data-anim>模型请求读取 README</h2>
+      <p class="body-zh" style="margin-top:2vh" data-anim><strong>Context 里已有：</strong>用户任务、系统提示、历史消息，以及 read / write / edit / bash 四个默认工具的说明。</p>
+      <p class="body-zh" style="margin-top:2vh" data-anim>模型发现自己不知道 README 当前内容，因此不应该猜。它输出一个 read Tool Call。</p>
+      <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">先读，再改，是模型基于 Context 做出的下一步决策。</div></div>
+    </div>
+    <pre data-anim style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.65;white-space:pre-wrap;padding:2.5vh 2vw;border-top:1px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>turn_start
+message_start
+message_update ...
+message_end
+
+tool_execution_start
+read("README.md")
+tool_execution_end
+
+turn_end</code></pre>
+  </div>
+  <div class="foot"><div>贯穿案例 · 第一次 Model → Tool</div><div>streamAssistantResponse · read</div></div>
+  <aside hidden><p>注意事件顺序：模型消息先完成，然后工具开始执行，最后整个 Turn 结束。下一轮会带着 README 内容再次询问模型。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Tool Runtime · Validation and Execution</div><div>13 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>工具不是随便调用一个函数</div>
+    <h2 class="h-xl" style="font-size:4.8vw" data-anim>一次 Tool Call 要过四道门</h2>
+    <div class="grid-4" style="margin-top:2.8vh;gap:2.6vh 4vw">
+      <div class="stat-card" data-anim><div class="stat-label">01 · Resolve</div><div class="stat-note"><strong>找到工具</strong><br>按 name 在当前工具集合里定位定义；不存在就返回错误结果。</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">02 · Validate</div><div class="stat-note"><strong>校验参数</strong><br>用 TypeBox schema 检查 path、command 等字段是否符合契约。</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">03 · Execute</div><div class="stat-note"><strong>执行副作用</strong><br>工具可以顺序或并行运行，并用 update 回报中间进度。</div></div>
+      <div class="stat-card" data-anim><div class="stat-label">04 · Finalize</div><div class="stat-note"><strong>形成结果</strong><br>内容、错误状态和 details 被包装成 Tool Result，交回模型。</div></div>
+    </div>
+    <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">内置目录有 7 个工具；默认交给模型的是 read、write、edit、bash 这 4 个。</div><div class="callout-src">grep / find / ls ARE AVAILABLE BUT NOT DEFAULT</div></div>
+  </div>
+  <div class="foot"><div>新增工具不需要修改 Agent Loop</div><div>executeToolCalls · core/tools/index.ts</div></div>
+  <aside hidden><p>这里能看到“模型提议，程序负责”的完整含义。工具层把 schema、执行和结果格式收在一个契约里。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Running Example · Rounds Two and Three</div><div>14 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>同一个任务，继续循环</div>
+    <h2 class="h-xl" style="font-size:4.7vw" data-anim>读完以后，模型才知道怎么改</h2>
+    <div class="grid-3" style="margin-top:3vh;align-content:start;gap:3vw">
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:1.8vh"><div class="ic">01</div><div class="t">Read Result</div><div class="d"><strong>输入：</strong>README 全文。<br><strong>模型判断：</strong>安装章节缺失，确定插入位置与文案。</div></div>
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:1.8vh"><div class="ic">02</div><div class="t">Edit Call</div><div class="d"><strong>行动：</strong>edit 写入安装说明。<br><strong>输出：</strong>成功或失败，以及修改细节。</div></div>
+      <div class="pillar" data-anim style="border-top:2px solid currentColor;padding-top:1.8vh"><div class="ic">03</div><div class="t">Bash Call</div><div class="d"><strong>行动：</strong>运行测试命令。<br><strong>输出：</strong>exit code、stdout、stderr。</div></div>
+    </div>
+    <div class="callout" style="margin-top:4vh" data-anim><div class="q-big">每次 Tool Result 都成为下一轮的新事实；模型不是记住了结果，而是再次在更新后的 Context 上推理。</div></div>
+  </div>
+  <div class="foot"><div>贯穿案例 · Read → Edit → Bash</div><div>MULTI-TURN TOOL USE</div></div>
+  <aside hidden><p>如果测试失败，循环还能继续：模型读取错误，决定修复，再次运行测试。循环次数由任务状态决定，不由固定脚本决定。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Control Flow · Stop and New Input</div><div>15 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>什么时候停，什么时候继续</div>
+    <h2 class="h-xl" style="font-size:4.8vw" data-anim>三种“没有结束”</h2>
+    <div class="grid-3" style="margin-top:3vh;align-content:start">
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="repeat" class="ico-lg"></i></div><div class="t">还有 Tool Call</div><div class="d">当前任务还没完成。执行结果写回 Context，内层循环再次调用模型。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="corner-down-right" class="ico-lg"></i></div><div class="t">Steering</div><div class="d">Agent 工作时用户插话。消息在下一个安全点注入当前 Run，改变接下来的方向。</div></div>
+      <div class="pillar" data-anim><div class="ic"><i data-lucide="list-plus" class="ico-lg"></i></div><div class="t">Follow-up</div><div class="d">当前任务结束后，队列里还有下一条用户消息。外层循环继续，而不是立刻 agent_end。</div></div>
+    </div>
+    <p class="lead" style="margin-top:4vh;max-width:84vw" data-anim><strong>真正停止：</strong>没有 Tool Call、没有待注入消息、也没有 Follow-up，循环才发出 <span style="font-family:var(--mono)">agent_end</span>。</p>
+  </div>
+  <div class="foot"><div>两层循环对应两种用户插话时机</div><div>agent-loop.ts · queues</div></div>
+  <aside hidden><p>这一页把循环和真实交互体验连接起来。用户并不总是等 Agent 完全结束后才说下一句话。</p></aside>
 </section>
 
 <section class="slide hero dark">
-  <div class="chrome"><div>Closing · Discussion</div><div>18 / 18</div></div>
-  <div class="frame" style="display:grid;gap:6vh;align-content:center;min-height:80vh">
-    <div class="kicker" data-anim>The Question</div>
-    <h1 class="h-hero" style="font-size:7vw;line-height:1.12"><span data-anim style="display:block">你的系统里，</span><span data-anim style="display:block">复杂性应该</span><span data-anim style="display:block">住在哪里？</span></h1>
-    <p class="lead" style="max-width:56vw" data-anim>不是删掉它，而是让它待在最容易理解、替换和验证的位置。</p>
-    <div class="meta-row" data-anim><span>Q &amp; A</span><span>·</span><span>CC BY 4.0 SOURCE NOTES</span></div>
+  <div class="chrome"><div>Act II · Product Layer</div><div>16 / 24</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act II</div>
+    <h1 class="h-hero" style="font-size:7.7vw;white-space:nowrap" data-anim>核心之外</h1>
+    <p class="lead" style="max-width:70vw" data-anim>循环只负责“继续还是停止”。真正的产品还要管理配置、历史、压缩、扩展、界面和信任。</p>
   </div>
-  <div class="foot"><div>谢谢 · 源码与书稿均在本地仓库</div><div>END</div></div>
-  <aside hidden><p>最后把问题留给自己的项目：哪些复杂性必须进入核心，哪些应该是可选策略，哪些必须由部署环境承担？</p><p>判断标准不是“代码更少”，而是边界是否清晰、责任是否有人承担、失败是否能被验证。谢谢。</p></aside>
+  <div class="foot"><div>复杂性没有消失，只是被放到更合适的层</div><div>PRODUCT ORCHESTRATION</div></div>
+  <aside hidden><p>现在把刚才的最小循环重新装回产品。你会看到 AgentSession 和 SessionManager 为什么存在。</p></aside>
+</section>
+
+<section class="slide light" data-animate="pipeline">
+  <div class="chrome"><div>Product · AgentSession</div><div>17 / 24</div></div>
+  <div class="frame">
+    <div class="kicker">用户按下回车之后，核心还没开始</div>
+    <h2 class="h-xl" style="font-size:4.7vw">prompt() 先把产品问题处理完</h2>
+    <p class="body-zh" style="margin-top:1.4vh;max-width:88vw">AgentSession 是中央编排器。它把用户输入整理成核心 Agent 能安全消费的消息，并在运行前后协调产品功能。</p>
+    <div class="pipeline-section" style="margin-top:2.6vh">
+      <div class="pipeline">
+        <div class="step" data-anim="step"><div class="step-nb">01</div><div class="step-title">Intercept</div><div class="step-desc">扩展可改写、处理或拦截输入</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">02</div><div class="step-title">Expand</div><div class="step-desc">展开 Skills、模板和文件引用</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">03</div><div class="step-title">Validate</div><div class="step-desc">检查模型、认证和运行状态</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">04</div><div class="step-title">Compact</div><div class="step-desc">上下文过长时准备摘要</div></div>
+        <div class="step" data-anim="step"><div class="step-nb">05</div><div class="step-title">Dispatch</div><div class="step-desc">把干净消息交给核心 Agent</div></div>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:3.2vh" data-anim><div class="q-big">贯穿任务在这里从“一句字符串”，变成带历史、工具、模型和产品规则的完整 Run。</div><div class="callout-src">AgentSession · 3333 LINES IN THIS SNAPSHOT</div></div>
+  </div>
+  <div class="foot"><div>按 → 逐步点亮产品漏斗</div><div>core/agent-session.ts</div></div>
+  <aside hidden><p>核心保持小，不是因为这些功能不存在，而是因为 AgentSession 在调用核心前后集中处理它们。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>State · Session Tree</div><div>18 / 24</div></div>
+  <div class="frame grid-2-6-6" style="padding-top:4.5vh;align-items:center">
+    <div>
+      <div class="kicker" data-anim>一次 Run 结束后，历史还要活着</div>
+      <h2 class="h-xl" style="font-size:4.8vw" data-anim>Session 是一棵追加树</h2>
+      <p class="body-zh" style="margin-top:2vh" data-anim>每条记录都有 id 与 parentId；当前 leaf 指向正在使用的分支。用户消息、模型回复、工具结果和摘要都成为节点。</p>
+      <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">压缩不是删除旧消息，而是追加 summary，再让后续分支从摘要继续。</div></div>
+    </div>
+    <pre data-anim style="font-family:var(--mono);font-size:max(12px,1vw);line-height:1.75;padding:2.5vh 2vw;border-left:2px solid currentColor;background:rgba(var(--paper-rgb),.05)"><code>user: 修改 README
+ └─ assistant: read
+    └─ toolResult: README 内容
+       └─ assistant: edit
+          └─ toolResult: 已修改
+             └─ assistant: bash
+                └─ toolResult: tests pass ← leaf
+
+fork(entryId)   → 新分支
+compact()       → 追加摘要
+moveTo(entryId) → 切换当前位置</code></pre>
+  </div>
+  <div class="foot"><div>回退、分支和压缩共享同一个数据模型</div><div>session-manager.ts · harness/session</div></div>
+  <aside hidden><p>贯穿任务的每一步都可以进入会话树。这样下一次用户提问时，产品能够恢复完整上下文，而核心循环仍然只处理内存中的消息。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Projection · One Session, Many Consumers</div><div>19 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>执行逻辑只有一份，呈现方式可以很多</div>
+    <h2 class="h-xl" style="font-size:4.7vw" data-anim>同一事件流，四种入口</h2>
+    <p class="body-zh" style="margin:1.6vh 0 2vh;max-width:86vw" data-anim>贯穿任务中的 message_update、tool_execution_start 和 agent_end，不关心最终是画在终端、写到 stdout，还是发给另一个进程。</p>
+    <div>
+      <div class="rowline" data-anim><div class="k">Interactive</div><div class="v">TUI 把流式文本、工具状态和输入框渲染成交互终端。</div><div class="m">HUMAN</div></div>
+      <div class="rowline" data-anim><div class="k">Print / JSON</div><div class="v">单次执行后退出；文本模式只给最终答案，JSON 模式输出事件行。</div><div class="m">SCRIPT</div></div>
+      <div class="rowline" data-anim><div class="k">RPC</div><div class="v">通过 stdin/stdout 接收命令、发送事件，方便 IDE 或守护进程驱动。</div><div class="m">PROCESS</div></div>
+      <div class="rowline" data-anim><div class="k">SDK</div><div class="v">应用直接创建 AgentSession 并订阅事件；它是嵌入入口，不是第四个 CLI 消费器。</div><div class="m">EMBED</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>新增界面，不需要复制 Agent Loop</div><div>modes/* · core/sdk.ts</div></div>
+  <aside hidden><p>事件流是产品层的稳定契约。同一任务可以在人类界面、流水线或 IDE 中运行，而无需重写执行逻辑。</p></aside>
+</section>
+
+<section class="slide hero light">
+  <div class="chrome"><div>Act III · Extension and Safety</div><div>20 / 24</div></div>
+  <div class="frame" style="display:grid;gap:5vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>Act III</div>
+    <h1 class="h-hero" style="font-size:7.8vw;white-space:nowrap" data-anim>边界取舍</h1>
+    <p class="lead" style="max-width:68vw" data-anim>Pi 把核心做小，也把更多选择留给扩展作者和运行环境。理解收益时，必须同时理解代价。</p>
+  </div>
+  <div class="foot"><div>最小化不是免费午餐</div><div>TRADE-OFFS</div></div>
+  <aside hidden><p>最后一幕回答两个问题：能力怎么加进来，风险又由谁承担。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Extension · Typed Surface</div><div>21 / 24</div></div>
+  <div class="frame grid-2-7-5" style="padding-top:4.5vh">
+    <div>
+      <div class="kicker" data-anim>没有内置 MCP，不等于不能扩展</div>
+      <h2 class="h-xl" style="font-size:4.9vw" data-anim>ExtensionAPI</h2>
+      <p class="body-zh" style="margin-top:2vh" data-anim>扩展是运行在同一 TypeScript 进程里的模块。它可以订阅 33 个强类型事件，也可以把新能力注册进产品。</p>
+      <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">收益：类型直接、协议成本低。<br>代价：扩展拥有与 Pi 进程相同的权限。</div><div class="callout-src">SOURCE 7846534</div></div>
+    </div>
+    <div>
+      <div class="rowline" style="grid-template-columns:1fr 1.4fr" data-anim><div class="k">registerTool</div><div class="v">增加模型可调用的能力</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.4fr" data-anim><div class="k">registerCommand</div><div class="v">增加斜杠命令</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.4fr" data-anim><div class="k">registerShortcut</div><div class="v">增加交互快捷键</div></div>
+      <div class="rowline" style="grid-template-columns:1fr 1.4fr" data-anim><div class="k">registerFlag</div><div class="v">增加 CLI 配置参数</div></div>
+      <p class="body-zh" style="margin-top:2.2vh" data-anim>扩展也能在输入、模型调用、工具调用和会话生命周期等关键点介入。</p>
+    </div>
+  </div>
+  <div class="foot"><div>扩展性来自类型化钩子，不来自修改核心循环</div><div>core/extensions/types.ts</div></div>
+  <aside hidden><p>Pi 官方文档明确说明没有内置 MCP，但可以通过扩展增加 MCP 支持。这里是选择，不是能力缺失的同义词。</p></aside>
+</section>
+
+<section class="slide light">
+  <div class="chrome"><div>Security · Three Different Questions</div><div>22 / 24</div></div>
+  <div class="frame" style="padding-top:3.5vh">
+    <div class="kicker" data-anim>不要把“信任”误解成“沙箱”</div>
+    <h2 class="h-xl" style="font-size:4.8vw" data-anim>三层安全边界</h2>
+    <div style="margin-top:2.5vh">
+      <div class="rowline" data-anim><div class="k">Project Trust</div><div class="v">决定是否加载项目本地设置、资源、包和扩展；它防止仓库在启动阶段悄悄注入代码。</div><div class="m">LOAD</div></div>
+      <div class="rowline" data-anim><div class="k">Tool Permission</div><div class="v">Pi 不内置逐工具审批弹窗。开始工作后，工具拥有启动 Pi 的用户权限。</div><div class="m">ACT</div></div>
+      <div class="rowline" data-anim><div class="k">Sandbox</div><div class="v">容器、VM、微虚拟机或策略沙箱限制整个进程；真正隔离必须由操作系统或虚拟化边界提供。</div><div class="m">ISOLATE</div></div>
+    </div>
+    <div class="callout" style="margin-top:3vh" data-anim><div class="q-big">如果不能控制执行环境，就不要把“没有逐动作审批”机械照搬到自己的产品。</div><div class="callout-src">PROJECT TRUST IS NOT A SANDBOX</div></div>
+  </div>
+  <div class="foot"><div>安全模型的适用条件必须讲清楚</div><div>coding-agent/docs/security.md</div></div>
+  <aside hidden><p>项目级信任、逐工具权限和进程隔离回答的是三个不同问题。Pi 只内置第一层，并建议不受信工作使用外部隔离。</p></aside>
+</section>
+
+<section class="slide dark">
+  <div class="chrome"><div>Reading Guide · Five Source Anchors</div><div>23 / 24</div></div>
+  <div class="frame" style="padding-top:3vh">
+    <div class="kicker" data-anim>现在再打开源码，就不会迷路</div>
+    <h2 class="h-xl" style="font-size:4.6vw" data-anim>按执行顺序读五个入口</h2>
+    <div style="margin-top:1.5vh">
+      <div class="rowline" data-anim><div class="k">01 · types.ts</div><div class="v">先认识 Context、Tool、StreamFn 与十种 AgentEvent，建立共同词汇。</div><div class="m">CONTRACTS</div></div>
+      <div class="rowline" data-anim><div class="k">02 · agent-loop.ts</div><div class="v">追两层循环：问模型、找 Tool Call、执行工具、写回结果、判断停止。</div><div class="m">CONTROL FLOW</div></div>
+      <div class="rowline" data-anim><div class="k">03 · agent.ts</div><div class="v">看 Agent 怎样保存内存状态、暴露 prompt / continue，并把事件交给订阅者。</div><div class="m">RUNTIME</div></div>
+      <div class="rowline" data-anim><div class="k">04 · agent-session.ts</div><div class="v">看产品怎样展开输入、管理模型与扩展、触发压缩并编排核心 Agent。</div><div class="m">PRODUCT</div></div>
+      <div class="rowline" data-anim><div class="k">05 · session-manager.ts</div><div class="v">最后看历史怎样落盘，以及分支、恢复和摘要如何建立在追加树上。</div><div class="m">PERSISTENCE</div></div>
+    </div>
+  </div>
+  <div class="foot"><div>先追一条执行链，再横向看九个工作区单元</div><div>BEGINNER READING PATH</div></div>
+  <aside hidden><p>不要从 packages 目录逐文件扫。按一次任务的时间顺序读，理解成本会低很多。</p></aside>
+</section>
+
+<section class="slide hero dark" data-animate="quote">
+  <div class="chrome"><div>Closing · The Whole Journey</div><div>24 / 24</div></div>
+  <div class="frame" style="display:grid;gap:3.6vh;align-content:center;min-height:80vh">
+    <div class="kicker" data-anim>最后，把贯穿任务再走一遍</div>
+    <blockquote style="font-family:var(--serif-zh);font-weight:700;font-size:4.3vw;line-height:1.24;max-width:86vw">
+      <span data-anim="line" style="display:block">用户给目标，Session 准备上下文；</span>
+      <span data-anim="line" style="display:block">模型提议行动，Loop 调度工具；</span>
+      <span data-anim="line" style="display:block">结果写回历史，事件交给界面。</span>
+    </blockquote>
+    <p class="lead" style="max-width:72vw" data-anim>README 被修改、测试被运行，并不是因为模型拥有电脑，而是因为一组边界清楚的组件不断交换结构化消息。</p>
+    <div class="meta-row" data-anim><span>PREPARE</span><span>→</span><span>DECIDE</span><span>→</span><span>ACT</span><span>→</span><span>RECORD</span><span>→</span><span>PRESENT</span></div>
+  </div>
+  <div class="foot"><div>你现在已经知道 Pi Agent 怎样工作</div><div>END · Q&amp;A</div></div>
+  <aside hidden><p>最后不要只记住两层 while。真正值得带走的是角色之间的边界：模型不执行，工具不决策，循环不持久化，Session 不负责具体呈现。</p><p>这些边界让 Pi 的核心小而清楚，也让产品复杂性有明确归属。</p></aside>
 </section>
 
 </div>
