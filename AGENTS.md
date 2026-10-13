@@ -1,10 +1,12 @@
 # AGENTS.md
 
-本文件为 AI 驱动的书籍内容维护而写。动手修改前，请先阅读本文件，再对照 `book/style.css`、`book/common.js` 和任一现有章节（推荐 `book/ch01-architecture.html`）确认当前约定——它们是活文档。
+本文件为 AI 驱动的书籍与演讲稿维护而写。修改书籍前，对照 `book/style.css`、`book/common.js` 和任一现有章节（推荐 `book/ch01-architecture.html`）；修改演讲稿前，对照 `presentation/outline.md` 与 `presentation/index.html`。它们是各自产物的活文档。
 
 ## 项目概述
 
-这是一个技术书籍项目：《**Pi Agent 源码解析**》——对 [Pi Agent](https://pi.dev)（`@earendil-works/pi-coding-agent` 及其同族包，版本 `v0.83.0`）的源码分析笔记。
+这是一个以技术书籍《**Pi Agent 源码解析**》为主体的源码学习项目——分析 [Pi Agent](https://pi.dev)（`@earendil-works/pi-coding-agent` 及其同族包，版本 `v0.83.0`），并把同一套理解整理成可演讲的材料。
+
+本仓库同时维护一份《**Pi Agent 如何工作**》中文 HTML 演讲稿。当前工作的目标是让零基础读者无需现场补充，也能沿着一个真实任务理解 `AgentSession → Agent Loop → Model / Tool → Session` 的完整执行链；概念页负责建立地图，源码跟读页用真实代码、事件和状态变化验证地图。
 
 - 书籍以**零依赖 HTML** 直接编写：只有 `book/style.css` 与 `book/common.js` 两个共享文件，**禁止任何第三方 CSS / JS / 字体 / CDN**。
 - 无构建步骤。浏览器直接打开 `book/index.html`（file:// 协议即可）阅读全书。
@@ -16,11 +18,53 @@
 
 | 路径 | 职责 | 注意事项 |
 |---|---|---|
-| `book/` | 书籍全部内容：`index.html`（序言）、`ch01–ch17` 章节、`style.css`、`common.js` | 本项目唯一需要维护的产物 |
+| `book/` | 书籍全部内容：`index.html`（序言）、`ch01–ch17` 章节、`style.css`、`common.js` | 书籍内容的唯一维护目录 |
 | `book/en/` | 英文版：与 `book/` 一一对应的 `index.html` + `ch01–ch17`，同框架、英文内容 | 修改正文时必须同步（见「双语维护」） |
+| `presentation/` | 中文单 HTML 演讲稿：`index.html`、`outline.md`、本地 Motion fallback | 无构建步骤；源码跟读与浏览器验证规则见下节 |
 | `pi-agent-src/` | git submodule，指向 https://github.com/earendil-works/pi.git | **分析对象，只读，禁止修改** |
 | `.github/workflows/deploy.yml` | GitHub Pages 静态部署 + 资源 cache-bust | 直接部署 `book/` 下的 HTML（含 `book/en/`），无需构建 |
 | `.tmp/` | 临时与参照资料（git-ignored） | 不要提交 |
+
+## HTML 演讲稿：正在维护什么
+
+演讲稿入口是 `presentation/index.html`，大纲与页序的单一说明在 `presentation/outline.md`。当前成品为 30 页，贯穿任务是「请在 README 增加安装说明，然后运行测试」，第 20–25 页采用源码跟读模式。
+
+源码主线固定按行为顺序讲解：
+
+```text
+AgentSession.prompt()
+→ Agent.prompt()
+→ runPromptMessages()
+→ runAgentLoop()
+→ runLoop()
+→ streamAssistantResponse() / executeToolCalls()
+→ message_end
+→ SessionManager.appendMessage()
+```
+
+维护演讲稿时遵循这些规则：
+
+- 面向零基础读者，概念首次出现时先用生活语言说明，再给类型名或函数名；每页必须在脱离讲者备注后仍可读懂。
+- 源码页同步展示「调用链位置、源码片段、事件或日志、状态变化、下一跳」。只保留解释当前行为所需的关键行，省略处标注 `SOURCE EXCERPT · … = ELIDED`。
+- 所有路径、函数名、字段名和行为描述先在 `pi-agent-src/` 当前提交中核实；源码行号会随上游变化，不能从旧记录直接照抄。
+- `Agent`、`AgentSession` 与 `SessionManager` 是不同层：实时循环、产品编排、持久化历史不得混为同义词。
+- 每页保留一个 `<aside hidden>` 讲者备注；新增或删除页面时同步更新 `outline.md`、所有 `NN / TOTAL` 页码和导航总数。
+- 保持现有靛蓝瓷主题、明暗节奏和既有 CSS 组件。代码页优先保证 1280×720 可读，不靠缩小字号硬塞全文。
+- `presentation/assets/motion.min.js` 是离线动效 fallback；Lucide 等可选 CDN 依赖必须安全降级，断网不能影响阅读或产生未捕获异常。
+
+演讲稿没有构建步骤。直接打开：
+
+```bash
+open presentation/index.html
+```
+
+交付前完成以下验证：
+
+1. `presentation/index.html` 的 slide、`aside hidden`、导航圆点和 `outline.md` 页数一致，页码从 01 连续到总页数。
+2. 在 1280×720 与 1440×810 检查所有页面，特别关注中文换行、代码字号、页脚和底部导航遮挡。
+3. 验证右箭头翻页、ESC 索引、N 讲稿；索引卡片和导航圆点数量等于 slide 数量。
+4. 阻断外部字体、Lucide 与 CDN fallback 后，页面内容仍可见且浏览器 console 无未捕获异常。
+5. 运行 `git diff --check`，并只暂存 `presentation/index.html`、`presentation/outline.md` 或本次明确修改的资源。
 
 ## 书籍结构与元数据
 
@@ -139,12 +183,12 @@ PB.fig("fig-name", function (d) { … });
 - 版本声明：分析基于 `v0.83.0`。若升级 submodule 的分析版本，需同步检查 `index.html` 的版本表述与各章过时内容。
 - 章节收尾固定「实践应用 + 总结」两节，总结段末尾要写一句引向下一章的过渡。
 
-## 零依赖铁律
+## 书籍：零依赖铁律
 
-- 只允许使用 `style.css` 与 `common.js`。禁止引入任何第三方 CSS / JS / 字体 / 图标库 / CDN 链接 / 构建工具。
-- 所有内容就地以 HTML 编写；没有构建步骤，改动即生效。
+- `book/` 只允许使用 `style.css` 与 `common.js`。禁止为书籍引入任何第三方 CSS / JS / 字体 / 图标库 / CDN 链接 / 构建工具。
+- 书籍内容就地以 HTML 编写；没有构建步骤，改动即生效。
 
-## 双语维护（zh ↔ en）
+## 书籍：双语维护（zh ↔ en）
 
 本书有中英双版本：`book/`（中文）与 `book/en/`（英文，部署后位于 `/en/...`）。页面框架（`style.css`、`common.js`）为两版共享，改一次即同时生效；正文与元数据则有两份，必须同步。
 
@@ -157,7 +201,7 @@ PB.fig("fig-name", function (d) { … });
 - 语言切换按钮组（页头「中文 | English」）与 README 顶部的 `[ **中文** | [English](README.en.md) ]` 由 `common.js` 与两个 README 各自维护，**不要**在章节 HTML 里手写切换链接。
 - README 修改必须同步 `README.md` 与 `README.en.md`，两版顶部的语言切换行都要保留，互链指向对方版本。
 
-## 修改后验证
+## 书籍修改后验证
 
 在浏览器中打开 `book/index.html`（file:// 即可），逐页检查：
 
@@ -178,11 +222,12 @@ PB.fig("fig-name", function (d) { … });
 - 提交信息风格：小写、简短、祈使句，如 `migrate book to zero-dependency html`。
 - 只暂存明确的路径（`git add <path1> <path2>`）；**绝不**使用 `git add -A` / `git add .`。
 - `pi-agent-src` 是 submodule，由上游管理，不要在其中提交，也不要改动其指针；`.tmp/` 已被 `.gitignore` 忽略，不要提交。
+- `docs/` 下的内部实施计划不是默认交付物；除非用户明确要求，不要暂存或发布。
 
 ## 给 AI 维护者的事项清单
 
 - **事实性内容**（路径、函数名、行为描述、版本号）改动前必须对照 `pi-agent-src/` 源码核实。
-- **任何内容改动都要中英文两版同步**（见「双语维护」）；漏改英文版视为未完成。
+- **任何书籍内容改动都要中英文两版同步**（见「书籍：双语维护」）；漏改英文版视为未完成。
 - 改书籍元数据（标题、顺序、部分划分）只动 `common.js` 的 `BOOKS.zh.chapters` 与 `BOOKS.en.chapters`。
 - 新增章节：复制现有章节骨架 → 写正文 → 注册进 `BOOKS.zh.chapters` 与 `BOOKS.en.chapters` → 在 `book/en/` 同步英文版 → 浏览器验证（或跑 `.tmp/verify/` 的脚本）。
 - 不要向 `pi-agent-src/` 写入任何内容；不要改动上游仓库。
