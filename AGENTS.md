@@ -1,12 +1,12 @@
 # AGENTS.md
 
-本文件为 AI 驱动的书籍与演讲稿维护而写。修改书籍前，对照 `book/style.css`、`book/common.js` 和任一现有章节（推荐 `book/ch01-architecture.html`）；修改演讲稿前，对照 `presentation/outline.md` 与 `presentation/index.html`。它们是各自产物的活文档。
+本文件为 AI 驱动的书籍与演讲稿维护而写。修改书籍前，对照 `book/style.css`、`book/common.js` 和任一现有章节（推荐 `book/ch01-architecture.html`）；修改旧 HTML 演讲稿前，对照 `presentation/outline.md` 与 `presentation/index.html`；继续简洁版 PPT 或代码跟读时，先读 `presentation/practical/outline.md`，再读目标实现文件。
 
 ## 项目概述
 
 这是一个以技术书籍《**Pi Agent 源码解析**》为主体的源码学习项目——分析 [Pi Agent](https://pi.dev)（`@earendil-works/pi-coding-agent` 及其同族包，版本 `v0.83.0`），并把同一套理解整理成可演讲的材料。
 
-本仓库同时维护一份《**Pi Agent 如何工作**》中文 HTML 演讲稿。当前工作的目标是让零基础读者无需现场补充，也能沿着一个真实任务理解 `AgentSession → Agent Loop → Model / Tool → Session` 的完整执行链；概念页负责建立地图，源码跟读页用真实代码、事件和状态变化验证地图。
+本仓库保留《**Pi Agent 如何工作**》中文 HTML 演讲稿，并新增《**从一次 API 调用，到一个能干活的 Agent**》简洁 Slidev 分享与代码执行回放。当前优先维护简洁版：先讲模型 API 的请求与工具结果回传，再搭最小 harness，最后沿 Pi 真实代码执行顺序理解循环与上下文。
 
 - 书籍以**零依赖 HTML** 直接编写：只有 `book/style.css` 与 `book/common.js` 两个共享文件，**禁止任何第三方 CSS / JS / 字体 / CDN**。
 - 无构建步骤。浏览器直接打开 `book/index.html`（file:// 协议即可）阅读全书。
@@ -21,11 +21,42 @@
 | `book/` | 书籍全部内容：`index.html`（序言）、`ch01–ch17` 章节、`style.css`、`common.js` | 书籍内容的唯一维护目录 |
 | `book/en/` | 英文版：与 `book/` 一一对应的 `index.html` + `ch01–ch17`，同框架、英文内容 | 修改正文时必须同步（见「双语维护」） |
 | `presentation/` | 中文单 HTML 演讲稿：`index.html`、`outline.md`、本地 Motion fallback | 无构建步骤；源码跟读与浏览器验证规则见下节 |
+| `presentation/practical/` | 当前简洁 Slidev 分享、两份可运行演示、单步代码跟读页 | 独立 pnpm 工程，端口 3032；先读该目录 `outline.md` |
+| `presentation/research-practical-sharing.md` | 改版的一手调研、版本差异与证据边界 | 引用外部经验或比较版本时读取 |
 | `pi-agent-src/` | git submodule，指向 https://github.com/earendil-works/pi.git | **分析对象，只读，禁止修改** |
 | `.github/workflows/deploy.yml` | GitHub Pages 静态部署 + 资源 cache-bust | 直接部署 `book/` 下的 HTML（含 `book/en/`），无需构建 |
 | `.tmp/` | 临时与参照资料（git-ignored） | 不要提交 |
 
-## HTML 演讲稿：正在维护什么
+## 最近交付：简洁分享与代码执行回放（2026-10-22）
+
+用户反馈：旧稿装饰较多，读完仍难理解。主要知识断点是模型 API 如何工作、怎样写 harness、上下文由谁管理；用户习惯先跑一次，再顺着代码流向看一遍。
+
+- `presentation/practical/slides.md`：21 页中文 Slidev，逐页 Markdown 讲者备注；深色、绿色强调、无动画。第 9 页链接到代码跟读页。简洁版独立维护，保留旧稿。
+- `minimal-harness.mjs`：按 Anthropic Messages 格式展示两次请求，默认模型响应预设、真实读取 fixture。`--live` 分支需用户自己的环境配置，本次未调用或验证在线模型。
+- `demo.mjs`：从固定源码提取 `runLoop`、`executePreparedToolCall`，只移除 TypeScript 类型并补齐行号；模型、流式与工具批次使用教学适配器，临时目录内的文件修改和测试真实执行。
+- `pnpm demo:trace`：用 Node 内置 inspector/V8 在原函数上捕获 21 个断点快照，生成 `public/walkthrough.html`。没有向上游源码插入记录语句。
+- `walkthrough.template.html` 是跟读页实现源；`public/walkthrough.html` 是需要随源码提交的自包含学习成品。改模板或采样逻辑后重新运行 `pnpm demo:trace`，两者同步提交。
+- 跟读页显示源码行高亮、内部 messages、最近模型输出/工具结果、文件变化和下一观察点；支持方向键、跳到失败、下一次模型调用和从头看。明确称为**执行记录回放**，不是正在运行的在线模型或完整 Pi 产品调试器。
+
+从本仓库根目录启动：
+
+```bash
+cd presentation/practical
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+PPT：`http://localhost:3032/`；跟读页：`http://localhost:3032/walkthrough.html`；演讲者备注：`http://localhost:3032/presenter/1?password=local`。也提供 `启动简洁版.command`。本地服务关闭后，需重新启动才能访问 localhost。
+
+验证：运行 `node minimal-harness.mjs`、`node demo.mjs`、`pnpm demo:trace` 和 `pnpm build`；浏览器核对断点顺序、错误结果进入上下文、修复前后文件与键盘/按钮导航。当前预设任务应产生 5 次模型请求、4 次工具执行、1 次工具异常、21 个观察点，最终 10 条消息。完整日志和原始 trace 放在 `.tmp/`；构建输出为 `.tmp/practical-dist`。
+
+源码基线为 `784653468c42387f607d41ed5ca533100e7eb2fe`（`v0.83.0-91-g784653468`，包字段 `0.83.0`），脚本会检查提交号。引用当前上游能力时重新核实，早期文章的“无 MCP”等表述不能作为今天产品功能清单。详细执行边界和验证记录见 `presentation/practical/outline.md`。
+
+验证尺寸以浏览器实际 `innerWidth/innerHeight` 为准：已核对 1280×720；工具请求其他尺寸但实际未变化时，不记为跨尺寸通过。file:// 打开本轮受浏览器策略限制，已验证入口为 localhost。
+
+现有 GitHub Pages 工作流只发布 `book/`。推送简洁版源码不等于已部署新的在线演示站点。2026-10-22 用户明确要求“提交所有文件并 push”，因此一并保存当前 `docs/` 规划记录；历史计划描述过去的方案，当前维护方式以本节和 `practical/outline.md` 为准。
+
+## 旧 HTML 演讲稿：保留版本
 
 演讲稿入口是 `presentation/index.html`，大纲与页序的单一说明在 `presentation/outline.md`。当前成品为 30 页，贯穿任务是「请在 README 增加安装说明，然后运行测试」，第 20–25 页采用源码跟读模式。
 

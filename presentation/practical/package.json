@@ -1,0 +1,16 @@
+{
+  "name": "pi-practical-source-sharing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "slidev --remote=local --bind 127.0.0.1 --port 3032",
+    "build": "slidev build --out ../../.tmp/practical-dist",
+    "export": "slidev export --format pdf --output ../../.tmp/pi-practical.pdf",
+    "demo": "node demo.mjs",
+    "demo:trace": "node demo.mjs --walkthrough"
+  },
+  "dependencies": {
+    "@slidev/cli": "^52.3.0",
+    "@slidev/theme-default": "^0.25.0"
+  }
+}
