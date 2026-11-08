@@ -1,0 +1,27 @@
+这一章讲模型切换。直觉上，Agent Loop 好像应该直接调用 OpenAI SDK。但这样一来，核心循环会被某一家模型厂商的消息格式绑住。
+
+换到 Anthropic、Google 或 OpenRouter 时，流式事件、工具调用格式、图片、缓存和 thinking 字段都会渗进 Loop。
+
+Pi 的做法是把这些差异放到 pi-ai。Agent Loop 只依赖一个 StreamFn：输入 model、Context 和 options，返回统一的 assistant event stream。
+
+streamAssistantResponse 默认调用 streamSimple。streamSimple 根据 model.api 找到注册的 Provider，再调用 Provider 自己的 streamSimple。
+
+对 Agent Loop 来说，重要的是统一事件：start、text delta、thinking delta、toolcall delta、done 和 error。
+
+底层到底是 SSE、SDK 对象还是别的协议，不应该改变 Loop 的主控制流。这就是依赖倒置。
+
+但统一不等于没有差异。Provider 层要处理 tool call id、thinking signature、cache control、图片格式、重试和认证。
+
+测试里会有很多看似琐碎的兼容用例。它们存在的原因是：把复杂性集中在边界层，上层循环才能保持稳定。
+
+API Key 也不是只在 Agent 创建时读取一次。每次模型请求前都可以动态解析。长任务运行到下一轮时，OAuth token 可能已经变了。
+
+一次 Provider 请求发送的也不是最后一句用户消息。它包含 system prompt、转换后的 messages 和工具定义。
+
+messages 里可能有之前的 assistant tool call，也有对应的 ToolResult。模型知道测试失败，是因为 Bash 输出已经进入了 Context。
+
+工具定义告诉模型有哪些能力和参数结构。模型输出 tool call 时，必须引用这些工具名。
+
+所以 Agent 的能力不是模型记住外部世界，而是 Runtime 持续把新的环境证据投影进 Context。
+
+模型可以切换，是因为 Loop 依赖稳定抽象；模型能继续做事，是因为每一轮请求都带着不断增长的证据链。

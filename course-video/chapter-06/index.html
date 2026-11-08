@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script src="timing-data.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #0b0e14; }
+      #chapter-06 {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        color: #f1f4f8;
+        background: #0b0e14;
+        font-family: Arial, sans-serif;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        padding: 78px 104px 128px;
+        display: flex;
+        flex-direction: column;
+        gap: 34px;
+        background:
+          radial-gradient(circle at 18% 16%, rgba(76, 141, 255, .16), transparent 34%),
+          radial-gradient(circle at 86% 26%, rgba(155, 124, 255, .12), transparent 32%),
+          #0b0e14;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .grid {
+        position: absolute;
+        inset: 0;
+        opacity: .2;
+        background-image: linear-gradient(rgba(169,178,195,.18) 1px, transparent 1px), linear-gradient(90deg, rgba(169,178,195,.18) 1px, transparent 1px);
+        background-size: 64px 64px;
+        mask-image: radial-gradient(circle at center, black, transparent 78%);
+      }
+      .glow {
+        position: absolute;
+        width: 560px;
+        height: 560px;
+        right: -120px;
+        top: -120px;
+        border-radius: 50%;
+        background: rgba(76,141,255,.16);
+        filter: blur(18px);
+      }
+      .topline, .footer {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #a9b2c3;
+        font: 22px "JetBrains Mono", monospace;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .body {
+        position: relative;
+        z-index: 2;
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1.08fr .92fr;
+        gap: 42px;
+        min-height: 0;
+      }
+      .panel {
+        border: 1px solid rgba(169, 178, 195, .18);
+        background: rgba(20, 25, 35, .9);
+        border-radius: 30px;
+        padding: 42px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+        min-height: 0;
+      }
+      .copy {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 28px;
+      }
+      .eyebrow, .code-title {
+        color: #4c8dff;
+        font: 24px "JetBrains Mono", monospace;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 88px;
+        line-height: 1.02;
+        letter-spacing: -0.055em;
+      }
+      p {
+        margin: 0;
+        color: #c6cedb;
+        font-size: 36px;
+        line-height: 1.38;
+      }
+      .evidence {
+        display: flex;
+        flex-direction: column;
+        gap: 28px;
+        font-family: "JetBrains Mono", monospace;
+      }
+      pre {
+        flex: 1;
+        margin: 0;
+        padding: 34px;
+        border-radius: 24px;
+        color: #f1f4f8;
+        background: rgba(11,14,20,.84);
+        border: 1px solid rgba(255,255,255,.08);
+        font-size: 38px;
+        line-height: 1.42;
+        white-space: pre-wrap;
+        display: flex;
+        align-items: center;
+      }
+      .chips {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      .chip {
+        padding: 20px 22px;
+        border-radius: 18px;
+        color: #dce5f2;
+        background: rgba(76,141,255,.12);
+        border: 1px solid rgba(76,141,255,.26);
+        font-size: 25px;
+      }
+      #captions {
+        position: absolute;
+        left: 190px;
+        right: 190px;
+        bottom: 120px;
+        z-index: 8;
+        display: flex;
+        justify-content: center;
+        pointer-events: none;
+      }
+      .caption {
+        position: absolute;
+        visibility: hidden;
+        opacity: 0;
+        max-width: 1380px;
+        padding: 18px 28px;
+        color: #f1f4f8;
+        background: rgba(11,14,20,.78);
+        border: 1px solid rgba(169,178,195,.22);
+        border-radius: 18px;
+        font-size: 34px;
+        line-height: 1.28;
+        text-align: center;
+        box-shadow: 0 18px 50px rgba(0,0,0,.32);
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-1kh9" id="chapter-06" data-composition-id="chapter-06" data-width="1920" data-height="1080" data-start="0" data-duration="378" data-track-index="0">
+      <section data-hf-id="hf-mcnq" class="scene" id="s1">
+        <div data-hf-id="hf-kxq8" class="grid"></div>
+        <div data-hf-id="hf-2s7n" class="glow"></div>
+        <div data-hf-id="hf-o5lv" class="topline"><span data-hf-id="hf-lups">CHAPTER 06</span><span data-hf-id="hf-51sb">01 / 06</span></div>
+        <div data-hf-id="hf-2t3w" class="body">
+          <div data-hf-id="hf-8f31" class="panel copy">
+            <div data-hf-id="hf-pznc" class="eyebrow">SOURCE READING</div>
+            <h1 data-hf-id="hf-df7a">不绑定 SDK</h1>
+            <p data-hf-id="hf-kojh">Agent Loop 不直接依赖某一家 SDK</p>
+          </div>
+          <div data-hf-id="hf-wo6h" class="panel evidence">
+            <div data-hf-id="hf-45mt" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-2i6e">dependency inversion</pre>
+            <div data-hf-id="hf-exrd" class="chips"><div data-hf-id="hf-czwv" class="chip">Agent Loop</div><div data-hf-id="hf-omsi" class="chip">StreamFn</div><div data-hf-id="hf-wqsr" class="chip">Provider</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-yh7l" class="footer"><span data-hf-id="hf-zvil">为什么 Pi 可以切换模型</span><span data-hf-id="hf-ed4i">Provider 抽象与统一事件</span></div>
+      </section>
+<section data-hf-id="hf-iejp" class="scene" id="s2">
+        <div data-hf-id="hf-6qwo" class="grid"></div>
+        <div data-hf-id="hf-x5mb" class="glow"></div>
+        <div data-hf-id="hf-pz6r" class="topline"><span data-hf-id="hf-0qew">CHAPTER 06</span><span data-hf-id="hf-ui0s">02 / 06</span></div>
+        <div data-hf-id="hf-6g9g" class="body">
+          <div data-hf-id="hf-xm5t" class="panel copy">
+            <div data-hf-id="hf-nas2" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-xook">统一事件</h1>
+            <p data-hf-id="hf-hl2s">Provider 差异收敛成同一组事件</p>
+          </div>
+          <div data-hf-id="hf-qkwt" class="panel evidence">
+            <div data-hf-id="hf-11i1" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-ohxn">AssistantMessageEventStream</pre>
+            <div data-hf-id="hf-4dp9" class="chips"><div data-hf-id="hf-wo1q" class="chip">start</div><div data-hf-id="hf-n5lr" class="chip">text delta</div><div data-hf-id="hf-fzfi" class="chip">toolcall delta</div><div data-hf-id="hf-rnme" class="chip">done</div><div data-hf-id="hf-jkfs" class="chip">error</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ll85" class="footer"><span data-hf-id="hf-mbnl">为什么 Pi 可以切换模型</span><span data-hf-id="hf-1yuu">Provider 抽象与统一事件</span></div>
+      </section>
+<section data-hf-id="hf-hmvw" class="scene" id="s3">
+        <div data-hf-id="hf-5jzl" class="grid"></div>
+        <div data-hf-id="hf-wrba" class="glow"></div>
+        <div data-hf-id="hf-pkvq" class="topline"><span data-hf-id="hf-zjht">CHAPTER 06</span><span data-hf-id="hf-si15">03 / 06</span></div>
+        <div data-hf-id="hf-59cd" class="body">
+          <div data-hf-id="hf-yt2w" class="panel copy">
+            <div data-hf-id="hf-zsly" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-p1w9">Registry</h1>
+            <p data-hf-id="hf-ojrd">model.api 决定使用哪个 Provider</p>
+          </div>
+          <div data-hf-id="hf-rrtw" class="panel evidence">
+            <div data-hf-id="hf-28f4" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-5zad">api registry</pre>
+            <div data-hf-id="hf-5kmc" class="chips"><div data-hf-id="hf-3k9o" class="chip">OpenAI</div><div data-hf-id="hf-edl2" class="chip">Anthropic</div><div data-hf-id="hf-nwit" class="chip">Google</div><div data-hf-id="hf-fclr" class="chip">OpenRouter</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ms58" class="footer"><span data-hf-id="hf-niko">为什么 Pi 可以切换模型</span><span data-hf-id="hf-2d5v">Provider 抽象与统一事件</span></div>
+      </section>
+<section data-hf-id="hf-54df" class="scene" id="s4">
+        <div data-hf-id="hf-5yam" class="grid"></div>
+        <div data-hf-id="hf-wd09" class="glow"></div>
+        <div data-hf-id="hf-p6kp" class="topline"><span data-hf-id="hf-zxsu">CHAPTER 06</span><span data-hf-id="hf-xz5e">04 / 06</span></div>
+        <div data-hf-id="hf-5nne" class="body">
+          <div data-hf-id="hf-yerv" class="panel copy">
+            <div data-hf-id="hf-06wz" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-px6o">差异集中管理</h1>
+            <p data-hf-id="hf-ix0n">统一层不消灭差异，只移动差异</p>
+          </div>
+          <div data-hf-id="hf-rdiv" class="panel evidence">
+            <div data-hf-id="hf-1u43" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-ll6d">provider complexity</pre>
+            <div data-hf-id="hf-56bb" class="chips"><div data-hf-id="hf-yyte" class="chip">tool IDs</div><div data-hf-id="hf-m0ym" class="chip">thinking</div><div data-hf-id="hf-pnho" class="chip">cache</div><div data-hf-id="hf-vzxs" class="chip">images</div><div data-hf-id="hf-40as" class="chip">auth</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-mdu7" class="footer"><span data-hf-id="hf-n49n">为什么 Pi 可以切换模型</span><span data-hf-id="hf-2rgw">Provider 抽象与统一事件</span></div>
+      </section>
+<section data-hf-id="hf-yynm" class="scene" id="s5">
+        <div data-hf-id="hf-4rdj" class="grid"></div>
+        <div data-hf-id="hf-vyp8" class="glow"></div>
+        <div data-hf-id="hf-os9o" class="topline"><span data-hf-id="hf-yqvr">CHAPTER 06</span><span data-hf-id="hf-lp8f">05 / 06</span></div>
+        <div data-hf-id="hf-7n6j" class="body">
+          <div data-hf-id="hf-wf8q" class="panel copy">
+            <div data-hf-id="hf-0l80" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-w1sw">请求里有什么</h1>
+            <p data-hf-id="hf-3lf6">不是只发最后一句话</p>
+          </div>
+          <div data-hf-id="hf-skfy" class="panel evidence">
+            <div data-hf-id="hf-zuky" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-zhw6">Context projection</pre>
+            <div data-hf-id="hf-6d8e" class="chips"><div data-hf-id="hf-vne7" class="chip">system</div><div data-hf-id="hf-q7y2" class="chip">messages</div><div data-hf-id="hf-2cxt" class="chip">tools</div><div data-hf-id="hf-6v7a" class="chip">tool results</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-nkra" class="footer"><span data-hf-id="hf-l4qi">为什么 Pi 可以切换模型</span><span data-hf-id="hf-zzbp">Provider 抽象与统一事件</span></div>
+      </section>
+<section data-hf-id="hf-v0jl" class="scene" id="s6">
+        <div data-hf-id="hf-55ok" class="grid"></div>
+        <div data-hf-id="hf-vke7" class="glow"></div>
+        <div data-hf-id="hf-odyn" class="topline"><span data-hf-id="hf-z56s">CHAPTER 06</span><span data-hf-id="hf-axi8">06 / 06</span></div>
+        <div data-hf-id="hf-81hk" class="body">
+          <div data-hf-id="hf-w0xp" class="panel copy">
+            <div data-hf-id="hf-xt2t" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-8yx3">本章记忆点</h1>
+            <p data-hf-id="hf-u811">切模型靠抽象，继续行动靠证据链</p>
+          </div>
+          <div data-hf-id="hf-s64x" class="panel evidence">
+            <div data-hf-id="hf-zg9x" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-h3xf">model != runtime</pre>
+            <div data-hf-id="hf-5yxd" class="chips"><div data-hf-id="hf-71fd" class="chip">stable loop</div><div data-hf-id="hf-2y34" class="chip">provider adapter</div><div data-hf-id="hf-wy2c" class="chip">growing context</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-n6g9" class="footer"><span data-hf-id="hf-kqfh">为什么 Pi 可以切换模型</span><span data-hf-id="hf-0dmq">Provider 抽象与统一事件</span></div>
+      </section>
+      <audio data-hf-id="hf-5egm" id="narration" data-start="0" data-duration="375.948" data-track-index="20" src="narration.wav" data-volume="1"></audio>
+      <div data-hf-id="hf-iuvo" id="captions"></div>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = window.CHAPTER_DATA.scenes;
+      const sceneSelectors = starts.map((_, index) => "#s" + (index + 1));
+
+      sceneSelectors.forEach((selector, index) => {
+        const t = starts[index] ?? 0;
+        const scene = document.querySelector(selector);
+        const content = scene.querySelectorAll(".topline, .copy, .evidence, .footer");
+        if (index > 0) tl.set(selector, { opacity: 1, x: 0 }, Math.max(0, t - .45));
+        tl.from(scene.querySelector(".grid"), { opacity: 0, x: index % 2 ? 24 : -24, duration: .75, ease: "sine.out" }, t + .1);
+        tl.from(scene.querySelector(".glow"), { opacity: 0, scale: .82, duration: .9, ease: "power2.out" }, t + .12);
+        tl.from(content, { opacity: 0, y: 28, scale: .988, duration: .58, stagger: .06, ease: "power3.out" }, t + .2);
+        if (index < sceneSelectors.length - 1) {
+          const next = starts[index + 1] ?? t + 12;
+          tl.to(selector, { x: -90, opacity: 0, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+          tl.fromTo(sceneSelectors[index + 1], { x: 90, opacity: 0 }, { x: 0, opacity: 1, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+        }
+      });
+
+      const captionHost = document.getElementById("captions");
+      window.CHAPTER_DATA.captions.forEach((group, index) => {
+        const element = document.createElement("div");
+        element.className = "caption";
+        element.id = "caption-" + index;
+        element.textContent = group.text;
+        captionHost.appendChild(element);
+        const visibleStart = group.start + .02;
+        const visibleEnd = Math.max(visibleStart + .2, group.end - .04);
+        tl.set(element, { visibility: "visible", opacity: 0 }, visibleStart);
+        tl.fromTo(element, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: .16, ease: "power3.out" }, visibleStart);
+        tl.to(element, { opacity: 0, duration: .1, ease: "power2.in" }, Math.max(visibleStart + .2, visibleEnd - .1));
+        tl.set(element, { opacity: 0, visibility: "hidden" }, visibleEnd);
+      });
+
+      tl.to(".scene:last-of-type .body, .scene:last-of-type .topline, .scene:last-of-type .footer", { opacity: 0, duration: .8, ease: "sine.inOut" }, Math.max(0, window.CHAPTER_DATA.duration - 1.5));
+      window.__timelines["chapter-06"] = tl;
+    </script>
+  </body>
+</html>

@@ -262,3 +262,8 @@ PB.fig("fig-name", function (d) { … });
 - 改书籍元数据（标题、顺序、部分划分）只动 `common.js` 的 `BOOKS.zh.chapters` 与 `BOOKS.en.chapters`。
 - 新增章节：复制现有章节骨架 → 写正文 → 注册进 `BOOKS.zh.chapters` 与 `BOOKS.en.chapters` → 在 `book/en/` 同步英文版 → 浏览器验证（或跑 `.tmp/verify/` 的脚本）。
 - 不要向 `pi-agent-src/` 写入任何内容；不要改动上游仓库。
+
+## ForNextJob 材料迁入（2026-10-24）
+
+当前短分享仍以 `presentation/practical/outline.md` 为入口。长课视频在 `course-video/`；旧学习材料、React 网页和 0.78.1 源码在 `archive/pi-agent-study/`。维护这些分支前读各自 README 和 `research/2026-10-24-fornextjob-migration.md`。
+旧源码 `archive/pi-agent-study/pi/` 与只读子模块 `pi-agent-src/` 是两个版本，分别遵循各自 AGENTS.md。迁移保留了旧源码中的既有本地改动。引用旧证据时带上版本，吸收至当前分享前重新核对。

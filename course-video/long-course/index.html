@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1920, height=1080">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #0B0E14;
+        color: #F1F4F8;
+        font-family: Arial, sans-serif;
+      }
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: #0B0E14;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 72px 104px 66px;
+        overflow: hidden;
+        background-color: #0B0E14;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .grid {
+        position: absolute;
+        inset: -60px;
+        opacity: .2;
+        background-image:
+          linear-gradient(rgba(76,141,255,.14) 1px, rgba(11,14,20,0) 1px),
+          linear-gradient(90deg, rgba(76,141,255,.14) 1px, rgba(11,14,20,0) 1px);
+        background-size: 92px 92px;
+        mask-image: linear-gradient(to bottom, rgba(0,0,0,.92), rgba(0,0,0,.12));
+      }
+      .glow {
+        position: absolute;
+        width: 780px;
+        height: 780px;
+        right: -250px;
+        top: -300px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(76,141,255,.21), rgba(76,141,255,0) 68%);
+      }
+      .ghost {
+        position: absolute;
+        right: -36px;
+        bottom: -65px;
+        color: rgba(76,141,255,.055);
+        font: 900 250px/1 "JetBrains Mono", monospace;
+        letter-spacing: -.08em;
+      }
+      .topline, .footer {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font: 700 18px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .055em;
+      }
+      .topline { color: #A9B2C3; }
+      .footer { color: #758197; font-size: 17px; }
+      .chapter { color: #4C8DFF; }
+      .scene-body {
+        position: relative;
+        z-index: 4;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        min-height: 0;
+      }
+      h1, h2, h3, p { margin: 0; }
+      h1 {
+        max-width: 1500px;
+        font-size: 108px;
+        line-height: 1.06;
+        letter-spacing: -.045em;
+        font-weight: 900;
+      }
+      h2 {
+        max-width: 1540px;
+        font-size: 68px;
+        line-height: 1.16;
+        letter-spacing: -.035em;
+        font-weight: 900;
+      }
+      h3 { font-size: 31px; line-height: 1.25; }
+      .eyebrow {
+        margin-bottom: 22px;
+        color: #4C8DFF;
+        font: 700 22px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .075em;
+      }
+      .lead {
+        max-width: 1280px;
+        margin-top: 26px;
+        color: #A9B2C3;
+        font-size: 29px;
+        line-height: 1.56;
+        font-weight: 350;
+      }
+      .accent { color: #4C8DFF; }
+      .success { color: #58C792; }
+      .failure { color: #FF6B74; }
+      .mono {
+        font-family: "JetBrains Mono", monospace;
+        font-variant-ligatures: none;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        width: max-content;
+        padding: 9px 13px;
+        border: 1px solid #4C8DFF;
+        color: #4C8DFF;
+        font: 700 16px/1 "JetBrains Mono", monospace;
+        letter-spacing: .08em;
+      }
+      .badge.real {
+        border-color: #58C792;
+        color: #58C792;
+      }
+      .progress {
+        width: 400px;
+        height: 3px;
+        background: #28303D;
+      }
+      .progress i {
+        display: block;
+        height: 100%;
+        background: #4C8DFF;
+      }
+      .failure-layout {
+        display: grid;
+        grid-template-columns: 1.12fr .88fr;
+        gap: 52px;
+        align-items: center;
+      }
+      .terminal {
+        min-height: 520px;
+        padding: 32px 34px;
+        background: #10151E;
+        border: 1px solid #303A4B;
+        box-shadow: 0 28px 90px rgba(0,0,0,.34);
+      }
+      .terminal-bar {
+        display: flex;
+        gap: 9px;
+        margin-bottom: 28px;
+      }
+      .terminal-bar i {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #303A4B;
+      }
+      .terminal pre {
+        margin: 0;
+        color: #C5CDDA;
+        font: 22px/1.68 "JetBrains Mono", monospace;
+        white-space: pre-wrap;
+      }
+      .error-number {
+        margin-top: 30px;
+        color: #FF6B74;
+        font: 900 78px/1 "JetBrains Mono", monospace;
+        letter-spacing: -.06em;
+      }
+      .timeline {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 12px;
+        margin-top: 46px;
+      }
+      .phase {
+        position: relative;
+        min-height: 230px;
+        padding: 24px 18px;
+        border: 1px solid #303A4B;
+        background: #141923;
+      }
+      .phase:not(:last-child)::after {
+        content: "→";
+        position: absolute;
+        top: 92px;
+        right: -29px;
+        z-index: 6;
+        color: #4C8DFF;
+        font-size: 32px;
+      }
+      .phase .num {
+        color: #4C8DFF;
+        font: 700 17px "JetBrains Mono", monospace;
+      }
+      .phase strong {
+        display: block;
+        margin-top: 26px;
+        font-size: 27px;
+      }
+      .phase span {
+        display: block;
+        margin-top: 18px;
+        color: #A9B2C3;
+        font-size: 18px;
+        line-height: 1.45;
+      }
+      .split {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 42px;
+        margin-top: 38px;
+      }
+      .flow-card {
+        min-height: 410px;
+        padding: 34px;
+        border: 1px solid #303A4B;
+        background: #141923;
+      }
+      .flow-card h3 {
+        color: #A9B2C3;
+        font: 700 19px "JetBrains Mono", monospace;
+        letter-spacing: .06em;
+      }
+      .flow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: 76px;
+      }
+      .flow.vertical {
+        flex-wrap: wrap;
+        justify-content: center;
+        margin-top: 38px;
+      }
+      .flow-node {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 138px;
+        min-height: 90px;
+        padding: 18px;
+        border: 1px solid #3B4659;
+        background: #10151E;
+        text-align: center;
+        font: 700 19px/1.3 "JetBrains Mono", monospace;
+      }
+      .flow-node.host { border-color: #58C792; color: #58C792; }
+      .arrow { color: #4C8DFF; font-size: 31px; }
+      .return {
+        width: 78%;
+        margin: 22px auto 0;
+        padding-top: 16px;
+        border-top: 2px solid #4C8DFF;
+        color: #A9B2C3;
+        text-align: center;
+        font: 18px "JetBrains Mono", monospace;
+      }
+      .loop-layout {
+        display: grid;
+        grid-template-columns: .9fr 1.1fr;
+        gap: 40px;
+        align-items: stretch;
+        margin-top: 34px;
+      }
+      .pseudo {
+        padding: 28px 31px;
+        border: 1px solid #303A4B;
+        background: #10151E;
+        color: #C5CDDA;
+        font: 20px/1.62 "JetBrains Mono", monospace;
+        white-space: pre-wrap;
+      }
+      .pseudo .active {
+        display: inline-block;
+        width: 100%;
+        margin: 2px -10px;
+        padding: 1px 10px;
+        color: #F1F4F8;
+        background: rgba(76,141,255,.19);
+      }
+      .source-map {
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+      }
+      .source-row {
+        display: grid;
+        grid-template-columns: 80px 1fr;
+        gap: 18px;
+        align-items: center;
+        min-height: 92px;
+        padding: 18px 22px;
+        border-bottom: 1px solid #303A4B;
+      }
+      .source-row b {
+        color: #4C8DFF;
+        font: 700 18px "JetBrains Mono", monospace;
+      }
+      .source-row span {
+        font: 20px/1.4 "JetBrains Mono", monospace;
+      }
+      .orbit {
+        position: relative;
+        width: 690px;
+        height: 520px;
+        margin-top: 22px;
+      }
+      .model-core {
+        position: absolute;
+        left: 250px;
+        top: 170px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 190px;
+        height: 190px;
+        border: 2px solid #4C8DFF;
+        background: #141923;
+        font: 900 28px "JetBrains Mono", monospace;
+      }
+      .orbit-ring {
+        position: absolute;
+        left: 92px;
+        top: 12px;
+        width: 506px;
+        height: 506px;
+        border: 1px solid #303A4B;
+        border-radius: 50%;
+      }
+      .satellite {
+        position: absolute;
+        min-width: 145px;
+        padding: 16px 18px;
+        border: 1px solid #303A4B;
+        background: #10151E;
+        text-align: center;
+        font: 700 18px "JetBrains Mono", monospace;
+      }
+      .sat-1 { left: 270px; top: 0; }
+      .sat-2 { right: 0; top: 105px; }
+      .sat-3 { right: 2px; bottom: 72px; }
+      .sat-4 { left: 270px; bottom: 0; }
+      .sat-5 { left: 0; bottom: 72px; }
+      .sat-6 { left: 0; top: 105px; }
+      .architecture {
+        display: grid;
+        grid-template-columns: 1.1fr .9fr;
+        gap: 62px;
+        align-items: center;
+      }
+      .layers {
+        display: flex;
+        flex-direction: column;
+        gap: 13px;
+      }
+      .layer {
+        display: grid;
+        grid-template-columns: 175px 1fr;
+        gap: 25px;
+        align-items: center;
+        min-height: 105px;
+        padding: 20px 26px;
+        border: 1px solid #303A4B;
+        background: #141923;
+      }
+      .layer b {
+        color: #4C8DFF;
+        font: 700 20px "JetBrains Mono", monospace;
+      }
+      .layer span { color: #A9B2C3; font-size: 22px; }
+      .objects {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 22px;
+        margin-top: 44px;
+      }
+      .object {
+        min-height: 290px;
+        padding: 31px 29px;
+        border: 1px solid #303A4B;
+        background: #141923;
+      }
+      .object .label {
+        color: #4C8DFF;
+        font: 700 17px "JetBrains Mono", monospace;
+      }
+      .object h3 { margin-top: 28px; font-size: 36px; }
+      .object p {
+        margin-top: 20px;
+        color: #A9B2C3;
+        font-size: 22px;
+        line-height: 1.5;
+      }
+      .object code {
+        display: block;
+        margin-top: 25px;
+        color: #58C792;
+        font: 18px/1.5 "JetBrains Mono", monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="96" data-width="1920" data-height="1080">
+      <section class="scene" id="s1">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>FAIL</div>
+        <div class="topline"><span class="chapter">PI AGENT / REAL TASK</span><span>01</span></div>
+        <div class="scene-body">
+          <div class="failure-layout">
+            <div>
+              <div class="badge real">REAL RUN</div>
+              <div class="eyebrow" style="margin-top:26px">原价 200 元 · 减去 15%</div>
+              <h1>本应得到 170 元，程序却算出<span class="failure">负 2800</span></h1>
+              <p class="lead">我们把这个明确的折扣计算错误交给 Pi Agent，观察它如何定位、修改并验证。</p>
+            </div>
+            <div class="terminal">
+              <div class="terminal-bar"><i></i><i></i><i></i></div>
+              <pre>$ npm test
+
+✖ applies a percentage discount
+
+AssertionError:
+Expected values to be strictly equal
+
+actual:   <span class="failure">-2800</span>
+expected: <span class="success">170</span></pre>
+              <div class="error-number">-2800 !== 170</div>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>fixture / discount.test.js</span><div class="progress"><i style="width:14%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s2">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>TRACE</div>
+        <div class="topline"><span class="chapter">THE OBSERVED PATH</span><span>02</span></div>
+        <div class="scene-body">
+          <div class="badge real">REAL RUN</div>
+          <div class="eyebrow" style="margin-top:24px">Pi 实际做了什么</div>
+          <h2>不是一次回答，而是<span class="accent">六个 Turn</span>组成的闭环</h2>
+          <div class="timeline">
+            <div class="phase"><span class="num">TURN 01</span><strong>bash + bash</strong><span>扫描文件，同时搜索相关代码</span></div>
+            <div class="phase"><span class="num">TURN 02</span><strong>read × 3</strong><span>并行读取实现、测试与 package.json</span></div>
+            <div class="phase"><span class="num">TURN 03</span><strong>bash</strong><span>运行测试，确认真实失败结果</span></div>
+            <div class="phase"><span class="num">TURN 04</span><strong>edit</strong><span>只修改折扣百分比计算的一行</span></div>
+            <div class="phase"><span class="num">TURN 05</span><strong>bash</strong><span>重新运行测试，得到通过反馈</span></div>
+            <div class="phase"><span class="num">TURN 06</span><strong class="success">stop</strong><span>没有新工具调用，输出最终回复</span></div>
+          </div>
+        </div>
+        <div class="footer"><span>Session JSONL / observed tool sequence</span><div class="progress"><i style="width:28%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s3">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>LOOP</div>
+        <div class="topline"><span class="chapter">CHATBOT VS AGENT</span><span>03</span></div>
+        <div class="scene-body">
+          <div class="eyebrow">分界线不是“模型更聪明”</div>
+          <h2>Agent 多出来的，是<span class="accent">执行与反馈循环</span></h2>
+          <div class="split">
+            <div class="flow-card">
+              <h3>CHATBOT / ONE REQUEST</h3>
+              <div class="flow">
+                <div class="flow-node">USER</div><div class="arrow">→</div>
+                <div class="flow-node">MODEL</div><div class="arrow">→</div>
+                <div class="flow-node">TEXT</div>
+              </div>
+              <p class="lead" style="font-size:23px">模型返回文本，一次请求结束。</p>
+            </div>
+            <div class="flow-card">
+              <h3>AGENT / FEEDBACK LOOP</h3>
+              <div class="flow vertical">
+                <div class="flow-node">MODEL</div><div class="arrow">→</div>
+                <div class="flow-node">TOOL CALL</div><div class="arrow">→</div>
+                <div class="flow-node host">HOST TOOL</div>
+              </div>
+              <div class="return">TOOL RESULT → NEXT MODEL REQUEST</div>
+              <p class="lead" style="font-size:23px">模型提出调用，宿主程序真正执行。</p>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>single-tool deterministic harness</span><div class="progress"><i style="width:42%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s4">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>CODE</div>
+        <div class="topline"><span class="chapter">SOURCE-DERIVED LOOP</span><span>04</span></div>
+        <div class="scene-body">
+          <div class="badge">SOURCE</div>
+          <div class="eyebrow" style="margin-top:24px">不是通用模板，是当前源码的压缩投影</div>
+          <h2>每一行伪代码，都能映射回<span class="accent">真实函数</span></h2>
+          <div class="loop-layout">
+            <div class="pseudo">加入 Prompt，发出起始事件
+读取 steering
+
+外层循环:
+  内层循环: 有工具或 steering
+    注入 pending messages
+    <span class="active">assistant = 调用模型并消费流</span>
+    如果 error / aborted: 结束
+    calls = assistant 中的 toolCall
+    <span class="active">results = 校验并执行 calls</span>
+    把 results 加入 Context
+    发出 turn_end
+    读取 steering
+
+  读取 follow-up
+
+发出 agent_end</div>
+            <div class="source-map">
+              <div class="source-row"><b>01</b><span>runAgentLoop() / Prompt 与起始事件</span></div>
+              <div class="source-row"><b>02</b><span>runLoop() / 双层循环与停止条件</span></div>
+              <div class="source-row"><b>03</b><span>streamAssistantResponse() / 流式模型消息</span></div>
+              <div class="source-row"><b>04</b><span>executeToolCalls() / 校验、执行、回填</span></div>
+              <div class="source-row"><b>05</b><span>createLoopConfig() / steering 与 follow-up</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>packages/agent/src/agent-loop.ts</span><div class="progress"><i style="width:57%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s5">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>RUNTIME</div>
+        <div class="topline"><span class="chapter">AGENT HARNESS</span><span>05</span></div>
+        <div class="scene-body">
+          <div class="architecture">
+            <div>
+              <div class="eyebrow">认知反转</div>
+              <h1>模型只是<span class="accent">决策器</span></h1>
+              <p class="lead">Agent 是把模型、上下文、工具、循环、状态、持久化和 UI 组织起来的运行系统。</p>
+            </div>
+            <div class="orbit">
+              <div class="orbit-ring"></div>
+              <div class="model-core">MODEL</div>
+              <div class="satellite sat-1">CONTEXT</div>
+              <div class="satellite sat-2">TOOLS</div>
+              <div class="satellite sat-3">LOOP</div>
+              <div class="satellite sat-4">STATE</div>
+              <div class="satellite sat-5">SESSION</div>
+              <div class="satellite sat-6">UI</div>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>Model + Runtime</span><div class="progress"><i style="width:71%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s6">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>PACKAGES</div>
+        <div class="topline"><span class="chapter">FOUR PACKAGE BOUNDARIES</span><span>06</span></div>
+        <div class="scene-body">
+          <div class="architecture">
+            <div>
+              <div class="eyebrow">先分清边界，再追调用链</div>
+              <h2>Pi 把产品、Runtime、模型协议与 UI <span class="accent">分开</span></h2>
+              <p class="lead">底层不知道具体编码产品；Agent Loop 不直接依赖某一家模型 SDK。</p>
+            </div>
+            <div class="layers">
+              <div class="layer"><b>coding-agent</b><span>CLI、Session、Tools、Extensions、Skills</span></div>
+              <div class="layer"><b>agent-core</b><span>状态、Agent Loop、工具调度与消息队列</span></div>
+              <div class="layer"><b>pi-ai</b><span>统一模型、消息、流事件与 Provider</span></div>
+              <div class="layer"><b>pi-tui</b><span>终端输入、组件和差量渲染</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>README.md / packages/*</span><div class="progress"><i style="width:85%"></i></div></div>
+      </section>
+
+      <section class="scene" id="s7">
+        <div class="grid" data-layout-allow-overflow></div><div class="glow" data-layout-ignore></div><div class="ghost" data-layout-ignore>OBJECTS</div>
+        <div class="topline"><span class="chapter">THREE CORE OBJECTS</span><span>07</span></div>
+        <div class="scene-body">
+          <div class="eyebrow">最容易混淆的边界</div>
+          <h2>发动机、产品编排与历史事实，<span class="accent">不是同一个对象</span></h2>
+          <div class="objects">
+            <div class="object">
+              <span class="label">RUNTIME</span>
+              <h3>Agent</h3>
+              <p>当前 transcript、Loop、Queue、Abort 与 streaming 状态。</p>
+              <code>agent.ts</code>
+            </div>
+            <div class="object">
+              <span class="label">APPLICATION</span>
+              <h3>AgentSession</h3>
+              <p>输入预处理、扩展、认证、重试、压缩和事件持久化。</p>
+              <code>agent-session.ts</code>
+            </div>
+            <div class="object">
+              <span class="label">FACT LOG</span>
+              <h3>SessionManager</h3>
+              <p>JSONL 追加式树、恢复、分支与模型 Context 投影。</p>
+              <code>session-manager.ts</code>
+            </div>
+          </div>
+        </div>
+        <div class="footer"><span>下一步：从 CLI 跟进一次 Prompt</span><div class="progress"><i style="width:100%"></i></div></div>
+      </section>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = [0, 13, 27, 41, 57, 70, 83];
+      const scenes = starts.map((_, index) => `#s${index + 1}`);
+
+      scenes.forEach((selector, index) => {
+        const t = starts[index];
+        const scene = document.querySelector(selector);
+        const content = scene.querySelectorAll(
+          ".topline, .badge, .eyebrow, h1, h2, .lead, .terminal, .phase, .flow-card, .pseudo, .source-row, .model-core, .orbit-ring, .satellite, .layer, .object, .footer"
+        );
+
+        if (index > 0) {
+          tl.set(selector, { opacity: 1, x: 0 }, t);
+        }
+        tl.from(scene.querySelector(".grid"), {
+          opacity: 0,
+          x: index % 2 === 0 ? -24 : 24,
+          duration: .7,
+          ease: "sine.out"
+        }, t + .16);
+        tl.from(scene.querySelector(".glow"), {
+          opacity: 0,
+          scale: .82,
+          duration: .95,
+          ease: "power2.out"
+        }, t + .2);
+        tl.from(scene.querySelector(".ghost"), {
+          opacity: 0,
+          x: 55,
+          duration: .8,
+          ease: "expo.out"
+        }, t + .22);
+        tl.from(content, {
+          opacity: 0,
+          y: 30,
+          scale: .985,
+          duration: .58,
+          stagger: .045,
+          ease: index % 3 === 0 ? "expo.out" : index % 3 === 1 ? "power3.out" : "sine.out"
+        }, t + .27);
+
+        if (scene.querySelector(".orbit-ring")) {
+          tl.from(scene.querySelector(".orbit-ring"), {
+            scale: .72,
+            rotation: -12,
+            duration: .85,
+            ease: "power3.out"
+          }, t + .42);
+        }
+
+        if (index < scenes.length - 1) {
+          const next = starts[index + 1];
+          tl.to(selector, {
+            x: -105,
+            opacity: 0,
+            duration: .48,
+            ease: "power2.inOut",
+            overwrite: "auto"
+          }, next - .48);
+          tl.fromTo(scenes[index + 1], {
+            x: 105,
+            opacity: 0
+          }, {
+            x: 0,
+            opacity: 1,
+            duration: .48,
+            ease: "power2.inOut",
+            overwrite: "auto"
+          }, next - .48);
+        }
+      });
+
+      tl.to("#s7 .scene-body, #s7 .topline, #s7 .footer", {
+        opacity: 0,
+        duration: .8,
+        ease: "sine.inOut"
+      }, 95);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

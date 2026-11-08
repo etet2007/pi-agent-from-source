@@ -1,0 +1,75 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "读取 greeting.js，把问候语改成中文。"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "toolCall",
+        "name": "read",
+        "arguments": {
+          "path": "greeting.js",
+          "offset": 1,
+          "limit": 400
+        }
+      }
+    ]
+  },
+  {
+    "role": "toolResult",
+    "toolName": "read",
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "export function greet(name) {\n  return `Hello, ${name}`;\n}\n"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "toolCall",
+        "name": "edit",
+        "arguments": {
+          "path": "greeting.js",
+          "edits": [
+            {
+              "oldText": "  return `Hello, ${name}`;\n",
+              "newText": "  return `你好，${name}`;\n"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "role": "toolResult",
+    "toolName": "edit",
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "Successfully replaced 1 block(s) in greeting.js."
+      }
+    ],
+    "diff": " 1 export function greet(name) {\n-2   return `Hello, ${name}`;\n+2   return `你好，${name}`;\n 3 }"
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "已改成中文：`你好，${name}`"
+      }
+    ]
+  }
+]

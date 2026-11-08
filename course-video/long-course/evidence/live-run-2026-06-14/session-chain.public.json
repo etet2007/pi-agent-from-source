@@ -1,0 +1,23 @@
+{
+  "evidenceType": "REAL RUN / SANITIZED SESSION CHAIN",
+  "recordedAt": "2026-06-14T00:57:26.125Z",
+  "nodes": [
+    { "node": "n01", "parent": "ROOT", "type": "model_change" },
+    { "node": "n02", "parent": "n01", "type": "thinking_level_change" },
+    { "node": "n03", "parent": "n02", "type": "message", "role": "user" },
+    { "node": "n04", "parent": "n03", "type": "message", "role": "assistant", "tools": ["bash", "bash"] },
+    { "node": "n05", "parent": "n04", "type": "message", "role": "toolResult", "toolName": "bash" },
+    { "node": "n06", "parent": "n05", "type": "message", "role": "toolResult", "toolName": "bash" },
+    { "node": "n07", "parent": "n06", "type": "message", "role": "assistant", "tools": ["read", "read", "read"] },
+    { "node": "n08", "parent": "n07", "type": "message", "role": "toolResult", "toolName": "read" },
+    { "node": "n09", "parent": "n08", "type": "message", "role": "toolResult", "toolName": "read" },
+    { "node": "n10", "parent": "n09", "type": "message", "role": "toolResult", "toolName": "read" },
+    { "node": "n11", "parent": "n10", "type": "message", "role": "assistant", "tools": ["bash"] },
+    { "node": "n12", "parent": "n11", "type": "message", "role": "toolResult", "toolName": "bash" },
+    { "node": "n13", "parent": "n12", "type": "message", "role": "assistant", "tools": ["edit"] },
+    { "node": "n14", "parent": "n13", "type": "message", "role": "toolResult", "toolName": "edit" },
+    { "node": "n15", "parent": "n14", "type": "message", "role": "assistant", "tools": ["bash"] },
+    { "node": "n16", "parent": "n15", "type": "message", "role": "toolResult", "toolName": "bash" },
+    { "node": "n17", "parent": "n16", "type": "message", "role": "assistant" }
+  ]
+}

@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1920, height=1080">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script src="timing-data.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #0B0E14;
+        color: #F1F4F8;
+        font-family: Arial, sans-serif;
+      }
+      #chapter-03 {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        color: #F1F4F8;
+        background: #0B0E14;
+        font-family: Arial, sans-serif;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        padding: 66px 98px 150px;
+        display: flex;
+        flex-direction: column;
+        gap: 34px;
+        overflow: hidden;
+        background-color: #0B0E14;
+      }
+      .scene::before {
+        content: "";
+        position: absolute;
+        inset: -50px;
+        opacity: .18;
+        background-image:
+          linear-gradient(rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px),
+          linear-gradient(90deg, rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px);
+        background-size: 92px 92px;
+        mask-image: linear-gradient(to bottom, rgba(0,0,0,.9), rgba(0,0,0,.08));
+      }
+      .scene::after {
+        content: "";
+        position: absolute;
+        width: 800px;
+        height: 800px;
+        right: -260px;
+        top: -320px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(76,141,255,.2), rgba(76,141,255,0) 68%);
+        pointer-events: none;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .topline {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #A9B2C3;
+        font: 700 18px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .055em;
+      }
+      .topline span:first-child { color: #4C8DFF; }
+      .body {
+        position: relative;
+        z-index: 4;
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 42px;
+        min-height: 0;
+      }
+      .single {
+        grid-template-columns: 1fr;
+        align-items: center;
+      }
+      .panel {
+        border: 1px solid #303A4B;
+        background: #141923;
+        padding: 32px;
+        box-shadow: none;
+        min-height: 0;
+      }
+      .evidence { font-family: "JetBrains Mono", monospace; }
+      .eyebrow {
+        color: #4C8DFF;
+        font: 700 21px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .075em;
+        margin-bottom: 22px;
+      }
+      h1 {
+        margin: 0;
+        max-width: 1550px;
+        font-size: 92px;
+        line-height: 1.08;
+        letter-spacing: -.04em;
+        font-weight: 900;
+      }
+      h2 {
+        margin: 0 0 22px;
+        font-size: 64px;
+        line-height: 1.16;
+        letter-spacing: -.035em;
+        font-weight: 900;
+      }
+      p {
+        margin: 0;
+        color: #B8C1D0;
+        font-size: 29px;
+        line-height: 1.55;
+        font-weight: 350;
+      }
+      .lead {
+        margin-top: 26px;
+        max-width: 1360px;
+        color: #B8C1D0;
+        font-size: 29px;
+        line-height: 1.55;
+        font-weight: 350;
+      }
+      .accent, .purple, .amber { color: #4C8DFF; }
+      .green { color: #58C792; }
+      .code {
+        white-space: pre-wrap;
+        color: #D2D8E2;
+        font: 22px/1.55 "JetBrains Mono", monospace;
+        font-variant-ligatures: none;
+      }
+      .code .dim { color: #7D899E; }
+      .code .hi { color: #58C792; }
+      .code .blue, .code .purple, .code .amber { color: #4C8DFF; }
+      .flow {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        height: 100%;
+      }
+      .node {
+        min-width: 205px;
+        padding: 25px 18px;
+        text-align: center;
+        background: #10151E;
+        border: 1px solid #3B4659;
+      }
+      .node b {
+        display: block;
+        font: 700 24px/1.2 "JetBrains Mono", monospace;
+        margin-bottom: 10px;
+      }
+      .node span {
+        color: #A9B2C3;
+        font-size: 21px;
+      }
+      .arrow {
+        color: #4C8DFF;
+        font: 32px "JetBrains Mono", monospace;
+      }
+      .stack {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 18px;
+      }
+      .layer {
+        display: grid;
+        grid-template-columns: 340px 1fr;
+        align-items: center;
+        gap: 22px;
+        padding: 22px 25px;
+        background: #10151E;
+        border: 1px solid #3B4659;
+      }
+      .layer b {
+        font: 700 25px "JetBrains Mono", monospace;
+      }
+      .layer span {
+        color: #A9B2C3;
+        font-size: 25px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 24px;
+      }
+      .card {
+        padding: 30px;
+        background: #10151E;
+        border: 1px solid #3B4659;
+        min-height: 310px;
+      }
+      .card b {
+        display: block;
+        font: 700 28px "JetBrains Mono", monospace;
+        margin-bottom: 18px;
+      }
+      .card p {
+        color: #A9B2C3;
+        font-size: 25px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 12px 16px;
+        background: #10151E;
+        color: #4C8DFF;
+        border-left: 4px solid #4C8DFF;
+        font: 700 18px "JetBrains Mono", monospace;
+        margin-bottom: 22px;
+      }
+      .footer {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        justify-content: space-between;
+        color: #7D899E;
+        font: 17px/1.2 "JetBrains Mono", monospace;
+      }
+      #captions {
+        position: absolute;
+        inset: 0;
+        z-index: 20;
+        pointer-events: none;
+      }
+      .caption {
+        position: absolute;
+        left: 0;
+        bottom: 38px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 78px;
+        padding: 0 210px;
+        opacity: 0;
+        visibility: hidden;
+      }
+      .caption span {
+        display: inline-block;
+        max-width: 1500px;
+        padding: 12px 24px 14px;
+        border-bottom: 3px solid #4C8DFF;
+        background: rgba(5,7,11,.92);
+        color: #F1F4F8;
+        text-align: center;
+        font-size: 30px;
+        line-height: 1.3;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-5p31" id="chapter-03" data-composition-id="chapter-03" data-width="1920" data-height="1080" data-start="0" data-duration="262">
+      <section data-hf-id="hf-mcnq" class="scene" id="s1">
+        <div data-hf-id="hf-o5lv" class="topline"><span data-hf-id="hf-4dtn">CHAPTER 03 / ENTRY CHAIN</span><span data-hf-id="hf-gvg2">CLI TO SESSION</span></div>
+        <div data-hf-id="hf-16oo" class="body single">
+          <div data-hf-id="hf-owjm" class="panel">
+            <div data-hf-id="hf-bp80" class="eyebrow">从入口开始</div>
+            <h1 data-hf-id="hf-jdm2">一次输入怎样进入 <span data-hf-id="hf-rvbs" class="accent">AgentSession</span></h1>
+            <p data-hf-id="hf-sggc" class="lead">第三章跟踪命令行输入：从 cli.ts、main.ts 到 sdk.ts 和 AgentSession.prompt。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-yh7l" class="footer"><span data-hf-id="hf-5bt5">QUESTION</span><span data-hf-id="hf-z43q">Prompt does not jump directly to the model</span></div>
+      </section>
+
+      <section data-hf-id="hf-iejp" class="scene" id="s2">
+        <div data-hf-id="hf-pz6r" class="topline"><span data-hf-id="hf-3636">THIN ENTRY</span><span data-hf-id="hf-jnwi">packages/coding-agent/src/cli.ts</span></div>
+        <div data-hf-id="hf-2t3w" class="body">
+          <div data-hf-id="hf-gxly" class="panel">
+            <div data-hf-id="hf-dd73" class="eyebrow">薄入口</div>
+            <h2 data-hf-id="hf-4xsa">cli.ts 只做进程初始化</h2>
+            <p data-hf-id="hf-yr1s">它设置运行环境，然后把参数交给 main()。这里还没有创建 Agent，也没有调用模型。</p>
+          </div>
+          <div data-hf-id="hf-wo6h" class="panel evidence">
+            <div data-hf-id="hf-2c1q" class="badge">cli.ts:12-20</div>
+            <div data-hf-id="hf-mruz" class="code"><span data-hf-id="hf-2c1e" class="dim">12</span> process.title = APP_NAME;
+<span data-hf-id="hf-1xqd" class="dim">13</span> process.env.PI_CODING_AGENT = "true";
+<span data-hf-id="hf-4pvk" class="dim">14</span> process.emitWarning = (() =&gt; {});
+
+<span data-hf-id="hf-zy78" class="dim">18</span> configureHttpDispatcher();
+
+<span data-hf-id="hf-qkfb" class="dim">20</span> <span data-hf-id="hf-xeap" class="hi">main(process.argv.slice(2));</span></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ll85" class="footer"><span data-hf-id="hf-682y">CONCLUSION</span><span data-hf-id="hf-sy9f">入口薄，复杂度交给 main.ts</span></div>
+      </section>
+
+      <section data-hf-id="hf-hmvw" class="scene" id="s3">
+        <div data-hf-id="hf-pkvq" class="topline"><span data-hf-id="hf-pkz7">APP MODE</span><span data-hf-id="hf-5yy5">main.ts:100-110</span></div>
+        <div data-hf-id="hf-xuuo" class="body single">
+          <div data-hf-id="hf-hbwz" class="panel">
+            <div data-hf-id="hf-62dx" class="eyebrow">模式分派</div>
+            <h2 data-hf-id="hf-13i8">四种模式，共享业务 Runtime</h2>
+            <div data-hf-id="hf-ck2w" class="flow">
+              <div data-hf-id="hf-cdek" class="node"><b data-hf-id="hf-u1qm" class="purple">rpc</b><span data-hf-id="hf-cac6">显式优先</span></div>
+              <div data-hf-id="hf-drib" class="arrow">→</div>
+              <div data-hf-id="hf-7gt0" class="node"><b data-hf-id="hf-fq6x" class="accent">json</b><span data-hf-id="hf-885l">结构化输出</span></div>
+              <div data-hf-id="hf-yhhf" class="arrow">→</div>
+              <div data-hf-id="hf-69vx" class="node"><b data-hf-id="hf-ty4x" class="green">print</b><span data-hf-id="hf-cn4w">-p 或 stdin</span></div>
+              <div data-hf-id="hf-y36e" class="arrow">→</div>
+              <div data-hf-id="hf-6o6y" class="node"><b data-hf-id="hf-vt7y" class="amber">interactive</b><span data-hf-id="hf-eyta">终端交互</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ms58" class="footer"><span data-hf-id="hf-rzh3">MODE IS I/O</span><span data-hf-id="hf-1trv">不是四套 Agent 内核</span></div>
+      </section>
+
+      <section data-hf-id="hf-54df" class="scene" id="s4">
+        <div data-hf-id="hf-p6kp" class="topline"><span data-hf-id="hf-xiw1">RUNTIME CWD</span><span data-hf-id="hf-79g0">main.ts:616-700</span></div>
+        <div data-hf-id="hf-6g9g" class="body">
+          <div data-hf-id="hf-qkwt" class="panel evidence">
+            <div data-hf-id="hf-cm4h" class="badge">main.ts:616-628</div>
+            <div data-hf-id="hf-rboa" class="code"><span data-hf-id="hf-8gdu" class="dim">616</span> <span data-hf-id="hf-0yuc" class="blue">// Decide the final runtime cwd</span>
+<span data-hf-id="hf-822t" class="dim">617</span> // --session and --resume may select
+<span data-hf-id="hf-7nrs" class="dim">618</span> // a session from another project.
+
+<span data-hf-id="hf-1gg3" class="dim">628</span> sessionManager =
+     await createSessionManager(...);
+
+<span data-hf-id="hf-w6ln" class="dim">655</span> cwd: <span data-hf-id="hf-uzku" class="hi">sessionManager.getCwd()</span></div>
+          </div>
+          <div data-hf-id="hf-hq80" class="panel">
+            <div data-hf-id="hf-t91b" class="eyebrow">先确定项目根</div>
+            <h2 data-hf-id="hf-4hy0">cwd 决定 Agent 看到什么</h2>
+            <p data-hf-id="hf-xr9i">settings、AGENTS.md、Skills、扩展、Session 和工具路径都依赖 cwd。目录错了，语境也会错。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-mdu7" class="footer"><span data-hf-id="hf-5cf9">WHY</span><span data-hf-id="hf-s29j">恢复旧 Session 时尤其重要</span></div>
+      </section>
+
+      <section data-hf-id="hf-yynm" class="scene" id="s5">
+        <div data-hf-id="hf-os9o" class="topline"><span data-hf-id="hf-ka5p">RUNTIME FACTORY</span><span data-hf-id="hf-2byd">main.ts + sdk.ts</span></div>
+        <div data-hf-id="hf-wnxl" class="body single">
+          <div data-hf-id="hf-ey2t" class="panel">
+            <div data-hf-id="hf-xi8h" class="eyebrow">组装顺序</div>
+            <h2 data-hf-id="hf-6e4u">先服务，再 Session，再 Agent</h2>
+            <div data-hf-id="hf-d1zs" class="stack">
+              <div data-hf-id="hf-a8wf" class="layer"><b data-hf-id="hf-rkh8" class="accent">SessionManager</b><span data-hf-id="hf-7ue7">确认历史和 runtime cwd</span></div>
+              <div data-hf-id="hf-rnan" class="layer"><b data-hf-id="hf-2qoq" class="green">Services</b><span data-hf-id="hf-mmx5">Settings、ResourceLoader、ModelRegistry、AuthStorage</span></div>
+              <div data-hf-id="hf-r8zm" class="layer"><b data-hf-id="hf-mxb0" class="purple">createAgentSession</b><span data-hf-id="hf-8nbe">选择模型、工具，构造 Agent 和 AgentSession</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-nkra" class="footer"><span data-hf-id="hf-oec9">FACTORY</span><span data-hf-id="hf-hda9">cwd-bound services are created after cwd is known</span></div>
+      </section>
+
+      <section data-hf-id="hf-v0jl" class="scene" id="s6">
+        <div data-hf-id="hf-odyn" class="topline"><span data-hf-id="hf-zt7g">NEW AGENT</span><span data-hf-id="hf-n7i8">sdk.ts:244-359</span></div>
+        <div data-hf-id="hf-59cd" class="body">
+          <div data-hf-id="hf-fcdu" class="panel">
+            <div data-hf-id="hf-f2hj" class="eyebrow">宿主工具</div>
+            <h2 data-hf-id="hf-6cr2">默认工具来自 coding-agent</h2>
+            <p data-hf-id="hf-mg1t">默认活动工具是 read、bash、edit、write。模型只能请求工具，执行工具的是宿主程序。</p>
+          </div>
+          <div data-hf-id="hf-rrtw" class="panel evidence">
+            <div data-hf-id="hf-9t34" class="badge">sdk.ts:244-359</div>
+            <div data-hf-id="hf-k8ub" class="code"><span data-hf-id="hf-n4vx" class="dim">244</span> const defaultActiveToolNames =
+     [<span data-hf-id="hf-ao94" class="hi">"read"</span>, <span data-hf-id="hf-ufwe" class="hi">"bash"</span>, <span data-hf-id="hf-9n3o" class="hi">"edit"</span>, <span data-hf-id="hf-jygd" class="hi">"write"</span>];
+
+<span data-hf-id="hf-4rh9" class="dim">293</span> agent = new Agent({
+<span data-hf-id="hf-vfe2" class="dim">300</span>   convertToLlm,
+<span data-hf-id="hf-v131" class="dim">301</span>   streamFn,
+<span data-hf-id="hf-z4rt" class="dim">349</span>   transformContext,
+<span data-hf-id="hf-ypij" class="dim">354</span>   steeringMode,
+<span data-hf-id="hf-z3tk" class="dim">355</span>   followUpMode,
+<span data-hf-id="hf-0p1o" class="dim">359</span> });</div>
+          </div>
+        </div>
+        <div data-hf-id="hf-n6g9" class="footer"><span data-hf-id="hf-da32">INJECTION</span><span data-hf-id="hf-nc8s">Agent 行为由构造参数决定</span></div>
+      </section>
+
+      <section data-hf-id="hf-u8vs" class="scene" id="s7">
+        <div data-hf-id="hf-nznm" class="topline"><span data-hf-id="hf-fg54">NEW AGENTSESSION</span><span data-hf-id="hf-wq0u">sdk.ts:375-389</span></div>
+        <div data-hf-id="hf-x28m" class="body single">
+          <div data-hf-id="hf-fqov" class="panel">
+            <div data-hf-id="hf-n2n6" class="eyebrow">产品中枢</div>
+            <h2 data-hf-id="hf-5z35">Agent 被注入 AgentSession</h2>
+            <div data-hf-id="hf-5cwd" class="cards">
+              <div data-hf-id="hf-vn2y" class="card"><b data-hf-id="hf-cmyo" class="purple">Agent</b><p data-hf-id="hf-qkac">通用运行时：模型、上下文、工具、队列和 Loop。</p></div>
+              <div data-hf-id="hf-i08u" class="card"><b data-hf-id="hf-wzel" class="amber">AgentSession</b><p data-hf-id="hf-oej5">产品层：输入、扩展、重试、压缩、事件转发。</p></div>
+              <div data-hf-id="hf-iejv" class="card"><b data-hf-id="hf-kzzl" class="green">SessionManager</b><p data-hf-id="hf-3pov">历史层：JSONL、恢复、分支和上下文投影。</p></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-oddc" class="footer"><span data-hf-id="hf-rhtf">BOUNDARY</span><span data-hf-id="hf-o08d">Agent Core remains reusable</span></div>
+      </section>
+
+      <section data-hf-id="hf-yv67" class="scene" id="s8">
+        <div data-hf-id="hf-nlcl" class="topline"><span data-hf-id="hf-3yir">PROMPT PREPROCESS</span><span data-hf-id="hf-jjkp">agent-session.ts:994-1216</span></div>
+        <div data-hf-id="hf-5nne" class="body">
+          <div data-hf-id="hf-g4zw" class="panel">
+            <div data-hf-id="hf-f9rg" class="eyebrow">进入模型前</div>
+            <h2 data-hf-id="hf-ndm1">输入先经过产品层处理</h2>
+            <p data-hf-id="hf-ntuk">斜杠命令、input hook、skill、template、队列、认证、压缩、before_agent_start 都在 agent.prompt 之前。</p>
+          </div>
+          <div data-hf-id="hf-rdiv" class="panel evidence">
+            <div data-hf-id="hf-9d2e" class="badge">AgentSession.prompt</div>
+            <div data-hf-id="hf-f7e7" class="code">raw input
+  → slash command
+  → input hook
+  → skill / template
+  → queue decision
+  → auth / model check
+  → compaction check
+  → user + custom messages
+  → before_agent_start
+  → <span data-hf-id="hf-mka4" class="hi">agent.prompt(messages)</span></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-nz2b" class="footer"><span data-hf-id="hf-4zq9">IMPORTANT</span><span data-hf-id="hf-ie7h">用户输入不是原样扔给模型</span></div>
+      </section>
+
+      <section data-hf-id="hf-ux26" class="scene" id="s9">
+        <div data-hf-id="hf-n71k" class="topline"><span data-hf-id="hf-clj3">SUMMARY</span><span data-hf-id="hf-eer2">NEXT / AGENT LOOP</span></div>
+        <div data-hf-id="hf-vvbj" class="body single">
+          <div data-hf-id="hf-dcup" class="panel">
+            <div data-hf-id="hf-aqvc" class="eyebrow">第三章主线</div>
+            <h2 data-hf-id="hf-avy5">Prompt 进入系统的真实路径</h2>
+            <div data-hf-id="hf-tuhs" class="flow">
+              <div data-hf-id="hf-8nq3" class="node"><b data-hf-id="hf-wj2q" class="accent">cli.ts</b><span data-hf-id="hf-r73r">薄入口</span></div>
+              <div data-hf-id="hf-xovd" class="arrow">→</div>
+              <div data-hf-id="hf-9214" class="node"><b data-hf-id="hf-cboy" class="green">main.ts</b><span data-hf-id="hf-1i32">模式 + cwd</span></div>
+              <div data-hf-id="hf-xakc" class="arrow">→</div>
+              <div data-hf-id="hf-7v41" class="node"><b data-hf-id="hf-xukk" class="purple">sdk.ts</b><span data-hf-id="hf-3bq4">组装对象</span></div>
+              <div data-hf-id="hf-ww9b" class="arrow">→</div>
+              <div data-hf-id="hf-89f2" class="node"><b data-hf-id="hf-unn0" class="amber">prompt</b><span data-hf-id="hf-1iqt">预处理</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-it2y" class="footer"><span data-hf-id="hf-q21i">REMEMBER</span><span data-hf-id="hf-xygq">下一章进入 Agent.prompt 和 Agent Loop</span></div>
+      </section>
+
+      <audio data-hf-id="hf-6qjo" id="narration" data-start="0" data-duration="260.016" data-track-index="20" src="narration.wav" data-volume="1"></audio>
+      <div data-hf-id="hf-iuvo" id="captions"></div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = window.CHAPTER_DATA.scenes;
+      const scenes = starts.map((_, index) => `#s${index + 1}`);
+
+      scenes.forEach((selector, index) => {
+        const t = starts[index];
+        const scene = document.querySelector(selector);
+        const content = scene.querySelectorAll(".topline, .panel, .footer, .layer, .node, .card, .badge");
+        if (index > 0) tl.set(selector, { opacity: 1, x: 0 }, Math.max(0, t - .45));
+        tl.from(content, { opacity: 0, y: 30, scale: .99, duration: .62, stagger: .045, overwrite: "auto", ease: index % 3 === 0 ? "expo.out" : index % 3 === 1 ? "power3.out" : "sine.out" }, t + .18);
+        if (index < scenes.length - 1) {
+          const next = starts[index + 1];
+          tl.to(selector, { x: -90, opacity: 0, duration: .45, overwrite: "auto", ease: "power2.inOut" }, next - .45);
+          tl.fromTo(scenes[index + 1], { x: 90, opacity: 0 }, { x: 0, opacity: 1, duration: .45, overwrite: "auto", ease: "power2.inOut" }, next - .45);
+        }
+      });
+
+      const captionHost = document.getElementById("captions");
+      window.CHAPTER_DATA.captions.forEach((group, index) => {
+        const element = document.createElement("div");
+        element.className = "caption";
+        element.id = `caption-${index}`;
+        const span = document.createElement("span");
+        span.textContent = group.text;
+        element.appendChild(span);
+        captionHost.appendChild(element);
+        const visibleStart = group.start + .02;
+        const visibleEnd = Math.max(visibleStart + .2, group.end - .04);
+        tl.set(element, { visibility: "visible", opacity: 0 }, visibleStart);
+        tl.fromTo(element, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: .14, overwrite: "auto", ease: "power3.out" }, visibleStart);
+        tl.to(element, { opacity: 0, duration: .1, overwrite: "auto", ease: "power2.in" }, Math.max(visibleStart + .2, visibleEnd - .1));
+        tl.set(element, { opacity: 0, visibility: "hidden" }, visibleEnd);
+      });
+
+      tl.to("#s9 .panel, #s9 .topline, #s9 .footer", { opacity: 0, duration: .8, ease: "sine.inOut" }, 260.5);
+      window.__timelines["chapter-03"] = tl;
+    </script>
+  </body>
+</html>

@@ -1,0 +1,29 @@
+这一章开始读 Agent Loop。先记住一个原则：Prompt 进来以后，第一件事不是立刻调用模型，而是进入运行生命周期。
+
+Agent 会先检查是否已有 active run。如果同一个 Agent 正在工作，新的 prompt 不能直接并发进入。否则两个循环会同时改 transcript、streaming 状态和 pending 工具。
+
+所以 Pi 把新的任务分成三类：新的 prompt、工作中的 steering，以及结束后的 follow-up。它们进入循环的位置不同。
+
+runWithLifecycle 创建 AbortController，把 isStreaming 设为 true，清空旧错误，然后把 signal 交给 runAgentLoop。
+
+Loop 完成后，还要等待事件监听器。因为 message_end 可能正在持久化消息，扩展也可能还在处理事件。主 promise 不能提前假装一切结束。
+
+进入 runAgentLoop 后，程序会复制旧 Context，合并新的 Prompt 消息，然后发出 agent_start、turn_start、message_start 和 message_end。
+
+用户消息也有 start 和 end。这样 UI、Session 和扩展不需要猜消息来源，只需要订阅同一套消息生命周期。
+
+真正的核心在 runLoop。外层循环处理 follow-up，内层循环处理工具调用和 steering。只要上一轮还有工具结果要给模型，或者用户中途追加了 steering，内层就继续。
+
+每个 Turn 都会先注入 pending messages，再调用 streamAssistantResponse。它把 Agent 内部消息转换成 Provider 能理解的 Context，然后消费流式事件。
+
+start 会创建 partial assistant message。text、thinking 或 tool call delta 会不断替换最后一条 partial。done 出现后，final assistant message 替换 partial，并发出 message_end。
+
+如果 assistant message 里有 tool call，Pi 调用 executeToolCalls。工具结果会追加回 Context，下一轮模型才能看到真实环境反馈。
+
+如果没有 tool call，也没有 steering，内层结束。外层再看有没有 follow-up。没有 follow-up，才发出 agent_end。
+
+停止也不只有一种原因。没有工具、模型报错、用户取消、shouldStopAfterTurn、工具批次终止，都会影响循环怎么收尾。
+
+所以 Agent Loop 不是一段神秘自动化。它是消息、事件、工具结果和停止条件组成的状态机。
+
+读源码时只问五个问题：当前 Context 是什么，模型请求在哪里，工具结果怎么回填，事件什么时候发出，循环为什么继续或停止。

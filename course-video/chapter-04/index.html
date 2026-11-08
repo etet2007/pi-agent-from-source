@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1920, height=1080">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script src="timing-data.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #0B0E14;
+        color: #F1F4F8;
+        font-family: Arial, sans-serif;
+      }
+      #chapter-04 {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0B0E14;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 66px 98px 150px;
+        overflow: hidden;
+        background-color: #0B0E14;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .grid {
+        position: absolute;
+        inset: -50px;
+        opacity: .18;
+        background-image:
+          linear-gradient(rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px),
+          linear-gradient(90deg, rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px);
+        background-size: 92px 92px;
+        mask-image: linear-gradient(to bottom, rgba(0,0,0,.9), rgba(0,0,0,.08));
+      }
+      .glow {
+        position: absolute;
+        width: 800px;
+        height: 800px;
+        right: -260px;
+        top: -320px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(76,141,255,.2), rgba(76,141,255,0) 68%);
+      }
+      .ghost {
+        position: absolute;
+        right: 10px;
+        bottom: 45px;
+        color: rgba(76,141,255,.05);
+        font: 900 190px/1 "JetBrains Mono", monospace;
+        letter-spacing: -.08em;
+      }
+      .topline, .footer {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: #A9B2C3;
+        font: 700 18px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .055em;
+      }
+      .footer { color: #7D899E; font-size: 17px; }
+      .topline span:first-child { color: #4C8DFF; }
+      .body {
+        position: relative;
+        z-index: 4;
+        flex: 1;
+        display: grid;
+        grid-template-columns: .88fr 1.12fr;
+        gap: 42px;
+        align-items: center;
+        min-height: 0;
+      }
+      .panel {
+        border: 1px solid #303A4B;
+        background: #141923;
+        padding: 32px;
+        min-height: 0;
+      }
+      .copy {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 22px;
+      }
+      .eyebrow, .code-title {
+        color: #4C8DFF;
+        font: 700 21px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .075em;
+      }
+      h1 {
+        margin: 0;
+        font-size: 78px;
+        line-height: 1.08;
+        letter-spacing: -.04em;
+        font-weight: 900;
+      }
+      p {
+        margin: 0;
+        color: #B8C1D0;
+        font-size: 29px;
+        line-height: 1.55;
+        font-weight: 350;
+      }
+      .evidence {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        font-family: "JetBrains Mono", monospace;
+      }
+      pre {
+        flex: 1;
+        margin: 0;
+        padding: 22px 24px;
+        color: #D2D8E2;
+        background: #10151E;
+        border: 1px solid #303A4B;
+        font: 19px/1.32 "JetBrains Mono", monospace;
+        white-space: pre-wrap;
+        overflow: hidden;
+      }
+      .chips {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      .chip {
+        padding: 15px 18px;
+        color: #D2D8E2;
+        background: #10151E;
+        border: 1px solid #3B4659;
+        font: 700 18px "JetBrains Mono", monospace;
+      }
+      #captions {
+        position: absolute;
+        inset: auto 0 38px 0;
+        z-index: 100;
+        pointer-events: none;
+      }
+      .caption {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 78px;
+        padding: 0 210px;
+        visibility: hidden;
+        opacity: 0;
+      }
+      .caption span {
+        display: inline-block;
+        max-width: 1500px;
+        padding: 12px 24px 14px;
+        border-bottom: 3px solid #4C8DFF;
+        background: rgba(5,7,11,.92);
+        color: #F1F4F8;
+        text-align: center;
+        font-size: 30px;
+        line-height: 1.3;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-b6kh" id="chapter-04" data-composition-id="chapter-04" data-width="1920" data-height="1080" data-start="0" data-duration="187" data-track-index="0">
+      <section data-hf-id="hf-mcnq" class="scene" id="s1">
+        <div data-hf-id="hf-kxq8" class="grid"></div>
+        <div data-hf-id="hf-2s7n" class="glow"></div>
+        <div data-hf-id="hf-s1ghost" class="ghost" data-layout-ignore="">PROMPT</div>
+        <div data-hf-id="hf-o5lv" class="topline"><span data-hf-id="hf-l23q">CHAPTER 04</span><span data-hf-id="hf-51sb">01 / 06</span></div>
+        <div data-hf-id="hf-2t3w" class="body">
+          <div data-hf-id="hf-8f31" class="panel copy">
+            <div data-hf-id="hf-pznc" class="eyebrow">SOURCE READING</div>
+            <h1 data-hf-id="hf-pstr">生命周期入口</h1>
+            <p data-hf-id="hf-136g">Agent.prompt 先守住 active run</p>
+          </div>
+          <div data-hf-id="hf-wo6h" class="panel evidence">
+            <div data-hf-id="hf-45mt" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-auj4">async prompt(input, images?) {
+  if (this.activeRun) {
+    throw new Error(
+      "Agent is already processing a prompt. " +
+      "Use steer() or followUp() to queue messages..."
+    );
+  }
+
+  const messages = this.normalizePromptInput(input, images);
+  await this.runPromptMessages(messages);
+}</pre>
+            <div data-hf-id="hf-exrd" class="chips"><div data-hf-id="hf-ulw4" class="chip">prompt</div><div data-hf-id="hf-bp03" class="chip">steer</div><div data-hf-id="hf-3ini" class="chip">followUp</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-yh7l" class="footer"><span data-hf-id="hf-3lqw">Agent Loop 源码精读</span><span data-hf-id="hf-zn06">从 prompt 到 agent_end</span></div>
+      </section>
+<section data-hf-id="hf-iejp" class="scene" id="s2">
+        <div data-hf-id="hf-6qwo" class="grid"></div>
+        <div data-hf-id="hf-x5mb" class="glow"></div>
+        <div data-hf-id="hf-s2ghost" class="ghost" data-layout-ignore="">EVENTS</div>
+        <div data-hf-id="hf-pz6r" class="topline"><span data-hf-id="hf-bjai">CHAPTER 04</span><span data-hf-id="hf-ui0s">02 / 06</span></div>
+        <div data-hf-id="hf-6g9g" class="body">
+          <div data-hf-id="hf-xm5t" class="panel copy">
+            <div data-hf-id="hf-nas2" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-e7m1">起始事件</h1>
+            <p data-hf-id="hf-znpu">user message 也走 message_start / message_end</p>
+          </div>
+          <div data-hf-id="hf-qkwt" class="panel evidence">
+            <div data-hf-id="hf-11i1" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-uu3p">const currentContext = {
+  ...context,
+  messages: [...context.messages, ...prompts],
+};
+
+await emit({ type: "agent_start" });
+await emit({ type: "turn_start" });
+
+for (const prompt of prompts) {
+  await emit({ type: "message_start", message: prompt });
+  await emit({ type: "message_end", message: prompt });
+}</pre>
+            <div data-hf-id="hf-4dp9" class="chips"><div data-hf-id="hf-6rk0" class="chip">agent_start</div><div data-hf-id="hf-2n4u" class="chip">turn_start</div><div data-hf-id="hf-npee" class="chip">message_start</div><div data-hf-id="hf-tzw3" class="chip">message_end</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ll85" class="footer"><span data-hf-id="hf-4j00">Agent Loop 源码精读</span><span data-hf-id="hf-21zu">从 prompt 到 agent_end</span></div>
+      </section>
+<section data-hf-id="hf-hmvw" class="scene" id="s3">
+        <div data-hf-id="hf-5jzl" class="grid"></div>
+        <div data-hf-id="hf-wrba" class="glow"></div>
+        <div data-hf-id="hf-s3ghost" class="ghost" data-layout-ignore="">LOOP</div>
+        <div data-hf-id="hf-pkvq" class="topline"><span data-hf-id="hf-bxlj">CHAPTER 04</span><span data-hf-id="hf-si15">03 / 06</span></div>
+        <div data-hf-id="hf-59cd" class="body">
+          <div data-hf-id="hf-yt2w" class="panel copy">
+            <div data-hf-id="hf-zsly" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-fgor">双层循环</h1>
+            <p data-hf-id="hf-52ly">内层管工具和 steering，外层管 follow-up</p>
+          </div>
+          <div data-hf-id="hf-rrtw" class="panel evidence">
+            <div data-hf-id="hf-28f4" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-58nr">let pendingMessages =
+  await config.getSteeringMessages?.() || [];
+
+while (true) {
+  let hasMoreToolCalls = true;
+
+  while (hasMoreToolCalls || pendingMessages.length > 0) {
+    const message = await streamAssistantResponse(...);
+    const toolCalls = message.content.filter(
+      (c) => c.type === "toolCall"
+    );
+    pendingMessages = await config.getSteeringMessages?.() || [];
+  }
+
+  const followUpMessages = await config.getFollowUpMessages?.() || [];
+  if (followUpMessages.length > 0) continue;
+  break;
+}</pre>
+            <div data-hf-id="hf-5kmc" class="chips"><div data-hf-id="hf-g9s8" class="chip">inner loop</div><div data-hf-id="hf-m86t" class="chip">outer loop</div><div data-hf-id="hf-zed7" class="chip">pending messages</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ms58" class="footer"><span data-hf-id="hf-3c2x">Agent Loop 源码精读</span><span data-hf-id="hf-2gav">从 prompt 到 agent_end</span></div>
+      </section>
+<section data-hf-id="hf-54df" class="scene" id="s4">
+        <div data-hf-id="hf-5yam" class="grid"></div>
+        <div data-hf-id="hf-wd09" class="glow"></div>
+        <div data-hf-id="hf-s4ghost" class="ghost" data-layout-ignore="">STREAM</div>
+        <div data-hf-id="hf-p6kp" class="topline"><span data-hf-id="hf-cbwk">CHAPTER 04</span><span data-hf-id="hf-xz5e">04 / 06</span></div>
+        <div data-hf-id="hf-5nne" class="body">
+          <div data-hf-id="hf-yerv" class="panel copy">
+            <div data-hf-id="hf-06wz" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-ybfn">流式消息</h1>
+            <p data-hf-id="hf-46zb">delta 不是新消息，是替换 partial</p>
+          </div>
+          <div data-hf-id="hf-rdiv" class="panel evidence">
+            <div data-hf-id="hf-1u43" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-9g22">for await (const event of response) {
+  switch (event.type) {
+    case "start":
+      partialMessage = event.partial;
+      context.messages.push(partialMessage);
+      await emit({ type: "message_start", message: {...partialMessage} });
+      break;
+
+    case "toolcall_delta":
+    case "thinking_delta":
+    case "text_delta":
+      partialMessage = event.partial;
+      context.messages[context.messages.length - 1] = partialMessage;
+      await emit({ type: "message_update", message: {...partialMessage} });
+      break;
+
+    case "done":
+      const finalMessage = await response.result();
+      context.messages[context.messages.length - 1] = finalMessage;
+      await emit({ type: "message_end", message: finalMessage });
+      return finalMessage;
+  }
+}</pre>
+            <div data-hf-id="hf-56bb" class="chips"><div data-hf-id="hf-wo1q" class="chip">start</div><div data-hf-id="hf-zuev" class="chip">update</div><div data-hf-id="hf-rnme" class="chip">done</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-mdu7" class="footer"><span data-hf-id="hf-3qdy">Agent Loop 源码精读</span><span data-hf-id="hf-2ulw">从 prompt 到 agent_end</span></div>
+      </section>
+<section data-hf-id="hf-yynm" class="scene" id="s5">
+        <div data-hf-id="hf-4rdj" class="grid"></div>
+        <div data-hf-id="hf-vyp8" class="glow"></div>
+        <div data-hf-id="hf-s5ghost" class="ghost" data-layout-ignore="">STOP</div>
+        <div data-hf-id="hf-os9o" class="topline"><span data-hf-id="hf-cq7l">CHAPTER 04</span><span data-hf-id="hf-lp8f">05 / 06</span></div>
+        <div data-hf-id="hf-7n6j" class="body">
+          <div data-hf-id="hf-wf8q" class="panel copy">
+            <div data-hf-id="hf-0l80" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-o6ef">停止条件</h1>
+            <p data-hf-id="hf-66fr">停止不是只有 no tool</p>
+          </div>
+          <div data-hf-id="hf-skfy" class="panel evidence">
+            <div data-hf-id="hf-zuky" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-sggv">if (message.stopReason === "error" ||
+    message.stopReason === "aborted") {
+  await emit({ type: "turn_end", message, toolResults: [] });
+  await emit({ type: "agent_end", messages: newMessages });
+  return;
+}
+
+if (await config.shouldStopAfterTurn?.({
+  message, toolResults, context: currentContext, newMessages
+})) {
+  await emit({ type: "agent_end", messages: newMessages });
+  return;
+}</pre>
+            <div data-hf-id="hf-6d8e" class="chips"><div data-hf-id="hf-udv5" class="chip">no tool</div><div data-hf-id="hf-bm0i" class="chip">error / aborted</div><div data-hf-id="hf-8lmy" class="chip">shouldStopAfterTurn</div><div data-hf-id="hf-6tm5" class="chip">terminate batch</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-nkra" class="footer"><span data-hf-id="hf-2jgv">Agent Loop 源码精读</span><span data-hf-id="hf-38wx">从 prompt 到 agent_end</span></div>
+      </section>
+<section data-hf-id="hf-v0jl" class="scene" id="s6">
+        <div data-hf-id="hf-55ok" class="grid"></div>
+        <div data-hf-id="hf-vke7" class="glow"></div>
+        <div data-hf-id="hf-s6ghost" class="ghost" data-layout-ignore="">TOOLS</div>
+        <div data-hf-id="hf-odyn" class="topline"><span data-hf-id="hf-d4im">CHAPTER 04</span><span data-hf-id="hf-axi8">06 / 06</span></div>
+        <div data-hf-id="hf-81hk" class="body">
+          <div data-hf-id="hf-w0xp" class="panel copy">
+            <div data-hf-id="hf-xt2t" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-8yx3">本章记忆点</h1>
+            <p data-hf-id="hf-5il8">Agent Loop 是可观察状态机</p>
+          </div>
+          <div data-hf-id="hf-s64x" class="panel evidence">
+            <div data-hf-id="hf-zg9x" class="code-title">真实源码锚点</div>
+	            <pre data-hf-id="hf-1kqz">const toolCalls = assistantMessage.content.filter(
+  (c) => c.type === "toolCall"
+);
+
+const hasSequentialToolCall = toolCalls.some(
+  (tc) => currentContext.tools
+    ?.find((t) => t.name === tc.name)
+    ?.executionMode === "sequential"
+);
+
+if (config.toolExecution === "sequential" ||
+    hasSequentialToolCall) {
+  return executeToolCallsSequential(...);
+}
+
+return executeToolCallsParallel(...);</pre>
+            <div data-hf-id="hf-5yxd" class="chips"><div data-hf-id="hf-fftl" class="chip">Context</div><div data-hf-id="hf-9odq" class="chip">Stream</div><div data-hf-id="hf-r7vl" class="chip">Tools</div><div data-hf-id="hf-dve3" class="chip">Events</div><div data-hf-id="hf-cs4m" class="chip">Stop</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-n6g9" class="footer"><span data-hf-id="hf-2xrw">Agent Loop 源码精读</span><span data-hf-id="hf-3n7y">从 prompt 到 agent_end</span></div>
+      </section>
+      <audio data-hf-id="hf-2xwk" id="narration" data-start="0" data-duration="184.944" data-track-index="20" src="narration.wav" data-volume="1"></audio>
+      <div data-hf-id="hf-iuvo" id="captions"></div>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = window.CHAPTER_DATA.scenes;
+      const sceneSelectors = starts.map((_, index) => "#s" + (index + 1));
+
+      sceneSelectors.forEach((selector, index) => {
+        const t = starts[index] ?? 0;
+        const scene = document.querySelector(selector);
+        const content = scene.querySelectorAll(".topline, .copy, .evidence, .footer");
+        if (index > 0) tl.set(selector, { opacity: 1, x: 0 }, Math.max(0, t - .45));
+        tl.from(scene.querySelector(".grid"), { opacity: 0, x: index % 2 ? 24 : -24, duration: .75, ease: "sine.out" }, t + .1);
+        tl.from(scene.querySelector(".glow"), { opacity: 0, scale: .82, duration: .9, ease: "power2.out" }, t + .12);
+        tl.from(scene.querySelector(".ghost"), { opacity: 0, x: 55, duration: .8, ease: "expo.out" }, t + .16);
+        tl.from(content, { opacity: 0, y: 28, scale: .988, duration: .58, stagger: .045, ease: "power3.out" }, t + .22);
+        if (index < sceneSelectors.length - 1) {
+          const next = starts[index + 1] ?? t + 12;
+          tl.to(selector, { x: -90, opacity: 0, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+          tl.fromTo(sceneSelectors[index + 1], { x: 90, opacity: 0 }, { x: 0, opacity: 1, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+        }
+      });
+
+      const captionHost = document.getElementById("captions");
+      window.CHAPTER_DATA.captions.forEach((group, index) => {
+        const element = document.createElement("div");
+        element.className = "caption";
+        element.id = "caption-" + index;
+        const span = document.createElement("span");
+        span.textContent = group.text;
+        element.appendChild(span);
+        captionHost.appendChild(element);
+        const visibleStart = group.start + .02;
+        const visibleEnd = Math.max(visibleStart + .2, group.end - .04);
+        tl.set(element, { visibility: "visible", opacity: 0 }, visibleStart);
+        tl.fromTo(element, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: .16, ease: "power3.out" }, visibleStart);
+        tl.to(element, { opacity: 0, duration: .1, ease: "power2.in" }, Math.max(visibleStart + .2, visibleEnd - .1));
+        tl.set(element, { opacity: 0, visibility: "hidden" }, visibleEnd);
+      });
+
+      tl.to(".scene:last-of-type .body, .scene:last-of-type .topline, .scene:last-of-type .footer", { opacity: 0, duration: .8, ease: "sine.inOut" }, Math.max(0, window.CHAPTER_DATA.duration - 1.5));
+      window.__timelines["chapter-04"] = tl;
+    </script>
+  </body>
+</html>

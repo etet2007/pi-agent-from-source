@@ -1,0 +1,43 @@
+第二章，我们看看Pi的源码模块划分。
+
+第一章我们看到，Agent 不是模型单独完成任务。模型提出工具请求，宿主程序执行工具，再把结果放回上下文。
+
+Pi 把这些职责放在源码的哪些位置呢？
+
+README写得很清楚：Pi Agent Harness Mono Repo。
+
+这两个词很关键。Harness 可以理解成运行和编排环境，它不是模型本身，而是负责把模型、工具、上下文、历史和界面接到一起。
+
+Mono Repo 是单一代码仓库，意思是 Pi 把多个相关模块放在同一个仓库里管理，所以我们在项目里看到以下几个模块。
+
+Pi 的核心源码可以先分成四层。
+
+最底层是 pi-ai。它统一模型、消息、工具描述和流事件，把不同的LLM Provider的差异藏在同一个 API 后面。
+
+往上是 pi-agent-core。这里有 Agent、Agent Loop、工具调用和状态管理。它不关心 read 或 edit 的业务含义。
+
+再往上是 pi-coding-agent。这是编码产品层。CLI、Session、tools(包括read、bash、edit、write等）、扩展和持久化主要都在这里。
+
+旁边还有 pi-tui。它负责终端 UI 和差量渲染。UI 消费状态和事件，但不决定 Agent 下一步调用什么工具。
+
+这四层的依赖方向很重要。coding-agent 可以依赖 agent-core、pi-ai 和 pi-tui。agent-core 只依赖 pi-ai。pi-ai 不依赖上层产品。
+
+换句话说，模型厂商、Agent 循环、终端界面和整体Coding-agent被拆开了。
+
+再看核心接口。Agent Loop 主要依赖两个抽象：StreamFn 和 AgentTool。
+
+StreamFn 表示一次模型流式调用。它把 Provider 的事件统一成 Agent 能理解的消息流。
+
+AgentTool 表示一个宿主工具。它有名称、参数 schema 和 execute 函数。模型只能请求工具，真正执行的是宿主程序。
+
+最后分清三个对象。
+
+Agent 是运行时发动机。它在内存里保存当前这次任务的消息记录、模型、工具、队列和取消状态，并启动 Agent Loop。
+
+AgentSession 是编码产品中枢。它处理用户输入、扩展、工具注册、重试、压缩和事件转发。
+
+SessionManager 负责磁盘上的历史。它保存 JSONL 记录，用 id 和 parentId 形成分支；每次请求模型前，再从当前分支里整理出模型真正需要看到的上下文。
+
+第二章只记住这张地图：pi-ai 统一模型，agent-core 跑循环，coding-agent 组织编码产品，pi-tui 展示界面。
+
+下一章我们就沿着调用链进入入口：CLI 如何把一次用户输入组装成一个 AgentSession。

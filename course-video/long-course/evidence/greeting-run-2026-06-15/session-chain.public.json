@@ -1,0 +1,76 @@
+{
+  "evidenceType": "REAL RUN / SANITIZED SESSION CHAIN",
+  "recordedAt": "2026-06-15T14:27:38.545Z",
+  "nodes": [
+    {
+      "node": "n01",
+      "parent": "ROOT",
+      "type": "model_change"
+    },
+    {
+      "node": "n02",
+      "parent": "n01",
+      "type": "thinking_level_change"
+    },
+    {
+      "node": "n03",
+      "parent": "n02",
+      "type": "message",
+      "role": "user"
+    },
+    {
+      "node": "n04",
+      "parent": "n03",
+      "type": "message",
+      "role": "assistant",
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "node": "n05",
+      "parent": "n04",
+      "type": "message",
+      "role": "toolResult",
+      "toolName": "read"
+    },
+    {
+      "node": "n06",
+      "parent": "n05",
+      "type": "message",
+      "role": "assistant",
+      "tools": [
+        "edit"
+      ]
+    },
+    {
+      "node": "n07",
+      "parent": "n06",
+      "type": "message",
+      "role": "toolResult",
+      "toolName": "edit"
+    },
+    {
+      "node": "n08",
+      "parent": "n07",
+      "type": "message",
+      "role": "assistant",
+      "tools": [
+        "read"
+      ]
+    },
+    {
+      "node": "n09",
+      "parent": "n08",
+      "type": "message",
+      "role": "toolResult",
+      "toolName": "read"
+    },
+    {
+      "node": "n10",
+      "parent": "n09",
+      "type": "message",
+      "role": "assistant"
+    }
+  ]
+}

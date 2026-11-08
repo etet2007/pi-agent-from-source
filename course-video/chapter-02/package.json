@@ -1,0 +1,16 @@
+{
+  "name": "pi-agent-chapter-02",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "narration": "node scripts/build-narration.mjs",
+    "transcribe": "python3 -m whisper narration.wav --model small --language Chinese --word_timestamps True --output_format json --output_dir transcriptions-word --verbose False",
+    "timing": "node scripts/build-timing.mjs",
+    "check": "npx --yes hyperframes@0.6.89 lint && npx --yes hyperframes@0.6.89 validate && npx --yes hyperframes@0.6.89 inspect --samples 18",
+    "preview": "npx --yes hyperframes@0.6.89 preview --port 3018",
+    "render": "npx --yes hyperframes@0.6.89 render --quality draft --output renders/pi-agent-chapter-02.mp4"
+  }
+}

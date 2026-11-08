@@ -1,0 +1,43 @@
+最后一章，把整条真实任务重新连起来。
+
+命令行入口解析参数，确定运行模式和 cwd，创建 SessionManager、资源服务、Agent 与 AgentSession。
+
+用户 Prompt 进入 AgentSession.prompt，经过输入处理、模型认证和 system prompt 准备，变成 user message。
+
+Agent.prompt 建立 active run、AbortSignal、Context 快照和 Loop 配置。
+
+runAgentLoop 发出起始事件。Provider 请求后，模型生成 tool call。Runtime 校验参数并执行工具。
+
+ToolResult 进入 Context，开始下一轮。模型根据真实工具反馈继续请求 read、bash、edit 或最终回复。
+
+终端上看起来像 Pi 自己修复了问题。源码层面更准确的说法是：模型与宿主 Runtime 通过多轮结构化消息和真实工具反馈完成闭环任务。
+
+如果你要自己实现 Agent，不需要一开始复制 Pi 的全部能力。可以从七个模块开始。
+
+第一，统一消息类型。至少能表达 user、assistant、tool call 和 tool result。
+
+第二，模型边界。把具体 Provider 封装成一个稳定的 stream 或 complete 接口。
+
+第三，工具接口。包含名称、描述、参数 Schema 和 execute。
+
+第四，最小 Agent Loop。模型返回工具就执行并回填，没有工具就停止。
+
+第五，运行状态。管理 transcript、Abort、当前流式消息和用户追加队列。
+
+第六，应用 Session。负责系统提示词、输入预处理、认证、重试和压缩策略。
+
+第七，追加式持久化与 Context 投影。先保存事实，再决定每次给模型看什么。
+
+Pi 的优点是边界清楚、事件协议统一、Session 保存事实、工具流水线完整，并且多种入口共用业务内核。
+
+代价也真实：Provider 层复杂，Session 职责重，Hook 顺序会形成隐含契约，分支、压缩和恢复会增加 Context 构建复杂度。
+
+所以学习 Pi 不是为了照抄每个选择，而是看清每种能力解决了什么问题，又引入了什么复杂度。
+
+最后，重新认识 Agent：它不是获得电脑控制权的大模型，也不只是更长的 system prompt。
+
+Agent 是模型决策、Runtime 控制、工具反馈、持久化上下文和安全边界组合起来的多步系统。
+
+不要只问模型有多聪明，还要问 Runtime 给了它什么上下文、什么工具、什么反馈、什么停止条件，以及工具运行在什么权限边界里。
+
+一旦你能沿着一次真实 Prompt，把每一层输入和输出说清楚，Agent 就不再是黑盒。它复杂，但可以阅读、运行、记录、测试和重新设计。

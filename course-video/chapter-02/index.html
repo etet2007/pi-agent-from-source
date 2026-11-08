@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script src="timing-data.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #0B0E14;
+        color: #F1F4F8;
+        font-family: Arial, sans-serif;
+      }
+      #chapter-02 {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0B0E14;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        padding: 66px 98px 150px;
+        overflow: hidden;
+        background-color: #0B0E14;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .grid {
+        position: absolute;
+        inset: -50px;
+        opacity: .18;
+        background-image:
+          linear-gradient(rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px),
+          linear-gradient(90deg, rgba(76,141,255,.12) 1px, rgba(11,14,20,0) 1px);
+        background-size: 92px 92px;
+        mask-image: linear-gradient(to bottom, rgba(0,0,0,.9), rgba(0,0,0,.08));
+      }
+      .glow {
+        position: absolute;
+        width: 800px;
+        height: 800px;
+        right: -260px;
+        top: -320px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(76,141,255,.2), rgba(76,141,255,0) 68%);
+      }
+      .ghost {
+        position: absolute;
+        right: 10px;
+        bottom: 45px;
+        color: rgba(76,141,255,.05);
+        font: 900 190px/1 "JetBrains Mono", monospace;
+        letter-spacing: -.08em;
+      }
+      .topline {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #A9B2C3;
+        font: 700 18px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .055em;
+        text-transform: uppercase;
+      }
+      .body {
+        position: relative;
+        z-index: 4;
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 42px;
+        min-height: 0;
+      }
+      .single {
+        grid-template-columns: 1fr;
+        align-items: center;
+      }
+      .panel {
+        border: 1px solid #303A4B;
+        background: #141923;
+        padding: 32px;
+        box-shadow: 0 28px 90px rgba(0,0,0,.32);
+        min-height: 0;
+      }
+      .panel.evidence {
+        font-family: "JetBrains Mono", monospace;
+      }
+      .eyebrow {
+        margin-bottom: 22px;
+        color: #4C8DFF;
+        font: 700 21px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .075em;
+      }
+      h1 {
+        margin: 0;
+        max-width: 1550px;
+        font-size: 92px;
+        line-height: 1.08;
+        letter-spacing: -.04em;
+        font-weight: 900;
+      }
+      h2 {
+        margin: 0 0 22px;
+        max-width: 1520px;
+        font-size: 64px;
+        line-height: 1.16;
+        letter-spacing: -0.035em;
+        font-weight: 900;
+      }
+      p {
+        margin: 0;
+        color: #B8C1D0;
+        font-size: 29px;
+        line-height: 1.55;
+      }
+      .lead {
+        max-width: 1360px;
+        margin-top: 26px;
+        color: #B8C1D0;
+        font-size: 29px;
+        line-height: 1.55;
+        font-weight: 350;
+      }
+      .accent { color: #4c8dff; }
+      .purple { color: #9b7cff; }
+      .green { color: #58c792; }
+      .amber { color: #ffb85c; }
+      .stack {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 18px;
+      }
+      .layer {
+        display: grid;
+        grid-template-columns: 300px 1fr;
+        align-items: center;
+        gap: 22px;
+        padding: 22px 25px;
+        background: #141923;
+        border-left: 4px solid #4C8DFF;
+      }
+      .layer b {
+        font: 28px "JetBrains Mono", monospace;
+      }
+      .layer span {
+        color: #c6cedb;
+        font-size: 27px;
+      }
+      .code {
+        padding: 26px 30px;
+        border: 1px solid #303A4B;
+        background: #10151E;
+        white-space: pre-wrap;
+        color: #D2D8E2;
+        font: 22px/1.55 "JetBrains Mono", monospace;
+      }
+      .code .dim { color: #7f8a9e; }
+      .code .hi { color: #58c792; }
+      .code .blue { color: #4c8dff; }
+      .code .purple { color: #9b7cff; }
+      .flow {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 22px;
+        height: 100%;
+      }
+      .node {
+        min-width: 250px;
+        padding: 25px 15px;
+        text-align: center;
+        background: #10151E;
+        border: 1px solid #3B4659;
+      }
+      .node b {
+        display: block;
+        font: 30px "JetBrains Mono", monospace;
+        margin-bottom: 10px;
+      }
+      .node span {
+        color: #c6cedb;
+        font-size: 24px;
+      }
+      .arrow {
+        color: #4c8dff;
+        font: 42px "JetBrains Mono", monospace;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 24px;
+      }
+      .card {
+        padding: 30px;
+        background: #141923;
+        border: 1px solid #303A4B;
+        min-height: 310px;
+      }
+      .card b {
+        display: block;
+        font: 34px "JetBrains Mono", monospace;
+        margin-bottom: 18px;
+      }
+      .card p {
+        font-size: 28px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 10px 14px;
+        background: #141923;
+        color: #4C8DFF;
+        border-left: 4px solid #4C8DFF;
+        font: 20px "JetBrains Mono", monospace;
+      }
+      .footer {
+        position: relative;
+        z-index: 5;
+        display: flex;
+        justify-content: space-between;
+        color: #7D899E;
+        font: 700 17px/1.2 "JetBrains Mono", monospace;
+        letter-spacing: .055em;
+      }
+      .caption {
+        position: absolute;
+        z-index: 100;
+        left: 0;
+        bottom: 38px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 78px;
+        padding: 0 210px;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      .caption span {
+        display: inline-block;
+        max-width: 1500px;
+        padding: 12px 24px 14px;
+        border-bottom: 3px solid #4C8DFF;
+        background: rgba(5,7,11,.92);
+        color: #F1F4F8;
+        text-align: center;
+        font-size: 30px;
+        line-height: 1.3;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-4bzm" id="chapter-02" data-composition-id="chapter-02" data-width="1920" data-height="1080" data-start="0" data-duration="202">
+      <section data-hf-id="hf-mcnq" class="scene" id="s1">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">MAP</div>
+        <div data-hf-id="hf-o5lv" class="topline"><span data-hf-id="hf-tobw">CHAPTER 02 / SOURCE MAP</span><span data-hf-id="hf-gtsn">MODEL + RUNTIME</span></div>
+        <div data-hf-id="hf-16oo" class="body single">
+          <div data-hf-id="hf-owjm" class="panel">
+            <div data-hf-id="hf-kvgz" class="eyebrow">从第一章继续</div>
+            <h1 data-hf-id="hf-zrho">先看地图，再读源码</h1>
+            <p data-hf-id="hf-sonx" class="lead">第一章建立 Agent Loop。第二章回答：这些职责在 Pi 源码里分别放在哪里。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-yh7l" class="footer"><span data-hf-id="hf-rd5h">LESSON FROM CHAPTER 01</span><span data-hf-id="hf-i0od">short sentences / source evidence / calibratable timing</span></div>
+      </section>
+
+      <section data-hf-id="hf-iejp" class="scene" id="s2">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">README</div>
+        <div data-hf-id="hf-pz6r" class="topline"><span data-hf-id="hf-36h4">README EVIDENCE</span><span data-hf-id="hf-brbw">SOURCE</span></div>
+        <div data-hf-id="hf-2t3w" class="body">
+          <div data-hf-id="hf-gxly" class="panel">
+            <div data-hf-id="hf-wair" class="eyebrow">官方定位</div>
+            <h2 data-hf-id="hf-5mxw">Pi 不是单个聊天界面</h2>
+            <p data-hf-id="hf-57qd">README 把项目称为 Agent Harness。这个词说明：模型之外，还有运行环境、工具、状态、历史和界面。</p>
+          </div>
+          <div data-hf-id="hf-wo6h" class="panel evidence">
+            <div data-hf-id="hf-2zpo" class="badge">pi/README.md</div>
+            <div data-hf-id="hf-d83l" class="code">
+<span data-hf-id="hf-zjw7" class="dim">19</span> <span data-hf-id="hf-tnpc" class="hi"># Pi Agent Harness Mono Repo</span>
+<span data-hf-id="hf-qyqc" class="dim">21</span> This is the home of the pi agent harness project
+<span data-hf-id="hf-q64a" class="dim">23</span> pi-coding-agent: Interactive coding agent CLI
+<span data-hf-id="hf-s5nf" class="dim">24</span> pi-agent-core: Agent runtime
+<span data-hf-id="hf-sjyg" class="dim">25</span> pi-ai: Unified multi-provider LLM API
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ll85" class="footer"><span data-hf-id="hf-682y">CONCLUSION</span><span data-hf-id="hf-vl7x">Agent = Model + Runtime</span></div>
+      </section>
+
+      <section data-hf-id="hf-hmvw" class="scene" id="s3">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">4 LAYERS</div>
+        <div data-hf-id="hf-pkvq" class="topline"><span data-hf-id="hf-4f12">ARCHITECTURE</span><span data-hf-id="hf-z3tq">FOUR PACKAGES</span></div>
+        <div data-hf-id="hf-xuuo" class="body single">
+          <div data-hf-id="hf-hbwz" class="panel">
+            <div data-hf-id="hf-jt07" class="eyebrow">先分层</div>
+            <h2 data-hf-id="hf-3sdn">四层源码地图</h2>
+            <div data-hf-id="hf-d1zs" class="stack">
+              <div data-hf-id="hf-r8zm" class="layer"><b data-hf-id="hf-zajt" class="accent">pi-ai</b><span data-hf-id="hf-numj">Unified LLM API：统一模型、消息、工具描述和流事件</span></div>
+              <div data-hf-id="hf-rnan" class="layer"><b data-hf-id="hf-wpko" class="purple">pi-agent-core</b><span data-hf-id="hf-iumj">General-purpose agent：Agent、Agent Loop、工具调用和状态管理</span></div>
+              <div data-hf-id="hf-a8wf" class="layer"><b data-hf-id="hf-vsa6" class="amber">pi-coding-agent</b><span data-hf-id="hf-w0co">Coding agent CLI：CLI、Session、read、bash、edit、write、扩展和持久化</span></div>
+              <div data-hf-id="hf-quol" class="layer"><b data-hf-id="hf-cen6" class="green">pi-tui</b><span data-hf-id="hf-haq5">Terminal UI library：终端 UI 和差量渲染</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ms58" class="footer"><span data-hf-id="hf-33z1">MAP</span><span data-hf-id="hf-j5l5">读源码先找层，再找调用链</span></div>
+      </section>
+
+      <section data-hf-id="hf-54df" class="scene" id="s4">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">DEPS</div>
+        <div data-hf-id="hf-p6kp" class="topline"><span data-hf-id="hf-0f5k">DEPENDENCY DIRECTION</span><span data-hf-id="hf-wkk4">PACKAGE LINKS</span></div>
+        <div data-hf-id="hf-6g9g" class="body single">
+          <div data-hf-id="hf-hq80" class="panel">
+            <div data-hf-id="hf-wagx" class="eyebrow">依赖方向</div>
+            <h2 data-hf-id="hf-gdvo">上层使用下层，下层不认识产品细节</h2>
+            <div data-hf-id="hf-m3c3" class="flow">
+              <div data-hf-id="hf-r73m" class="node"><b class="amber">coding-agent</b><span>tools / session / cli</span></div>
+              <div data-hf-id="hf-a2aq" class="arrow">→</div>
+              <div data-hf-id="hf-n58c" class="node"><b class="purple">agent-core</b><span>Agent Loop</span></div>
+              <div data-hf-id="hf-b0sk" class="arrow">→</div>
+              <div data-hf-id="hf-rpnv" class="node"><b class="accent">pi-ai</b><span>Provider API</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-mdu7" class="footer"><span data-hf-id="hf-n6yo">DIRECTION</span><span data-hf-id="hf-ffbt">换 Provider 不应该重写 Agent Loop</span></div>
+      </section>
+
+      <section data-hf-id="hf-yynm" class="scene" id="s5">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">TYPES</div>
+        <div data-hf-id="hf-os9o" class="topline"><span data-hf-id="hf-fg09">CORE ABSTRACTIONS</span><span data-hf-id="hf-rhtf">StreamFn + AgentTool</span></div>
+        <div data-hf-id="hf-wnxl" class="body">
+          <div data-hf-id="hf-ey2t" class="panel evidence">
+            <div data-hf-id="hf-fflo" class="badge">packages/agent/src/types.ts</div>
+            <div data-hf-id="hf-ck2w" class="code">
+<span class="dim">24</span> export type <span class="blue">StreamFn</span> = (
+<span class="dim">25</span>   ...args: Parameters&lt;typeof streamSimple&gt;
+<span class="dim">26</span> ) =&gt; ReturnType&lt;typeof streamSimple&gt;
+
+<span class="dim">361</span> export interface <span class="hi">AgentTool</span> ...
+<span class="dim">370</span> execute: (...) =&gt; Promise&lt;AgentToolResult&gt;
+            </div>
+          </div>
+          <div class="panel">
+            <div class="eyebrow">两个接口</div>
+            <h2>模型调用和工具执行被抽象掉</h2>
+            <p>Agent Loop 依赖 StreamFn 和 AgentTool，而不是直接绑定 Provider 或具体工具实现。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-nkra" class="footer"><span data-hf-id="hf-nl0k">LOOP DEPENDS ON</span><span data-hf-id="hf-f949">StreamFn + AgentTool</span></div>
+      </section>
+
+      <section data-hf-id="hf-v0jl" class="scene" id="s6">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">OBJECTS</div>
+        <div data-hf-id="hf-odyn" class="topline"><span data-hf-id="hf-itgz">THREE OBJECTS</span><span data-hf-id="hf-9qpp">DO NOT CONFUSE</span></div>
+        <div data-hf-id="hf-59cd" class="body single">
+          <div data-hf-id="hf-rrtw" class="panel">
+            <div data-hf-id="hf-0vz0" class="eyebrow">三个名字</div>
+            <h2 data-hf-id="hf-r8zh">Agent、AgentSession、SessionManager</h2>
+            <div data-hf-id="hf-puof" class="cards">
+              <div class="card"><b class="purple">Agent</b><p>运行时发动机：当前任务消息记录、model、tools、queue、abort、Agent Loop。</p></div>
+              <div class="card"><b class="amber">AgentSession</b><p>编码产品中枢：输入、扩展、工具注册、重试、压缩、事件转发。</p></div>
+              <div class="card"><b class="green">SessionManager</b><p>磁盘历史：JSONL、id、parentId、分支，并整理出模型需要看到的上下文。</p></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-n6g9" class="footer"><span data-hf-id="hf-s635">SOURCE</span><span data-hf-id="hf-gumr">agent.ts / agent-session.ts / session-manager.ts</span></div>
+      </section>
+
+      <section data-hf-id="hf-u8vs" class="scene" id="s7">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">PI</div>
+        <div data-hf-id="hf-nznm" class="topline"><span data-hf-id="hf-hscz">SUMMARY</span><span data-hf-id="hf-r5fw">MENTAL MODEL</span></div>
+        <div data-hf-id="hf-x28m" class="body single">
+          <div data-hf-id="hf-fqov" class="panel">
+            <div data-hf-id="hf-cxfe" class="eyebrow">第二章主线</div>
+            <h2 data-hf-id="hf-134k">Pi 的源码地图</h2>
+            <div data-hf-id="hf-5cwd" class="stack">
+              <div class="layer"><b class="accent">pi-ai</b><span>统一模型</span></div>
+              <div class="layer"><b class="purple">agent-core</b><span>跑循环</span></div>
+              <div class="layer"><b class="amber">coding-agent</b><span>组织编码产品</span></div>
+              <div class="layer"><b class="green">pi-tui</b><span>展示界面</span></div>
+            </div>
+          </div>
+        </div>
+        <div data-hf-id="hf-oddc" class="footer"><span data-hf-id="hf-vdn1">REMEMBER</span><span data-hf-id="hf-coub">先定位层，再读调用链</span></div>
+      </section>
+
+      <section data-hf-id="hf-yv67" class="scene" id="s8">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">NEXT</div>
+        <div data-hf-id="hf-nlcl" class="topline"><span data-hf-id="hf-clj3">NEXT</span><span data-hf-id="hf-r7b5">CLI TO SESSION</span></div>
+        <div data-hf-id="hf-vvbj" class="body single">
+          <div data-hf-id="hf-g4zw" class="panel">
+            <div data-hf-id="hf-xwnx" class="eyebrow">下一章</div>
+            <h1 data-hf-id="hf-706d">一次输入怎样变成 AgentSession</h1>
+            <p data-hf-id="hf-g2wg" class="lead">下一章进入入口：cli.ts、main.ts 和 sdk.ts 如何把命令行输入组装成可运行的 Agent。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-nz2b" class="footer"><span data-hf-id="hf-q21i">CHAPTER 03</span><span data-hf-id="hf-x50f">CLI / main / sdk</span></div>
+      </section>
+
+      <section data-hf-id="hf-ux26" class="scene" id="s9">
+        <div class="grid" data-layout-allow-overflow=""></div><div class="glow" data-layout-ignore=""></div><div class="ghost" data-layout-ignore="">NEXT</div>
+        <div data-hf-id="hf-n71k" class="topline"><span data-hf-id="hf-xito">NEXT</span><span data-hf-id="hf-gvg2">CLI TO SESSION</span></div>
+        <div data-hf-id="hf-w9mk" class="body single">
+          <div data-hf-id="hf-dcup" class="panel">
+            <div data-hf-id="hf-lxxy" class="eyebrow">下一章</div>
+            <h1 data-hf-id="hf-wsqd">一次输入怎样变成 AgentSession</h1>
+            <p data-hf-id="hf-856a" class="lead">下一章进入入口：cli.ts、main.ts 和 sdk.ts 如何把命令行输入组装成可运行的 Agent。</p>
+          </div>
+        </div>
+        <div data-hf-id="hf-it2y" class="footer"><span data-hf-id="hf-jv6n">CHAPTER 03</span><span data-hf-id="hf-sfbg">CLI / main / sdk</span></div>
+      </section>
+
+      <audio data-hf-id="hf-svgq" id="narration" data-start="0" data-duration="200.448" data-track-index="20" src="narration.wav" data-volume="1"></audio>
+      <div data-hf-id="hf-iuvo" id="captions"></div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = window.CHAPTER_DATA.scenes;
+      const scenes = starts.map((_, index) => `#s${index + 1}`);
+
+      scenes.forEach((selector, index) => {
+        const t = starts[index];
+        const scene = document.querySelector(selector);
+        const grid = scene.querySelector(".grid");
+        const glow = scene.querySelector(".glow");
+        const ghost = scene.querySelector(".ghost");
+        const content = scene.querySelectorAll(".topline, .eyebrow, h1, h2, .code, .panel, .lead, .layer, .node, .card, .badge, .footer");
+        if (index > 0) tl.set(selector, { opacity: 1, x: 0 }, t - .45);
+        tl.from(grid, { opacity: 0, scale: 1.04, duration: .8, overwrite: "auto", ease: "sine.out" }, t + .08);
+        tl.from(glow, { opacity: 0, scale: .9, duration: .9, overwrite: "auto", ease: "sine.out" }, t + .12);
+        tl.from(ghost, { opacity: 0, x: 45, duration: .7, overwrite: "auto", ease: "power2.out" }, t + .16);
+        tl.from(content, { opacity: 0, y: 28, scale: .988, duration: .58, stagger: .045, overwrite: "auto", ease: index % 3 === 0 ? "expo.out" : index % 3 === 1 ? "power3.out" : "sine.out" }, t + .24);
+        if (index < scenes.length - 1) {
+          const next = starts[index + 1];
+          tl.to(selector, { x: -90, opacity: 0, duration: .45, overwrite: "auto", ease: "power2.inOut" }, next - .45);
+          tl.fromTo(scenes[index + 1], { x: 90, opacity: 0 }, { x: 0, opacity: 1, duration: .45, overwrite: "auto", ease: "power2.inOut" }, next - .45);
+        }
+      });
+
+      const captionHost = document.getElementById("captions");
+      window.CHAPTER_DATA.captions.forEach((group, index) => {
+        const element = document.createElement("div");
+        element.className = "caption";
+        element.id = `caption-${index}`;
+        const span = document.createElement("span");
+        span.textContent = group.text;
+        element.appendChild(span);
+        captionHost.appendChild(element);
+        const visibleStart = group.start + .02;
+        const visibleEnd = Math.max(visibleStart + .2, group.end - .04);
+        tl.set(element, { visibility: "visible", opacity: 0 }, visibleStart);
+        tl.fromTo(element, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: .14, overwrite: "auto", ease: "power3.out" }, visibleStart);
+        tl.to(element, { opacity: 0, duration: .1, overwrite: "auto", ease: "power2.in" }, Math.max(visibleStart + .2, visibleEnd - .1));
+        tl.set(element, { opacity: 0, visibility: "hidden" }, visibleEnd);
+      });
+
+      tl.to("#s8 .panel, #s8 .topline, #s8 .footer", { opacity: 0, duration: .8, ease: "sine.inOut" }, 200.1);
+      window.__timelines["chapter-02"] = tl;
+    </script>
+  </body>
+</html>

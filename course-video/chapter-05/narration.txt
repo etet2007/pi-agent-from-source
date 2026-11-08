@@ -1,0 +1,31 @@
+这一章讲工具。先把一句常见说法改准确：不是模型真的在终端里执行命令，而是模型生成了一个工具调用请求。
+
+宿主程序把工具名、描述和参数 Schema 放进模型请求。模型输出结构化 tool call，比如工具名 bash，参数 command 是 npm test。
+
+Pi 在 assistant message 里找到 tool call，再到自己的工具列表里按名称查找工具。真正执行命令的是 Node.js 宿主进程。
+
+执行结果会被包装成 role 为 toolResult 的消息，放回下一次模型 Context。模型靠这个结果知道外部世界发生了什么。
+
+executeToolCalls 会先拿到同一条 assistant message 里的全部 tool call。默认可以并行执行，但配置或工具本身可以要求 sequential。
+
+每个工具调用先发出 tool_execution_start，然后进入 prepareToolCall。这里会查找工具，规范化参数，并按 Schema 校验。
+
+工具不存在时，Pi 不会让整个 Loop 崩溃，而是生成一个错误 ToolResult，让模型在下一轮看到失败原因。
+
+参数校验通过后，beforeToolCall 可以拦截或要求确认。真正执行完成后，afterToolCall 还能改写结果、标记错误或要求终止。
+
+长时间工具可以产生 partial update。比如 Bash 命令运行时，终端输出会不断变成 tool_execution_update。
+
+并行工具有一个重要细节。完成事件按真实完成时间发出，fast 工具可能先结束。但最终 ToolResult 回填仍保持模型原始 tool call 顺序。
+
+原因是并行路径用 Promise.all 收集结果。Promise 可以先后完成，但数组结果保持输入顺序。
+
+这让 UI 能及时显示完成进度，同时让下一次模型请求拿到稳定顺序，避免上下文变得不可预测。
+
+coding-agent 默认核心工具包括 read、bash、edit 和 write。read 读取文件，bash 运行命令，edit 做旧文本到新文本的替换，write 创建或覆盖文件。
+
+edit 的设计很关键。模型不是上传整个文件，而是提交 oldText 和 newText。宿主确认匹配后再替换，并能展示 diff。
+
+工具安全不能只靠 Schema。Schema 只能说明 command 是字符串，不能说明这个命令安全。
+
+生产环境至少要分三层：协议层限制工具和参数，应用层做确认、Hook、日志和脱敏，系统层用容器、虚拟机或受限用户隔离。

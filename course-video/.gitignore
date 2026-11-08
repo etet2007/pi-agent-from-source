@@ -1,0 +1,19 @@
+# Rendered media outputs are reproducible and should stay out of Git.
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.aiff
+
+# Local HyperFrames caches and macOS metadata.
+.DS_Store
+.thumbnails/
+.waveform-cache/
+.hyperframes/
+renders/
+.tts-work/
+transcript.json
+
+# Raw online-run evidence may contain private provider metadata.
+*.raw.jsonl
+*.raw.log

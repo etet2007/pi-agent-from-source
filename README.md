@@ -6,6 +6,20 @@
 
 全书以中文写成，用**零依赖 HTML** 直接编写（仅 `book/style.css` 与 `book/common.js` 两个共享文件），无构建步骤、无第三方库，浏览器打开即可阅读。英文版位于 `book/en/`（部署后以 `/en/...` 访问）。
 
+## 统一材料入口（2026-10-24）
+
+| 用途 | 入口 | 维护定位 |
+|---|---|---|
+| 当前现场分享 | [presentation/practical/outline.md](presentation/practical/outline.md) | 21 页短分享、最小 harness 与源码执行回放，优先维护 |
+| 深入阅读 | [book/index.html](book/index.html) | 中文书籍；英文版位于 `book/en/` |
+| 长课视频 | [course-video/README.md](course-video/README.md) | 从 ForNextJob 迁入的旁白、动画、素材和本地成片 |
+| 历史学习资料 | [archive/pi-agent-study/README.md](archive/pi-agent-study/README.md) | 旧课程、证据、React 网页及 0.78.1 源码副本 |
+| 迁移与版本说明 | [research/2026-10-24-fornextjob-migration.md](research/2026-10-24-fornextjob-migration.md) | 来源、路径、校验和待处理事项 |
+
+短分享固定源码提交为 `784653468`；迁入的旧课程基于 `130ae577`（包版本 0.78.1）。吸收旧内容前逐项核对版本与证据。历史资料保持原文，本次没有进行内容去重。
+媒体和依赖在本机一并移动，仍由 Git 忽略；现有 Pages 工作流只部署书籍。
+本书的许可声明适用于书籍；迁入材料保留原来源与许可文件，迁移不改变其授权。
+
 ## 如何阅读
 
 - **在线**：<https://kuwii.xyz/pi-agent-from-source/>；英文版在 `/en/` 下（<https://kuwii.xyz/pi-agent-from-source/en/>）

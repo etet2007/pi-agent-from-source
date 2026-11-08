@@ -1,0 +1,105 @@
+第三章从入口开始。
+
+我们跟踪一条用户输入，怎样从命令杭进入 AgentSession。
+
+先看 cli.ts。
+
+这个文件很薄。
+
+它设置进程的参数，配置 HTTP dispatcher。
+
+最后一行，把 process.argv 去掉前两个元素，交给 main。
+
+所以 cli.ts 不解析业务，不创建 Agent，也不调用模型。
+
+复杂度从 main.ts 开始。
+
+main 会先解析参数，再决定运行模式。
+
+这里有四种模式：rpc、json、print、interactive。
+
+显式 rpc 优先。
+
+显式 json 次之。
+
+如果传了 print，或者标准输入不是 TTY，就进入 print。
+
+其他情况才是 interactive。
+
+这一步说明，交互终端、一次性输出、JSON 输出和 RPC，并不是四套 Agent 内核。
+
+它们主要是不同的输入输出外壳。
+
+接下来是一个容易忽略的点：先确定最终 cwd。
+
+cwd 就是 Agent 认为自己在哪个项目里工作。
+
+这会影响 settings、AGENTS.md、Skills、扩展、Session 和工具路径。
+
+如果用户恢复的是另一个项目的 Session，不能先按当前终端目录加载资源。
+
+所以 main 先创建或打开 SessionManager。
+
+SessionManager 确认最终 runtime cwd。
+
+然后才创建和 cwd 绑定的 SettingsManager、ResourceLoader、ModelRegistry 等服务。
+
+目录错了，Agent 看到的项目规则和文件边界都会错。
+
+确定 cwd 后，main 建立 runtime factory。
+
+真正组装对象的地方在 sdk.ts 的 createAgentSession。
+
+这里先选择模型和 thinking level。
+
+然后确定默认工具。
+
+默认活动工具是 read、bash、edit、write。
+
+这些工具不是模型 SDK 自带的。
+
+它们是 coding-agent 层构造出来，再交给 Agent 的宿主工具。
+
+随后代码 new Agent。
+
+传进去的不是一个神秘大对象，而是一组明确的依赖。
+
+包括 model、convertToLlm、streamFn、transformContext、provider hook、工具 hook、steering 和 follow-up 策略。
+
+Agent 创建之后，再 new AgentSession。
+
+AgentSession 持有 Agent、SessionManager、SettingsManager、ResourceLoader、ModelRegistry 和 ExtensionRunner。
+
+到这里，运行时已经组装完，但用户输入还没有直接进模型。
+
+用户真正提交文本后，先进入 AgentSession.prompt。
+
+如果文本以斜杠开头，Pi 会先尝试扩展命令。
+
+扩展命令处理成功，就不会进入普通 Agent 主循环。
+
+然后是 input hook。
+
+扩展可以拦截输入，也可以改写文本和图片。
+
+再往后，才展开 skill 命令和 prompt template。
+
+如果 Agent 正在 streaming，Pi 不会偷偷启动第二个并发 prompt。
+
+调用者必须明确选择 steer 或 followUp。
+
+如果 Agent 空闲，Session 会校验模型和认证，检查是否需要压缩上下文，构造 user message。
+
+然后触发 before_agent_start hook。
+
+扩展可以追加 custom message，也可以临时改写 system prompt。
+
+最后，_runAgentPrompt 才调用 agent.prompt。
+
+这一章的结论很简单。
+
+一条输入不是直接扔给模型。
+
+它先经过 CLI 模式分派、cwd 确认、运行时组装、输入预处理、扩展 hook、队列判断，最后才进入 Agent Core。
+
+下一章，我们进入 Agent.prompt 和 Agent Loop。

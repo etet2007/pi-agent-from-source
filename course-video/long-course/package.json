@@ -1,0 +1,13 @@
+{
+  "name": "pi-agent-long-course-animatic",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "npx --yes hyperframes@0.6.89 preview",
+    "check": "npx --yes hyperframes@0.6.89 lint && npx --yes hyperframes@0.6.89 validate && npx --yes hyperframes@0.6.89 inspect --samples 15",
+    "render:draft": "npx --yes hyperframes@0.6.89 render --quality draft --output renders/pi-agent-long-course-animatic.mp4"
+  }
+}

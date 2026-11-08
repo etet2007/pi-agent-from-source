@@ -3,3 +3,6 @@
 
 # 站点构建产物与依赖（零依赖 HTML 方案，无构建步骤，此项仅为保险）
 node_modules/
+
+# Imported legacy viewer build output. Video media use course-video/.gitignore.
+/archive/pi-agent-study/share-web/dist/

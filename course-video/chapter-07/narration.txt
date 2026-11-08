@@ -1,0 +1,29 @@
+这一章讲记忆。Agent 领域里，记忆是最容易把不同概念揉在一起的词。
+
+在 Pi 里至少要区分四种东西：Agent.state、LLM Context、Session JSONL 和 AgentEvent。
+
+Agent.state 是当前内存状态，包括 transcript、model、tools、thinking level、是否 streaming、当前 partial message 和 pending tool calls。
+
+LLM Context 是某一次请求真正发送给模型的内容。它包含 system prompt、messages 和 tools，而且可能经过 transform 和 convert。
+
+Session JSONL 是磁盘上的持久化事实。它记录消息、模型变化、thinking level、压缩和分支摘要。
+
+AgentEvent 是运行过程通知，比如 turn_start、message_update 和 tool_execution_end。它会驱动 UI、状态更新和持久化，但它本身不是模型历史。
+
+AgentSession 订阅 AgentEvent。message_start 和 message_update 可以让 UI 实时显示，但主要持久化边界是 message_end。
+
+如果完成的是 user、assistant 或 toolResult，SessionManager 会追加一条消息记录。这样磁盘历史以完成消息为单位，而不是把每个 token delta 都写进去。
+
+Session 不是简单数组，而是一棵树。appendMessage 创建新记录时，会把 parentId 设置为当前 leafId，然后把 leaf 前进到新记录。
+
+如果用户回到历史某个节点继续，新的 child 会形成分支。这样旧路径不会被覆盖，审计和恢复都还能做。
+
+buildSessionContext 接收一个 leaf，从这个 leaf 沿 parentId 走回根，再反转成当前分支。只有这条路径会被投影成当前 Context。
+
+所以磁盘上存在的历史，和当前模型看到的历史，不是同一件事。
+
+压缩也不是删除历史。Pi 会追加 compaction entry，保存摘要、压缩前 token 数量，以及从哪条记录开始保留原消息。
+
+之后构建 Context 时，先放摘要，再放保留的原消息，最后放压缩后的新消息。原始事实仍然留在 Session 里。
+
+这一章最重要的设计是：事实日志和模型上下文分离。事实日志追求可恢复、可分支、可审计；模型 Context 追求在窗口限制内保留当前任务最有价值的信息。

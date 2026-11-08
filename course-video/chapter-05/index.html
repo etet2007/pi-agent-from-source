@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script src="timing-data.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #0b0e14; }
+      #chapter-05 {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        color: #f1f4f8;
+        background: #0b0e14;
+        font-family: Arial, sans-serif;
+      }
+      .scene {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        padding: 78px 104px 128px;
+        display: flex;
+        flex-direction: column;
+        gap: 34px;
+        background:
+          radial-gradient(circle at 18% 16%, rgba(76, 141, 255, .16), transparent 34%),
+          radial-gradient(circle at 86% 26%, rgba(155, 124, 255, .12), transparent 32%),
+          #0b0e14;
+      }
+      .scene:not(#s1) { opacity: 0; }
+      .grid {
+        position: absolute;
+        inset: 0;
+        opacity: .2;
+        background-image: linear-gradient(rgba(169,178,195,.18) 1px, transparent 1px), linear-gradient(90deg, rgba(169,178,195,.18) 1px, transparent 1px);
+        background-size: 64px 64px;
+        mask-image: radial-gradient(circle at center, black, transparent 78%);
+      }
+      .glow {
+        position: absolute;
+        width: 560px;
+        height: 560px;
+        right: -120px;
+        top: -120px;
+        border-radius: 50%;
+        background: rgba(76,141,255,.16);
+        filter: blur(18px);
+      }
+      .topline, .footer {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #a9b2c3;
+        font: 22px "JetBrains Mono", monospace;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .body {
+        position: relative;
+        z-index: 2;
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1.08fr .92fr;
+        gap: 42px;
+        min-height: 0;
+      }
+      .panel {
+        border: 1px solid rgba(169, 178, 195, .18);
+        background: rgba(20, 25, 35, .9);
+        border-radius: 30px;
+        padding: 42px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+        min-height: 0;
+      }
+      .copy {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 28px;
+      }
+      .eyebrow, .code-title {
+        color: #4c8dff;
+        font: 24px "JetBrains Mono", monospace;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 88px;
+        line-height: 1.02;
+        letter-spacing: -0.055em;
+      }
+      p {
+        margin: 0;
+        color: #c6cedb;
+        font-size: 36px;
+        line-height: 1.38;
+      }
+      .evidence {
+        display: flex;
+        flex-direction: column;
+        gap: 28px;
+        font-family: "JetBrains Mono", monospace;
+      }
+      pre {
+        flex: 1;
+        margin: 0;
+        padding: 34px;
+        border-radius: 24px;
+        color: #f1f4f8;
+        background: rgba(11,14,20,.84);
+        border: 1px solid rgba(255,255,255,.08);
+        font-size: 38px;
+        line-height: 1.42;
+        white-space: pre-wrap;
+        display: flex;
+        align-items: center;
+      }
+      .chips {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      .chip {
+        padding: 20px 22px;
+        border-radius: 18px;
+        color: #dce5f2;
+        background: rgba(76,141,255,.12);
+        border: 1px solid rgba(76,141,255,.26);
+        font-size: 25px;
+      }
+      #captions {
+        position: absolute;
+        left: 190px;
+        right: 190px;
+        bottom: 120px;
+        z-index: 8;
+        display: flex;
+        justify-content: center;
+        pointer-events: none;
+      }
+      .caption {
+        position: absolute;
+        visibility: hidden;
+        opacity: 0;
+        max-width: 1380px;
+        padding: 18px 28px;
+        color: #f1f4f8;
+        background: rgba(11,14,20,.78);
+        border: 1px solid rgba(169,178,195,.22);
+        border-radius: 18px;
+        font-size: 34px;
+        line-height: 1.28;
+        text-align: center;
+        box-shadow: 0 18px 50px rgba(0,0,0,.32);
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-v0e8" id="chapter-05" data-composition-id="chapter-05" data-width="1920" data-height="1080" data-start="0" data-duration="476" data-track-index="0">
+      <section data-hf-id="hf-mcnq" class="scene" id="s1">
+        <div data-hf-id="hf-kxq8" class="grid"></div>
+        <div data-hf-id="hf-2s7n" class="glow"></div>
+        <div data-hf-id="hf-o5lv" class="topline"><span data-hf-id="hf-knsp">CHAPTER 05</span><span data-hf-id="hf-51sb">01 / 06</span></div>
+        <div data-hf-id="hf-2t3w" class="body">
+          <div data-hf-id="hf-8f31" class="panel copy">
+            <div data-hf-id="hf-pznc" class="eyebrow">SOURCE READING</div>
+            <h1 data-hf-id="hf-dmby">工具调用不是执行</h1>
+            <p data-hf-id="hf-unj4">模型只生成请求，宿主真正执行</p>
+          </div>
+          <div data-hf-id="hf-wo6h" class="panel evidence">
+            <div data-hf-id="hf-45mt" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-orno">toolCall -&gt; execute -&gt; result</pre>
+            <div data-hf-id="hf-exrd" class="chips"><div data-hf-id="hf-hjbv" class="chip">Model</div><div data-hf-id="hf-gnsm" class="chip">Runtime</div><div data-hf-id="hf-ooc2" class="chip">Host Tool</div><div data-hf-id="hf-ff69" class="chip">ToolResult</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-yh7l" class="footer"><span data-hf-id="hf-f8fr">模型如何使用工具</span><span data-hf-id="hf-2v8i">tool call 到 tool result</span></div>
+      </section>
+<section data-hf-id="hf-iejp" class="scene" id="s2">
+        <div data-hf-id="hf-6qwo" class="grid"></div>
+        <div data-hf-id="hf-x5mb" class="glow"></div>
+        <div data-hf-id="hf-pz6r" class="topline"><span data-hf-id="hf-6dzh">CHAPTER 05</span><span data-hf-id="hf-ui0s">02 / 06</span></div>
+        <div data-hf-id="hf-6g9g" class="body">
+          <div data-hf-id="hf-xm5t" class="panel copy">
+            <div data-hf-id="hf-nas2" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-k8e9">执行流水线</h1>
+            <p data-hf-id="hf-tga2">查找、校验、Hook、执行、回填</p>
+          </div>
+          <div data-hf-id="hf-qkwt" class="panel evidence">
+            <div data-hf-id="hf-11i1" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-li4s">executeToolCalls</pre>
+            <div data-hf-id="hf-4dp9" class="chips"><div data-hf-id="hf-mh0g" class="chip">lookup</div><div data-hf-id="hf-zh8g" class="chip">validate</div><div data-hf-id="hf-glc9" class="chip">before</div><div data-hf-id="hf-ht99" class="chip">execute</div><div data-hf-id="hf-4vhg" class="chip">after</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ll85" class="footer"><span data-hf-id="hf-7hx3">模型如何使用工具</span><span data-hf-id="hf-3z46">tool call 到 tool result</span></div>
+      </section>
+<section data-hf-id="hf-hmvw" class="scene" id="s3">
+        <div data-hf-id="hf-5jzl" class="grid"></div>
+        <div data-hf-id="hf-wrba" class="glow"></div>
+        <div data-hf-id="hf-pkvq" class="topline"><span data-hf-id="hf-7kwk">CHAPTER 05</span><span data-hf-id="hf-si15">03 / 06</span></div>
+        <div data-hf-id="hf-59cd" class="body">
+          <div data-hf-id="hf-yt2w" class="panel copy">
+            <div data-hf-id="hf-zsly" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-7t1r">错误也是结果</h1>
+            <p data-hf-id="hf-tql7">工具不存在或参数错误，返回 ToolResult</p>
+          </div>
+          <div data-hf-id="hf-rrtw" class="panel evidence">
+            <div data-hf-id="hf-28f4" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-zsyj">failure goes back to model</pre>
+            <div data-hf-id="hf-5kmc" class="chips"><div data-hf-id="hf-xaaj" class="chip">not found</div><div data-hf-id="hf-bjv7" class="chip">schema error</div><div data-hf-id="hf-mqtg" class="chip">isError</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-ms58" class="footer"><span data-hf-id="hf-73m2">模型如何使用工具</span><span data-hf-id="hf-4df7">tool call 到 tool result</span></div>
+      </section>
+<section data-hf-id="hf-54df" class="scene" id="s4">
+        <div data-hf-id="hf-5yam" class="grid"></div>
+        <div data-hf-id="hf-wd09" class="glow"></div>
+        <div data-hf-id="hf-p6kp" class="topline"><span data-hf-id="hf-76lj">CHAPTER 05</span><span data-hf-id="hf-xz5e">04 / 06</span></div>
+        <div data-hf-id="hf-5nne" class="body">
+          <div data-hf-id="hf-yerv" class="panel copy">
+            <div data-hf-id="hf-06wz" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-4jz4">并行细节</h1>
+            <p data-hf-id="hf-qy3x">完成顺序和回填顺序可以不同</p>
+          </div>
+          <div data-hf-id="hf-rdiv" class="panel evidence">
+            <div data-hf-id="hf-1u43" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-j5g4">Promise.all keeps order</pre>
+            <div data-hf-id="hf-56bb" class="chips"><div data-hf-id="hf-5ns7" class="chip">fast end first</div><div data-hf-id="hf-bly7" class="chip">results keep call order</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-mdu7" class="footer"><span data-hf-id="hf-6pb1">模型如何使用工具</span><span data-hf-id="hf-4rq8">tool call 到 tool result</span></div>
+      </section>
+<section data-hf-id="hf-yynm" class="scene" id="s5">
+        <div data-hf-id="hf-4rdj" class="grid"></div>
+        <div data-hf-id="hf-vyp8" class="glow"></div>
+        <div data-hf-id="hf-os9o" class="topline"><span data-hf-id="hf-8dim">CHAPTER 05</span><span data-hf-id="hf-lp8f">05 / 06</span></div>
+        <div data-hf-id="hf-7n6j" class="body">
+          <div data-hf-id="hf-wf8q" class="panel copy">
+            <div data-hf-id="hf-0l80" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-9hrn">Coding Tools</h1>
+            <p data-hf-id="hf-v8tp">read / bash / edit / write</p>
+          </div>
+          <div data-hf-id="hf-skfy" class="panel evidence">
+            <div data-hf-id="hf-zuky" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-vnlc">default tools</pre>
+            <div data-hf-id="hf-6d8e" class="chips"><div data-hf-id="hf-8978" class="chip">read file</div><div data-hf-id="hf-8xle" class="chip">run command</div><div data-hf-id="hf-i2tp" class="chip">replace text</div><div data-hf-id="hf-h8rp" class="chip">write file</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-nkra" class="footer"><span data-hf-id="hf-9hg8">模型如何使用工具</span><span data-hf-id="hf-1zl1">tool call 到 tool result</span></div>
+      </section>
+<section data-hf-id="hf-v0jl" class="scene" id="s6">
+        <div data-hf-id="hf-55ok" class="grid"></div>
+        <div data-hf-id="hf-vke7" class="glow"></div>
+        <div data-hf-id="hf-odyn" class="topline"><span data-hf-id="hf-7z7l">CHAPTER 05</span><span data-hf-id="hf-axi8">06 / 06</span></div>
+        <div data-hf-id="hf-81hk" class="body">
+          <div data-hf-id="hf-w0xp" class="panel copy">
+            <div data-hf-id="hf-xt2t" class="eyebrow">CONTROL FLOW</div>
+            <h1 data-hf-id="hf-sawu">安全边界</h1>
+            <p data-hf-id="hf-7yiq">参数合法不等于操作安全</p>
+          </div>
+          <div data-hf-id="hf-s64x" class="panel evidence">
+            <div data-hf-id="hf-zg9x" class="code-title">真实源码锚点</div>
+            <pre data-hf-id="hf-k2ln">do not confuse layers</pre>
+            <div data-hf-id="hf-5yxd" class="chips"><div data-hf-id="hf-i3l5" class="chip">Schema</div><div data-hf-id="hf-72yc" class="chip">Policy Hooks</div><div data-hf-id="hf-84of" class="chip">OS Sandbox</div></div>
+          </div>
+        </div>
+        <div data-hf-id="hf-n6g9" class="footer"><span data-hf-id="hf-9357">模型如何使用工具</span><span data-hf-id="hf-2dw2">tool call 到 tool result</span></div>
+      </section>
+      <audio data-hf-id="hf-fi61" id="narration" data-start="0" data-duration="473.348" data-track-index="20" src="narration.wav" data-volume="1"></audio>
+      <div data-hf-id="hf-iuvo" id="captions"></div>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const starts = window.CHAPTER_DATA.scenes;
+      const sceneSelectors = starts.map((_, index) => "#s" + (index + 1));
+
+      sceneSelectors.forEach((selector, index) => {
+        const t = starts[index] ?? 0;
+        const scene = document.querySelector(selector);
+        const content = scene.querySelectorAll(".topline, .copy, .evidence, .footer");
+        if (index > 0) tl.set(selector, { opacity: 1, x: 0 }, Math.max(0, t - .45));
+        tl.from(scene.querySelector(".grid"), { opacity: 0, x: index % 2 ? 24 : -24, duration: .75, ease: "sine.out" }, t + .1);
+        tl.from(scene.querySelector(".glow"), { opacity: 0, scale: .82, duration: .9, ease: "power2.out" }, t + .12);
+        tl.from(content, { opacity: 0, y: 28, scale: .988, duration: .58, stagger: .06, ease: "power3.out" }, t + .2);
+        if (index < sceneSelectors.length - 1) {
+          const next = starts[index + 1] ?? t + 12;
+          tl.to(selector, { x: -90, opacity: 0, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+          tl.fromTo(sceneSelectors[index + 1], { x: 90, opacity: 0 }, { x: 0, opacity: 1, duration: .45, ease: "power2.inOut" }, Math.max(0, next - .45));
+        }
+      });
+
+      const captionHost = document.getElementById("captions");
+      window.CHAPTER_DATA.captions.forEach((group, index) => {
+        const element = document.createElement("div");
+        element.className = "caption";
+        element.id = "caption-" + index;
+        element.textContent = group.text;
+        captionHost.appendChild(element);
+        const visibleStart = group.start + .02;
+        const visibleEnd = Math.max(visibleStart + .2, group.end - .04);
+        tl.set(element, { visibility: "visible", opacity: 0 }, visibleStart);
+        tl.fromTo(element, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: .16, ease: "power3.out" }, visibleStart);
+        tl.to(element, { opacity: 0, duration: .1, ease: "power2.in" }, Math.max(visibleStart + .2, visibleEnd - .1));
+        tl.set(element, { opacity: 0, visibility: "hidden" }, visibleEnd);
+      });
+
+      tl.to(".scene:last-of-type .body, .scene:last-of-type .topline, .scene:last-of-type .footer", { opacity: 0, duration: .8, ease: "sine.inOut" }, Math.max(0, window.CHAPTER_DATA.duration - 1.5));
+      window.__timelines["chapter-05"] = tl;
+    </script>
+  </body>
+</html>

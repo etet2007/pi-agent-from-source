@@ -1,0 +1,72 @@
+{
+  "evidenceType": "REAL RUN",
+  "recordedAt": "2026-06-15T14:27:38.545Z",
+  "provider": "openai-codex",
+  "model": "gpt-5.4-mini",
+  "task": "Read greeting.js, change greet() to return `你好，${name}！`, then read it again to confirm.",
+  "sourceSession": "local-private-session.jsonl",
+  "steps": [
+    {
+      "type": "tool_calls",
+      "calls": [
+        {
+          "name": "read",
+          "arguments": {
+            "path": "greeting.js"
+          }
+        }
+      ]
+    },
+    {
+      "type": "tool_result",
+      "toolName": "read",
+      "isError": false,
+      "text": "export function greet(name) {\n  return `Hello, ${name}`;\n}\n"
+    },
+    {
+      "type": "tool_calls",
+      "calls": [
+        {
+          "name": "edit",
+          "arguments": {
+            "path": "greeting.js",
+            "edits": [
+              {
+                "oldText": "  return `Hello, ${name}`;\n",
+                "newText": "  return `你好，${name}！`;\n"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "tool_result",
+      "toolName": "edit",
+      "isError": false,
+      "text": "Successfully replaced 1 block(s) in greeting.js.",
+      "diff": " 1 export function greet(name) {\n-2   return `Hello, ${name}`;\n+2   return `你好，${name}！`;\n 3 }"
+    },
+    {
+      "type": "tool_calls",
+      "calls": [
+        {
+          "name": "read",
+          "arguments": {
+            "path": "greeting.js"
+          }
+        }
+      ]
+    },
+    {
+      "type": "tool_result",
+      "toolName": "read",
+      "isError": false,
+      "text": "export function greet(name) {\n  return `你好，${name}！`;\n}\n"
+    },
+    {
+      "type": "final",
+      "text": "Done."
+    }
+  ]
+}

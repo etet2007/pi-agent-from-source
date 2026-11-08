@@ -6,6 +6,20 @@ An educational source-code analysis: a line-by-line breakdown of [Pi Agent](http
 
 The book is written in English, in **zero-dependency HTML** (only two shared files, `book/style.css` and `book/common.js`), with no build step and no third-party libraries — open it in a browser and read.
 
+## Unified material entry points (2026-10-24)
+
+| Purpose | Entry point | Maintenance role |
+|---|---|---|
+| Current live talk | [presentation/practical/outline.md](presentation/practical/outline.md) | Primary 21-slide talk, minimal harness and source execution replay |
+| In-depth reading | [book/en/index.html](book/en/index.html) | English book; Chinese edition is in `book/` |
+| Long-form video | [course-video/README.md](course-video/README.md) | Narration, animation, assets and local renders moved from ForNextJob |
+| Historical study materials | [archive/pi-agent-study/README.md](archive/pi-agent-study/README.md) | Earlier course, evidence, React viewer and vendored 0.78.1 source |
+| Migration and versions | [research/2026-10-24-fornextjob-migration.md](research/2026-10-24-fornextjob-migration.md) | Provenance, paths, verification and remaining work |
+
+The practical talk pins source commit `784653468`; the imported course uses `130ae577` (package version 0.78.1). Check each claim against its source version before incorporating older content. Historical materials retain their original text; this move does not deduplicate their content.
+Media and dependencies were moved locally and remain Git-ignored. The existing Pages workflow deploys only the book.
+The book license applies to the book; imported materials retain their provenance and license files. Moving them does not change their licensing.
+
 ## How to read
 
 - **Online**: Chinese edition at <https://kuwii.xyz/pi-agent-from-source/>; the English edition is served under `/en/` (<https://kuwii.xyz/pi-agent-from-source/en/>)

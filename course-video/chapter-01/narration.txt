@@ -1,0 +1,29 @@
+这一系列视频会围绕 Pi Agent 源码，讲解它的工作流程，让大家了解一个 LLM Agent 到底是什么；第一章，我们先讲 Agent Loop。我们直接看一个实例。greeting.js文件。greet 函数接收 name，返回 Hello 加上name。
+
+我把这条 Prompt 交给从本地源码启动的Pi Agent：读取 greeting.js，把问候语改成中文。
+
+这次真实运行的顺序是：read、edit、final answer。Pi Agent保存的结构化消息记录了每一步。
+
+第一次模型响应是一个 tool call。名称是read，参数是 greeting.js。宿主程序执行read，把文件源码包装成 tool result，加入 Context。
+
+下一轮模型看到源码，生成edit 调用。参数中包含旧文本和新文本。宿主程序完成替换并返回 diff。
+
+编辑工具返回成功结果和 diff。最后一轮模型没有请求工具，只返回最终回复，循环结束。
+
+普通聊天程序的流程是：用户发消息，程序调用模型，模型返回文本，请求结束。
+
+Agent 允许模型输出 tool call。宿主程序执行工具，把 tool result 放回 Context，再次调用模型。
+
+在这个任务里，模型依次请求 read、edit。每轮根据工具结果，决定下一步动作。这就是 Agent 的循环与反馈。
+
+下面这页，左边是最小 Agent Loop 的伪代码，右边是它在 Pi 源码里的函数对应关系。
+
+assistant message 不是人写的回复。它是 streamAssistantResponse 把 Context 发给模型后，模型返回的一条结构化消息。里面可能有文字，也可能有 tool call。
+
+runLoop 负责反复跑这个流程：取 assistant message，检查里面有没有 tool call。没有，就停止。
+
+如果有 tool call，runLoop 交给 executeToolCalls。宿主执行工具，把 tool result 追加回 Context。下一轮 streamAssistantResponse 会带着新的 Context 再问模型。
+
+Pi 还有 steering 和 follow-up。steering 可以在工作过程中追加方向；follow-up 可以在当前工作结束后启动下一段任务。它们构成源码中的内层循环和外层循环。
+
+第一章只需要记住这条主线：模型生成工具请求，宿主执行工具，工具结果进入 Context，模型生成下一步。没有新的工具请求，循环停止。

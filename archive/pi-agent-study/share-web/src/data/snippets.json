@@ -1,0 +1,3068 @@
+{
+  "cli.ts": {
+    "file": "packages/coding-agent/src/cli.ts",
+    "ranges": "10-20",
+    "lines": [
+      {
+        "line": 10,
+        "text": "import { main } from \"./main.ts\";"
+      },
+      {
+        "line": 11,
+        "text": ""
+      },
+      {
+        "line": 12,
+        "text": "process.title = APP_NAME;"
+      },
+      {
+        "line": 13,
+        "text": "process.env.PI_CODING_AGENT = \"true\";"
+      },
+      {
+        "line": 14,
+        "text": "process.emitWarning = (() => {}) as typeof process.emitWarning;"
+      },
+      {
+        "line": 15,
+        "text": ""
+      },
+      {
+        "line": 16,
+        "text": "// Configure undici's global dispatcher before provider SDKs issue requests."
+      },
+      {
+        "line": 17,
+        "text": "// Runtime settings are applied once SettingsManager has loaded global/project settings."
+      },
+      {
+        "line": 18,
+        "text": "configureHttpDispatcher();"
+      },
+      {
+        "line": 19,
+        "text": ""
+      },
+      {
+        "line": 20,
+        "text": "main(process.argv.slice(2));"
+      }
+    ]
+  },
+  "main.ts": {
+    "file": "packages/coding-agent/src/main.ts",
+    "ranges": "98-110,542-575",
+    "lines": [
+      {
+        "line": 98,
+        "text": "type AppMode = \"interactive\" | \"print\" | \"json\" | \"rpc\";"
+      },
+      {
+        "line": 99,
+        "text": ""
+      },
+      {
+        "line": 100,
+        "text": "function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {"
+      },
+      {
+        "line": 101,
+        "text": "\tif (parsed.mode === \"rpc\") {"
+      },
+      {
+        "line": 102,
+        "text": "\t\treturn \"rpc\";"
+      },
+      {
+        "line": 103,
+        "text": "\t}"
+      },
+      {
+        "line": 104,
+        "text": "\tif (parsed.mode === \"json\") {"
+      },
+      {
+        "line": 105,
+        "text": "\t\treturn \"json\";"
+      },
+      {
+        "line": 106,
+        "text": "\t}"
+      },
+      {
+        "line": 107,
+        "text": "\tif (parsed.print || !stdinIsTTY) {"
+      },
+      {
+        "line": 108,
+        "text": "\t\treturn \"print\";"
+      },
+      {
+        "line": 109,
+        "text": "\t}"
+      },
+      {
+        "line": 110,
+        "text": "\treturn \"interactive\";"
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 542,
+        "text": "export async function main(args: string[], options?: MainOptions) {"
+      },
+      {
+        "line": 543,
+        "text": "\tconsole.log(`coding-agent main.ts main()`);"
+      },
+      {
+        "line": 544,
+        "text": "\tresetTimings();"
+      },
+      {
+        "line": 545,
+        "text": "\tconst offlineMode = args.includes(\"--offline\") || isTruthyEnvFlag(process.env.PI_OFFLINE);"
+      },
+      {
+        "line": 546,
+        "text": "\tif (offlineMode) {"
+      },
+      {
+        "line": 547,
+        "text": "\t\tprocess.env.PI_OFFLINE = \"1\";"
+      },
+      {
+        "line": 548,
+        "text": "\t\tprocess.env.PI_SKIP_VERSION_CHECK = \"1\";"
+      },
+      {
+        "line": 549,
+        "text": "\t}"
+      },
+      {
+        "line": 550,
+        "text": ""
+      },
+      {
+        "line": 551,
+        "text": "\tif (process.platform === \"win32\") {"
+      },
+      {
+        "line": 552,
+        "text": "\t\tcleanupWindowsSelfUpdateQuarantine(getPackageDir());"
+      },
+      {
+        "line": 553,
+        "text": "\t}"
+      },
+      {
+        "line": 554,
+        "text": ""
+      },
+      {
+        "line": 555,
+        "text": "\tif (await handlePackageCommand(args)) {"
+      },
+      {
+        "line": 556,
+        "text": "\t\treturn;"
+      },
+      {
+        "line": 557,
+        "text": "\t}"
+      },
+      {
+        "line": 558,
+        "text": ""
+      },
+      {
+        "line": 559,
+        "text": "\tif (await handleConfigCommand(args)) {"
+      },
+      {
+        "line": 560,
+        "text": "\t\treturn;"
+      },
+      {
+        "line": 561,
+        "text": "\t}"
+      },
+      {
+        "line": 562,
+        "text": ""
+      },
+      {
+        "line": 563,
+        "text": "\tconst parsed = parseArgs(args);"
+      },
+      {
+        "line": 564,
+        "text": "\tif (parsed.diagnostics.length > 0) {"
+      },
+      {
+        "line": 565,
+        "text": "\t\tfor (const d of parsed.diagnostics) {"
+      },
+      {
+        "line": 566,
+        "text": "\t\t\tconst color = d.type === \"error\" ? chalk.red : chalk.yellow;"
+      },
+      {
+        "line": 567,
+        "text": "\t\t\tconsole.error(color(`${d.type === \"error\" ? \"Error\" : \"Warning\"}: ${d.message}`));"
+      },
+      {
+        "line": 568,
+        "text": "\t\t}"
+      },
+      {
+        "line": 569,
+        "text": "\t\tif (parsed.diagnostics.some((d) => d.type === \"error\")) {"
+      },
+      {
+        "line": 570,
+        "text": "\t\t\tprocess.exit(1);"
+      },
+      {
+        "line": 571,
+        "text": "\t\t}"
+      },
+      {
+        "line": 572,
+        "text": "\t}"
+      },
+      {
+        "line": 573,
+        "text": "\ttime(\"parseArgs\");"
+      },
+      {
+        "line": 574,
+        "text": "\tlet appMode = resolveAppMode(parsed, process.stdin.isTTY);"
+      },
+      {
+        "line": 575,
+        "text": "\tconst shouldTakeOverStdout = appMode !== \"interactive\";"
+      }
+    ]
+  },
+  "agent-session.ts": {
+    "file": "packages/coding-agent/src/core/agent-session.ts",
+    "ranges": "325-351,383-430,476-547",
+    "lines": [
+      {
+        "line": 325,
+        "text": "\tconstructor(config: AgentSessionConfig) {"
+      },
+      {
+        "line": 326,
+        "text": "\t\tthis.agent = config.agent;"
+      },
+      {
+        "line": 327,
+        "text": "\t\tthis.sessionManager = config.sessionManager;"
+      },
+      {
+        "line": 328,
+        "text": "\t\tthis.settingsManager = config.settingsManager;"
+      },
+      {
+        "line": 329,
+        "text": "\t\tthis._scopedModels = config.scopedModels ?? [];"
+      },
+      {
+        "line": 330,
+        "text": "\t\tthis._resourceLoader = config.resourceLoader;"
+      },
+      {
+        "line": 331,
+        "text": "\t\tthis._customTools = config.customTools ?? [];"
+      },
+      {
+        "line": 332,
+        "text": "\t\tthis._cwd = config.cwd;"
+      },
+      {
+        "line": 333,
+        "text": "\t\tthis._modelRegistry = config.modelRegistry;"
+      },
+      {
+        "line": 334,
+        "text": "\t\tthis._extensionRunnerRef = config.extensionRunnerRef;"
+      },
+      {
+        "line": 335,
+        "text": "\t\tthis._initialActiveToolNames = config.initialActiveToolNames;"
+      },
+      {
+        "line": 336,
+        "text": "\t\tthis._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;"
+      },
+      {
+        "line": 337,
+        "text": "\t\tthis._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;"
+      },
+      {
+        "line": 338,
+        "text": "\t\tthis._baseToolsOverride = config.baseToolsOverride;"
+      },
+      {
+        "line": 339,
+        "text": "\t\tthis._sessionStartEvent = config.sessionStartEvent ?? { type: \"session_start\", reason: \"startup\" };"
+      },
+      {
+        "line": 340,
+        "text": ""
+      },
+      {
+        "line": 341,
+        "text": "\t\t// Always subscribe to agent events for internal handling"
+      },
+      {
+        "line": 342,
+        "text": "\t\t// (session persistence, extensions, auto-compaction, retry logic)"
+      },
+      {
+        "line": 343,
+        "text": "\t\tthis._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);"
+      },
+      {
+        "line": 344,
+        "text": "\t\tthis._installAgentToolHooks();"
+      },
+      {
+        "line": 345,
+        "text": ""
+      },
+      {
+        "line": 346,
+        "text": "\t\tthis._buildRuntime({"
+      },
+      {
+        "line": 347,
+        "text": "\t\t\tactiveToolNames: this._initialActiveToolNames,"
+      },
+      {
+        "line": 348,
+        "text": "\t\t\tincludeAllExtensionTools: true,"
+      },
+      {
+        "line": 349,
+        "text": "\t\t});"
+      },
+      {
+        "line": 350,
+        "text": "\t}"
+      },
+      {
+        "line": 351,
+        "text": ""
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 383,
+        "text": "\tprivate async _getCompactionRequestAuth(model: Model<any>): Promise<{"
+      },
+      {
+        "line": 384,
+        "text": "\t\tapiKey?: string;"
+      },
+      {
+        "line": 385,
+        "text": "\t\theaders?: Record<string, string>;"
+      },
+      {
+        "line": 386,
+        "text": "\t}> {"
+      },
+      {
+        "line": 387,
+        "text": "\t\tif (this.agent.streamFn === streamSimple) {"
+      },
+      {
+        "line": 388,
+        "text": "\t\t\treturn this._getRequiredRequestAuth(model);"
+      },
+      {
+        "line": 389,
+        "text": "\t\t}"
+      },
+      {
+        "line": 390,
+        "text": ""
+      },
+      {
+        "line": 391,
+        "text": "\t\tconst result = await this._modelRegistry.getApiKeyAndHeaders(model);"
+      },
+      {
+        "line": 392,
+        "text": "\t\treturn result.ok ? { apiKey: result.apiKey, headers: result.headers } : {};"
+      },
+      {
+        "line": 393,
+        "text": "\t}"
+      },
+      {
+        "line": 394,
+        "text": ""
+      },
+      {
+        "line": 395,
+        "text": "\t/**"
+      },
+      {
+        "line": 396,
+        "text": "\t * Install tool hooks once on the Agent instance."
+      },
+      {
+        "line": 397,
+        "text": "\t *"
+      },
+      {
+        "line": 398,
+        "text": "\t * The callbacks read `this._extensionRunner` at execution time, so extension reload swaps in the"
+      },
+      {
+        "line": 399,
+        "text": "\t * new runner without reinstalling hooks. Extension-specific tool wrappers are still used to adapt"
+      },
+      {
+        "line": 400,
+        "text": "\t * registered tool execution to the extension context. Tool call and tool result interception now"
+      },
+      {
+        "line": 401,
+        "text": "\t * happens here instead of in wrappers."
+      },
+      {
+        "line": 402,
+        "text": "\t */"
+      },
+      {
+        "line": 403,
+        "text": "\tprivate _installAgentToolHooks(): void {"
+      },
+      {
+        "line": 404,
+        "text": "\t\tthis.agent.beforeToolCall = async ({ toolCall, args }) => {"
+      },
+      {
+        "line": 405,
+        "text": "\t\t\tconst runner = this._extensionRunner;"
+      },
+      {
+        "line": 406,
+        "text": "\t\t\tif (!runner.hasHandlers(\"tool_call\")) {"
+      },
+      {
+        "line": 407,
+        "text": "\t\t\t\treturn undefined;"
+      },
+      {
+        "line": 408,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 409,
+        "text": ""
+      },
+      {
+        "line": 410,
+        "text": "\t\t\ttry {"
+      },
+      {
+        "line": 411,
+        "text": "\t\t\t\treturn await runner.emitToolCall({"
+      },
+      {
+        "line": 412,
+        "text": "\t\t\t\t\ttype: \"tool_call\","
+      },
+      {
+        "line": 413,
+        "text": "\t\t\t\t\ttoolName: toolCall.name,"
+      },
+      {
+        "line": 414,
+        "text": "\t\t\t\t\ttoolCallId: toolCall.id,"
+      },
+      {
+        "line": 415,
+        "text": "\t\t\t\t\tinput: args as Record<string, unknown>,"
+      },
+      {
+        "line": 416,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 417,
+        "text": "\t\t\t} catch (err) {"
+      },
+      {
+        "line": 418,
+        "text": "\t\t\t\tif (err instanceof Error) {"
+      },
+      {
+        "line": 419,
+        "text": "\t\t\t\t\tthrow err;"
+      },
+      {
+        "line": 420,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 421,
+        "text": "\t\t\t\tthrow new Error(`Extension failed, blocking execution: ${String(err)}`);"
+      },
+      {
+        "line": 422,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 423,
+        "text": "\t\t};"
+      },
+      {
+        "line": 424,
+        "text": ""
+      },
+      {
+        "line": 425,
+        "text": "\t\tthis.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {"
+      },
+      {
+        "line": 426,
+        "text": "\t\t\tconst runner = this._extensionRunner;"
+      },
+      {
+        "line": 427,
+        "text": "\t\t\tif (!runner.hasHandlers(\"tool_result\")) {"
+      },
+      {
+        "line": 428,
+        "text": "\t\t\t\treturn undefined;"
+      },
+      {
+        "line": 429,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 430,
+        "text": ""
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 476,
+        "text": "\tprivate _handleAgentEvent = async (event: AgentEvent): Promise<void> => {"
+      },
+      {
+        "line": 477,
+        "text": "\t\t// When a user message starts, check if it's from either queue and remove it BEFORE emitting"
+      },
+      {
+        "line": 478,
+        "text": "\t\t// This ensures the UI sees the updated queue state"
+      },
+      {
+        "line": 479,
+        "text": "\t\tif (event.type === \"message_start\" && event.message.role === \"user\") {"
+      },
+      {
+        "line": 480,
+        "text": "\t\t\tthis._overflowRecoveryAttempted = false;"
+      },
+      {
+        "line": 481,
+        "text": "\t\t\tconst messageText = this._getUserMessageText(event.message);"
+      },
+      {
+        "line": 482,
+        "text": "\t\t\tif (messageText) {"
+      },
+      {
+        "line": 483,
+        "text": "\t\t\t\t// Check steering queue first"
+      },
+      {
+        "line": 484,
+        "text": "\t\t\t\tconst steeringIndex = this._steeringMessages.indexOf(messageText);"
+      },
+      {
+        "line": 485,
+        "text": "\t\t\t\tif (steeringIndex !== -1) {"
+      },
+      {
+        "line": 486,
+        "text": "\t\t\t\t\tthis._steeringMessages.splice(steeringIndex, 1);"
+      },
+      {
+        "line": 487,
+        "text": "\t\t\t\t\tthis._emitQueueUpdate();"
+      },
+      {
+        "line": 488,
+        "text": "\t\t\t\t} else {"
+      },
+      {
+        "line": 489,
+        "text": "\t\t\t\t\t// Check follow-up queue"
+      },
+      {
+        "line": 490,
+        "text": "\t\t\t\t\tconst followUpIndex = this._followUpMessages.indexOf(messageText);"
+      },
+      {
+        "line": 491,
+        "text": "\t\t\t\t\tif (followUpIndex !== -1) {"
+      },
+      {
+        "line": 492,
+        "text": "\t\t\t\t\t\tthis._followUpMessages.splice(followUpIndex, 1);"
+      },
+      {
+        "line": 493,
+        "text": "\t\t\t\t\t\tthis._emitQueueUpdate();"
+      },
+      {
+        "line": 494,
+        "text": "\t\t\t\t\t}"
+      },
+      {
+        "line": 495,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 496,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 497,
+        "text": "\t\t}"
+      },
+      {
+        "line": 498,
+        "text": ""
+      },
+      {
+        "line": 499,
+        "text": "\t\t// Emit to extensions first"
+      },
+      {
+        "line": 500,
+        "text": "\t\tawait this._emitExtensionEvent(event);"
+      },
+      {
+        "line": 501,
+        "text": ""
+      },
+      {
+        "line": 502,
+        "text": "\t\t// Notify all listeners"
+      },
+      {
+        "line": 503,
+        "text": "\t\tthis._emit(event.type === \"agent_end\" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);"
+      },
+      {
+        "line": 504,
+        "text": ""
+      },
+      {
+        "line": 505,
+        "text": "\t\t// Handle session persistence"
+      },
+      {
+        "line": 506,
+        "text": "\t\tif (event.type === \"message_end\") {"
+      },
+      {
+        "line": 507,
+        "text": "\t\t\t// Check if this is a custom message from extensions"
+      },
+      {
+        "line": 508,
+        "text": "\t\t\tif (event.message.role === \"custom\") {"
+      },
+      {
+        "line": 509,
+        "text": "\t\t\t\t// Persist as CustomMessageEntry"
+      },
+      {
+        "line": 510,
+        "text": "\t\t\t\tthis.sessionManager.appendCustomMessageEntry("
+      },
+      {
+        "line": 511,
+        "text": "\t\t\t\t\tevent.message.customType,"
+      },
+      {
+        "line": 512,
+        "text": "\t\t\t\t\tevent.message.content,"
+      },
+      {
+        "line": 513,
+        "text": "\t\t\t\t\tevent.message.display,"
+      },
+      {
+        "line": 514,
+        "text": "\t\t\t\t\tevent.message.details,"
+      },
+      {
+        "line": 515,
+        "text": "\t\t\t\t);"
+      },
+      {
+        "line": 516,
+        "text": "\t\t\t} else if ("
+      },
+      {
+        "line": 517,
+        "text": "\t\t\t\tevent.message.role === \"user\" ||"
+      },
+      {
+        "line": 518,
+        "text": "\t\t\t\tevent.message.role === \"assistant\" ||"
+      },
+      {
+        "line": 519,
+        "text": "\t\t\t\tevent.message.role === \"toolResult\""
+      },
+      {
+        "line": 520,
+        "text": "\t\t\t) {"
+      },
+      {
+        "line": 521,
+        "text": "\t\t\t\t// Regular LLM message - persist as SessionMessageEntry"
+      },
+      {
+        "line": 522,
+        "text": "\t\t\t\tthis.sessionManager.appendMessage(event.message);"
+      },
+      {
+        "line": 523,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 524,
+        "text": "\t\t\t// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere"
+      },
+      {
+        "line": 525,
+        "text": ""
+      },
+      {
+        "line": 526,
+        "text": "\t\t\t// Track assistant message for auto-compaction (checked on agent_end)"
+      },
+      {
+        "line": 527,
+        "text": "\t\t\tif (event.message.role === \"assistant\") {"
+      },
+      {
+        "line": 528,
+        "text": "\t\t\t\tthis._lastAssistantMessage = event.message;"
+      },
+      {
+        "line": 529,
+        "text": ""
+      },
+      {
+        "line": 530,
+        "text": "\t\t\t\tconst assistantMsg = event.message as AssistantMessage;"
+      },
+      {
+        "line": 531,
+        "text": "\t\t\t\tif (assistantMsg.stopReason !== \"error\") {"
+      },
+      {
+        "line": 532,
+        "text": "\t\t\t\t\tthis._overflowRecoveryAttempted = false;"
+      },
+      {
+        "line": 533,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 534,
+        "text": ""
+      },
+      {
+        "line": 535,
+        "text": "\t\t\t\t// Reset retry counter immediately on successful assistant response"
+      },
+      {
+        "line": 536,
+        "text": "\t\t\t\t// This prevents accumulation across multiple LLM calls within a turn"
+      },
+      {
+        "line": 537,
+        "text": "\t\t\t\tif (assistantMsg.stopReason !== \"error\" && this._retryAttempt > 0) {"
+      },
+      {
+        "line": 538,
+        "text": "\t\t\t\t\tthis._emit({"
+      },
+      {
+        "line": 539,
+        "text": "\t\t\t\t\t\ttype: \"auto_retry_end\","
+      },
+      {
+        "line": 540,
+        "text": "\t\t\t\t\t\tsuccess: true,"
+      },
+      {
+        "line": 541,
+        "text": "\t\t\t\t\t\tattempt: this._retryAttempt,"
+      },
+      {
+        "line": 542,
+        "text": "\t\t\t\t\t});"
+      },
+      {
+        "line": 543,
+        "text": "\t\t\t\t\tthis._retryAttempt = 0;"
+      },
+      {
+        "line": 544,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 545,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 546,
+        "text": "\t\t}"
+      },
+      {
+        "line": 547,
+        "text": "\t};"
+      }
+    ]
+  },
+  "agent.ts": {
+    "file": "packages/agent/src/agent.ts",
+    "ranges": "95-180,330-420",
+    "lines": [
+      {
+        "line": 95,
+        "text": "/** Options for constructing an {@link Agent}. */"
+      },
+      {
+        "line": 96,
+        "text": "export interface AgentOptions {"
+      },
+      {
+        "line": 97,
+        "text": "\tinitialState?: Partial<Omit<AgentState, \"pendingToolCalls\" | \"isStreaming\" | \"streamingMessage\" | \"errorMessage\">>;"
+      },
+      {
+        "line": 98,
+        "text": "\tconvertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;"
+      },
+      {
+        "line": 99,
+        "text": "\ttransformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;"
+      },
+      {
+        "line": 100,
+        "text": "\tstreamFn?: StreamFn;"
+      },
+      {
+        "line": 101,
+        "text": "\tgetApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;"
+      },
+      {
+        "line": 102,
+        "text": "\tonPayload?: SimpleStreamOptions[\"onPayload\"];"
+      },
+      {
+        "line": 103,
+        "text": "\tonResponse?: SimpleStreamOptions[\"onResponse\"];"
+      },
+      {
+        "line": 104,
+        "text": "\tbeforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;"
+      },
+      {
+        "line": 105,
+        "text": "\tafterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;"
+      },
+      {
+        "line": 106,
+        "text": "\tprepareNextTurn?: ("
+      },
+      {
+        "line": 107,
+        "text": "\t\tsignal?: AbortSignal,"
+      },
+      {
+        "line": 108,
+        "text": "\t) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;"
+      },
+      {
+        "line": 109,
+        "text": "\tsteeringMode?: QueueMode;"
+      },
+      {
+        "line": 110,
+        "text": "\tfollowUpMode?: QueueMode;"
+      },
+      {
+        "line": 111,
+        "text": "\tsessionId?: string;"
+      },
+      {
+        "line": 112,
+        "text": "\tthinkingBudgets?: ThinkingBudgets;"
+      },
+      {
+        "line": 113,
+        "text": "\ttransport?: Transport;"
+      },
+      {
+        "line": 114,
+        "text": "\tmaxRetryDelayMs?: number;"
+      },
+      {
+        "line": 115,
+        "text": "\ttoolExecution?: ToolExecutionMode;"
+      },
+      {
+        "line": 116,
+        "text": "}"
+      },
+      {
+        "line": 117,
+        "text": ""
+      },
+      {
+        "line": 118,
+        "text": "class PendingMessageQueue {"
+      },
+      {
+        "line": 119,
+        "text": "\tprivate messages: AgentMessage[] = [];"
+      },
+      {
+        "line": 120,
+        "text": "\tpublic mode: QueueMode;"
+      },
+      {
+        "line": 121,
+        "text": ""
+      },
+      {
+        "line": 122,
+        "text": "\tconstructor(mode: QueueMode) {"
+      },
+      {
+        "line": 123,
+        "text": "\t\tthis.mode = mode;"
+      },
+      {
+        "line": 124,
+        "text": "\t}"
+      },
+      {
+        "line": 125,
+        "text": ""
+      },
+      {
+        "line": 126,
+        "text": "\tenqueue(message: AgentMessage): void {"
+      },
+      {
+        "line": 127,
+        "text": "\t\tthis.messages.push(message);"
+      },
+      {
+        "line": 128,
+        "text": "\t}"
+      },
+      {
+        "line": 129,
+        "text": ""
+      },
+      {
+        "line": 130,
+        "text": "\thasItems(): boolean {"
+      },
+      {
+        "line": 131,
+        "text": "\t\treturn this.messages.length > 0;"
+      },
+      {
+        "line": 132,
+        "text": "\t}"
+      },
+      {
+        "line": 133,
+        "text": ""
+      },
+      {
+        "line": 134,
+        "text": "\tdrain(): AgentMessage[] {"
+      },
+      {
+        "line": 135,
+        "text": "\t\tif (this.mode === \"all\") {"
+      },
+      {
+        "line": 136,
+        "text": "\t\t\tconst drained = this.messages.slice();"
+      },
+      {
+        "line": 137,
+        "text": "\t\t\tthis.messages = [];"
+      },
+      {
+        "line": 138,
+        "text": "\t\t\treturn drained;"
+      },
+      {
+        "line": 139,
+        "text": "\t\t}"
+      },
+      {
+        "line": 140,
+        "text": ""
+      },
+      {
+        "line": 141,
+        "text": "\t\tconst first = this.messages[0];"
+      },
+      {
+        "line": 142,
+        "text": "\t\tif (!first) {"
+      },
+      {
+        "line": 143,
+        "text": "\t\t\treturn [];"
+      },
+      {
+        "line": 144,
+        "text": "\t\t}"
+      },
+      {
+        "line": 145,
+        "text": "\t\tthis.messages = this.messages.slice(1);"
+      },
+      {
+        "line": 146,
+        "text": "\t\treturn [first];"
+      },
+      {
+        "line": 147,
+        "text": "\t}"
+      },
+      {
+        "line": 148,
+        "text": ""
+      },
+      {
+        "line": 149,
+        "text": "\tclear(): void {"
+      },
+      {
+        "line": 150,
+        "text": "\t\tthis.messages = [];"
+      },
+      {
+        "line": 151,
+        "text": "\t}"
+      },
+      {
+        "line": 152,
+        "text": "}"
+      },
+      {
+        "line": 153,
+        "text": ""
+      },
+      {
+        "line": 154,
+        "text": "type ActiveRun = {"
+      },
+      {
+        "line": 155,
+        "text": "\tpromise: Promise<void>;"
+      },
+      {
+        "line": 156,
+        "text": "\tresolve: () => void;"
+      },
+      {
+        "line": 157,
+        "text": "\tabortController: AbortController;"
+      },
+      {
+        "line": 158,
+        "text": "};"
+      },
+      {
+        "line": 159,
+        "text": ""
+      },
+      {
+        "line": 160,
+        "text": "/**"
+      },
+      {
+        "line": 161,
+        "text": " * Stateful wrapper around the low-level agent loop."
+      },
+      {
+        "line": 162,
+        "text": " *"
+      },
+      {
+        "line": 163,
+        "text": " * `Agent` owns the current transcript, emits lifecycle events, executes tools,"
+      },
+      {
+        "line": 164,
+        "text": " * and exposes queueing APIs for steering and follow-up messages."
+      },
+      {
+        "line": 165,
+        "text": " */"
+      },
+      {
+        "line": 166,
+        "text": "export class Agent {"
+      },
+      {
+        "line": 167,
+        "text": "\tprivate _state: MutableAgentState;"
+      },
+      {
+        "line": 168,
+        "text": "\tprivate readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();"
+      },
+      {
+        "line": 169,
+        "text": "\tprivate readonly steeringQueue: PendingMessageQueue;"
+      },
+      {
+        "line": 170,
+        "text": "\tprivate readonly followUpQueue: PendingMessageQueue;"
+      },
+      {
+        "line": 171,
+        "text": ""
+      },
+      {
+        "line": 172,
+        "text": "\tpublic convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;"
+      },
+      {
+        "line": 173,
+        "text": "\tpublic transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;"
+      },
+      {
+        "line": 174,
+        "text": "\tpublic streamFn: StreamFn;"
+      },
+      {
+        "line": 175,
+        "text": "\tpublic getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;"
+      },
+      {
+        "line": 176,
+        "text": "\tpublic onPayload?: SimpleStreamOptions[\"onPayload\"];"
+      },
+      {
+        "line": 177,
+        "text": "\tpublic onResponse?: SimpleStreamOptions[\"onResponse\"];"
+      },
+      {
+        "line": 178,
+        "text": "\tpublic beforeToolCall?: ("
+      },
+      {
+        "line": 179,
+        "text": "\t\tcontext: BeforeToolCallContext,"
+      },
+      {
+        "line": 180,
+        "text": "\t\tsignal?: AbortSignal,"
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 330,
+        "text": "\t\t\t\t\"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.\","
+      },
+      {
+        "line": 331,
+        "text": "\t\t\t);"
+      },
+      {
+        "line": 332,
+        "text": "\t\t}"
+      },
+      {
+        "line": 333,
+        "text": "\t\tconsole.log(\"[调试] Agent.prompt：收到新的 prompt 请求，准备规范化输入\", {"
+      },
+      {
+        "line": 334,
+        "text": "\t\t\tinputType: typeof input === \"string\" ? \"string\" : Array.isArray(input) ? \"message[]\" : \"message\","
+      },
+      {
+        "line": 335,
+        "text": "\t\t\timageCount: images?.length ?? 0,"
+      },
+      {
+        "line": 336,
+        "text": "\t\t\texistingMessageCount: this._state.messages.length,"
+      },
+      {
+        "line": 337,
+        "text": "\t\t\ttoolCount: this._state.tools.length,"
+      },
+      {
+        "line": 338,
+        "text": "\t\t\tprovider: this._state.model.provider,"
+      },
+      {
+        "line": 339,
+        "text": "\t\t\tmodel: this._state.model.id,"
+      },
+      {
+        "line": 340,
+        "text": "\t\t\tapi: this._state.model.api,"
+      },
+      {
+        "line": 341,
+        "text": "\t\t});"
+      },
+      {
+        "line": 342,
+        "text": "\t\tconst messages = this.normalizePromptInput(input, images);"
+      },
+      {
+        "line": 343,
+        "text": "\t\tconsole.log(\"[调试] Agent.prompt：输入normalize完成，准备进入 runPromptMessages\", {"
+      },
+      {
+        "line": 344,
+        "text": "\t\t\tmessages: JSON.stringify(messages, null, 2),"
+      },
+      {
+        "line": 345,
+        "text": "\t\t});"
+      },
+      {
+        "line": 346,
+        "text": "\t\tawait this.runPromptMessages(messages);"
+      },
+      {
+        "line": 347,
+        "text": "\t}"
+      },
+      {
+        "line": 348,
+        "text": ""
+      },
+      {
+        "line": 349,
+        "text": "\t/** Continue from the current transcript. The last message must be a user or tool-result message. */"
+      },
+      {
+        "line": 350,
+        "text": "\tasync continue(): Promise<void> {"
+      },
+      {
+        "line": 351,
+        "text": "\t\tif (this.activeRun) {"
+      },
+      {
+        "line": 352,
+        "text": "\t\t\tthrow new Error(\"Agent is already processing. Wait for completion before continuing.\");"
+      },
+      {
+        "line": 353,
+        "text": "\t\t}"
+      },
+      {
+        "line": 354,
+        "text": ""
+      },
+      {
+        "line": 355,
+        "text": "\t\tconst lastMessage = this._state.messages[this._state.messages.length - 1];"
+      },
+      {
+        "line": 356,
+        "text": "\t\tif (!lastMessage) {"
+      },
+      {
+        "line": 357,
+        "text": "\t\t\tthrow new Error(\"No messages to continue from\");"
+      },
+      {
+        "line": 358,
+        "text": "\t\t}"
+      },
+      {
+        "line": 359,
+        "text": ""
+      },
+      {
+        "line": 360,
+        "text": "\t\tif (lastMessage.role === \"assistant\") {"
+      },
+      {
+        "line": 361,
+        "text": "\t\t\tconst queuedSteering = this.steeringQueue.drain();"
+      },
+      {
+        "line": 362,
+        "text": "\t\t\tif (queuedSteering.length > 0) {"
+      },
+      {
+        "line": 363,
+        "text": "\t\t\t\tawait this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });"
+      },
+      {
+        "line": 364,
+        "text": "\t\t\t\treturn;"
+      },
+      {
+        "line": 365,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 366,
+        "text": ""
+      },
+      {
+        "line": 367,
+        "text": "\t\t\tconst queuedFollowUps = this.followUpQueue.drain();"
+      },
+      {
+        "line": 368,
+        "text": "\t\t\tif (queuedFollowUps.length > 0) {"
+      },
+      {
+        "line": 369,
+        "text": "\t\t\t\tawait this.runPromptMessages(queuedFollowUps);"
+      },
+      {
+        "line": 370,
+        "text": "\t\t\t\treturn;"
+      },
+      {
+        "line": 371,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 372,
+        "text": ""
+      },
+      {
+        "line": 373,
+        "text": "\t\t\tthrow new Error(\"Cannot continue from message role: assistant\");"
+      },
+      {
+        "line": 374,
+        "text": "\t\t}"
+      },
+      {
+        "line": 375,
+        "text": ""
+      },
+      {
+        "line": 376,
+        "text": "\t\tawait this.runContinuation();"
+      },
+      {
+        "line": 377,
+        "text": "\t}"
+      },
+      {
+        "line": 378,
+        "text": ""
+      },
+      {
+        "line": 379,
+        "text": "\tprivate normalizePromptInput("
+      },
+      {
+        "line": 380,
+        "text": "\t\tinput: string | AgentMessage | AgentMessage[],"
+      },
+      {
+        "line": 381,
+        "text": "\t\timages?: ImageContent[],"
+      },
+      {
+        "line": 382,
+        "text": "\t): AgentMessage[] {"
+      },
+      {
+        "line": 383,
+        "text": "\t\tif (Array.isArray(input)) {"
+      },
+      {
+        "line": 384,
+        "text": "\t\t\treturn input;"
+      },
+      {
+        "line": 385,
+        "text": "\t\t}"
+      },
+      {
+        "line": 386,
+        "text": ""
+      },
+      {
+        "line": 387,
+        "text": "\t\tif (typeof input !== \"string\") {"
+      },
+      {
+        "line": 388,
+        "text": "\t\t\treturn [input];"
+      },
+      {
+        "line": 389,
+        "text": "\t\t}"
+      },
+      {
+        "line": 390,
+        "text": ""
+      },
+      {
+        "line": 391,
+        "text": "\t\tconst content: Array<TextContent | ImageContent> = [{ type: \"text\", text: input }];"
+      },
+      {
+        "line": 392,
+        "text": "\t\tif (images && images.length > 0) {"
+      },
+      {
+        "line": 393,
+        "text": "\t\t\tcontent.push(...images);"
+      },
+      {
+        "line": 394,
+        "text": "\t\t}"
+      },
+      {
+        "line": 395,
+        "text": "\t\treturn [{ role: \"user\", content, timestamp: Date.now() }];"
+      },
+      {
+        "line": 396,
+        "text": "\t}"
+      },
+      {
+        "line": 397,
+        "text": ""
+      },
+      {
+        "line": 398,
+        "text": "\tprivate async runPromptMessages("
+      },
+      {
+        "line": 399,
+        "text": "\t\tmessages: AgentMessage[],"
+      },
+      {
+        "line": 400,
+        "text": "\t\toptions: { skipInitialSteeringPoll?: boolean } = {},"
+      },
+      {
+        "line": 401,
+        "text": "\t): Promise<void> {"
+      },
+      {
+        "line": 402,
+        "text": "\t\tconsole.log(\"[调试] Agent.runPromptMessages：准备启动 Agent 主循环\", {"
+      },
+      {
+        "line": 403,
+        "text": "\t\t\tmessageCount: messages.length,"
+      },
+      {
+        "line": 404,
+        "text": "\t\t\troles: messages.map((message) => message.role),"
+      },
+      {
+        "line": 405,
+        "text": "\t\t\tskipInitialSteeringPoll: options.skipInitialSteeringPoll === true,"
+      },
+      {
+        "line": 406,
+        "text": "\t\t\tcontextMessageCount: this._state.messages.length,"
+      },
+      {
+        "line": 407,
+        "text": "\t\t\ttoolCount: this._state.tools.length,"
+      },
+      {
+        "line": 408,
+        "text": "\t\t});"
+      },
+      {
+        "line": 409,
+        "text": "\t\tawait this.runWithLifecycle(async (signal) => {"
+      },
+      {
+        "line": 410,
+        "text": "\t\t\tawait runAgentLoop("
+      },
+      {
+        "line": 411,
+        "text": "\t\t\t\tmessages,"
+      },
+      {
+        "line": 412,
+        "text": "\t\t\t\tthis.createContextSnapshot(),"
+      },
+      {
+        "line": 413,
+        "text": "\t\t\t\tthis.createLoopConfig(options),"
+      },
+      {
+        "line": 414,
+        "text": "\t\t\t\t(event) => this.processEvents(event),"
+      },
+      {
+        "line": 415,
+        "text": "\t\t\t\tsignal,"
+      },
+      {
+        "line": 416,
+        "text": "\t\t\t\tthis.streamFn,"
+      },
+      {
+        "line": 417,
+        "text": "\t\t\t);"
+      },
+      {
+        "line": 418,
+        "text": "\t\t});"
+      },
+      {
+        "line": 419,
+        "text": "\t}"
+      },
+      {
+        "line": 420,
+        "text": ""
+      }
+    ]
+  },
+  "agent-loop-runAgentLoop": {
+    "file": "packages/agent/src/agent-loop.ts",
+    "ranges": "95-132",
+    "lines": [
+      {
+        "line": 95,
+        "text": "export async function runAgentLoop("
+      },
+      {
+        "line": 96,
+        "text": "\tprompts: AgentMessage[],"
+      },
+      {
+        "line": 97,
+        "text": "\tcontext: AgentContext,"
+      },
+      {
+        "line": 98,
+        "text": "\tconfig: AgentLoopConfig,"
+      },
+      {
+        "line": 99,
+        "text": "\temit: AgentEventSink,"
+      },
+      {
+        "line": 100,
+        "text": "\tsignal?: AbortSignal,"
+      },
+      {
+        "line": 101,
+        "text": "\tstreamFn?: StreamFn,"
+      },
+      {
+        "line": 102,
+        "text": "): Promise<AgentMessage[]> {"
+      },
+      {
+        "line": 103,
+        "text": "\tconsole.log(\"[调试] runAgentLoop：启动新一轮 Agent Loop\", {"
+      },
+      {
+        "line": 104,
+        "text": "\t\tpromptCount: prompts.length,"
+      },
+      {
+        "line": 105,
+        "text": "\t\tpromptRoles: prompts.map((prompt) => prompt.role),"
+      },
+      {
+        "line": 106,
+        "text": "\t\tcontextMessageCount: context.messages.length,"
+      },
+      {
+        "line": 107,
+        "text": "\t\ttoolCount: context.tools?.length ?? 0,"
+      },
+      {
+        "line": 108,
+        "text": "\t\tprovider: config.model.provider,"
+      },
+      {
+        "line": 109,
+        "text": "\t\tmodel: config.model.id,"
+      },
+      {
+        "line": 110,
+        "text": "\t\tapi: config.model.api,"
+      },
+      {
+        "line": 111,
+        "text": "\t});"
+      },
+      {
+        "line": 112,
+        "text": "\tconst newMessages: AgentMessage[] = [...prompts];"
+      },
+      {
+        "line": 113,
+        "text": "\tconst currentContext: AgentContext = {"
+      },
+      {
+        "line": 114,
+        "text": "\t\t...context,"
+      },
+      {
+        "line": 115,
+        "text": "\t\tmessages: [...context.messages, ...prompts],"
+      },
+      {
+        "line": 116,
+        "text": "\t};"
+      },
+      {
+        "line": 117,
+        "text": "\tconsole.log(\"[调试] runAgentLoop：创建本轮消息记录和模型上下文快照\", {"
+      },
+      {
+        "line": 118,
+        "text": "\t\texplain:"
+      },
+      {
+        "line": 119,
+        "text": "\t\t\t\"newMessages 只记录本次 run 新增的消息；currentContext.messages 是历史消息加本次 prompt，后续会作为模型可见上下文继续追加 assistant/toolResult\","
+      },
+      {
+        "line": 120,
+        "text": "\t\tnewMessageCount: newMessages.length,"
+      },
+      {
+        "line": 121,
+        "text": "\t});"
+      },
+      {
+        "line": 122,
+        "text": ""
+      },
+      {
+        "line": 123,
+        "text": "\tawait emit({ type: \"agent_start\" });"
+      },
+      {
+        "line": 124,
+        "text": "\tawait emit({ type: \"turn_start\" });"
+      },
+      {
+        "line": 125,
+        "text": "\tfor (const prompt of prompts) {"
+      },
+      {
+        "line": 126,
+        "text": "\t\tawait emit({ type: \"message_start\", message: prompt });"
+      },
+      {
+        "line": 127,
+        "text": "\t\tawait emit({ type: \"message_end\", message: prompt });"
+      },
+      {
+        "line": 128,
+        "text": "\t}"
+      },
+      {
+        "line": 129,
+        "text": ""
+      },
+      {
+        "line": 130,
+        "text": "\tawait runLoop(currentContext, newMessages, config, signal, emit, streamFn);"
+      },
+      {
+        "line": 131,
+        "text": "\treturn newMessages;"
+      },
+      {
+        "line": 132,
+        "text": "}"
+      }
+    ]
+  },
+  "agent-loop-runLoop": {
+    "file": "packages/agent/src/agent-loop.ts",
+    "ranges": "176-340",
+    "lines": [
+      {
+        "line": 176,
+        "text": "async function runLoop("
+      },
+      {
+        "line": 177,
+        "text": "\tinitialContext: AgentContext,"
+      },
+      {
+        "line": 178,
+        "text": "\tnewMessages: AgentMessage[],"
+      },
+      {
+        "line": 179,
+        "text": "\tinitialConfig: AgentLoopConfig,"
+      },
+      {
+        "line": 180,
+        "text": "\tsignal: AbortSignal | undefined,"
+      },
+      {
+        "line": 181,
+        "text": "\temit: AgentEventSink,"
+      },
+      {
+        "line": 182,
+        "text": "\tstreamFn?: StreamFn,"
+      },
+      {
+        "line": 183,
+        "text": "): Promise<void> {"
+      },
+      {
+        "line": 184,
+        "text": "\tlet currentContext = initialContext;"
+      },
+      {
+        "line": 185,
+        "text": "\tlet config = initialConfig;"
+      },
+      {
+        "line": 186,
+        "text": "\tlet firstTurn = true;"
+      },
+      {
+        "line": 187,
+        "text": "\t// Check for steering messages at start (user may have typed while waiting)"
+      },
+      {
+        "line": 188,
+        "text": "\tlet pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];"
+      },
+      {
+        "line": 189,
+        "text": "\tconsole.log(\"[调试] runLoop：进入主循环，先检查 steering 队列\", {"
+      },
+      {
+        "line": 190,
+        "text": "\t\tinitialContextMessageCount: initialContext.messages.length,"
+      },
+      {
+        "line": 191,
+        "text": "\t\tinitialNewMessageCount: newMessages.length,"
+      },
+      {
+        "line": 192,
+        "text": "\t\tpendingSteeringCount: pendingMessages.length,"
+      },
+      {
+        "line": 193,
+        "text": "\t});"
+      },
+      {
+        "line": 194,
+        "text": ""
+      },
+      {
+        "line": 195,
+        "text": "\t// Outer loop: continues when queued follow-up messages arrive after agent would stop"
+      },
+      {
+        "line": 196,
+        "text": "\twhile (true) {"
+      },
+      {
+        "line": 197,
+        "text": "\t\tlet hasMoreToolCalls = true;"
+      },
+      {
+        "line": 198,
+        "text": ""
+      },
+      {
+        "line": 199,
+        "text": "\t\t// Inner loop: process tool calls and steering messages"
+      },
+      {
+        "line": 200,
+        "text": "\t\twhile (hasMoreToolCalls || pendingMessages.length > 0) {"
+      },
+      {
+        "line": 201,
+        "text": "\t\t\tif (!firstTurn) {"
+      },
+      {
+        "line": 202,
+        "text": "\t\t\t\tawait emit({ type: \"turn_start\" });"
+      },
+      {
+        "line": 203,
+        "text": "\t\t\t} else {"
+      },
+      {
+        "line": 204,
+        "text": "\t\t\t\tfirstTurn = false;"
+      },
+      {
+        "line": 205,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 206,
+        "text": ""
+      },
+      {
+        "line": 207,
+        "text": "\t\t\t// Process pending messages (inject before next assistant response)"
+      },
+      {
+        "line": 208,
+        "text": "\t\t\tif (pendingMessages.length > 0) {"
+      },
+      {
+        "line": 209,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：处理排队消息，把 steering/follow-up 注入上下文\", {"
+      },
+      {
+        "line": 210,
+        "text": "\t\t\t\t\tpendingMessageCount: pendingMessages.length,"
+      },
+      {
+        "line": 211,
+        "text": "\t\t\t\t\troles: pendingMessages.map((message) => message.role),"
+      },
+      {
+        "line": 212,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 213,
+        "text": "\t\t\t\tfor (const message of pendingMessages) {"
+      },
+      {
+        "line": 214,
+        "text": "\t\t\t\t\tawait emit({ type: \"message_start\", message });"
+      },
+      {
+        "line": 215,
+        "text": "\t\t\t\t\tawait emit({ type: \"message_end\", message });"
+      },
+      {
+        "line": 216,
+        "text": "\t\t\t\t\tcurrentContext.messages.push(message);"
+      },
+      {
+        "line": 217,
+        "text": "\t\t\t\t\tnewMessages.push(message);"
+      },
+      {
+        "line": 218,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 219,
+        "text": "\t\t\t\tpendingMessages = [];"
+      },
+      {
+        "line": 220,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 221,
+        "text": ""
+      },
+      {
+        "line": 222,
+        "text": "\t\t\t// Stream assistant response"
+      },
+      {
+        "line": 223,
+        "text": "\t\t\tconsole.log(\"[调试] runLoop：准备请求模型生成 assistant 响应\", {"
+      },
+      {
+        "line": 224,
+        "text": "\t\t\t\tcontextMessageCount: currentContext.messages.length,"
+      },
+      {
+        "line": 225,
+        "text": "\t\t\t\ttoolCount: currentContext.tools?.length ?? 0,"
+      },
+      {
+        "line": 226,
+        "text": "\t\t\t});"
+      },
+      {
+        "line": 227,
+        "text": "\t\t\t//streamAssistantResponse里面很多逻辑"
+      },
+      {
+        "line": 228,
+        "text": "\t\t\tconst message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);"
+      },
+      {
+        "line": 229,
+        "text": "\t\t\tnewMessages.push(message);"
+      },
+      {
+        "line": 230,
+        "text": "\t\t\tconsole.log(\"[调试] runLoop：assistant 响应完成，检查是否包含工具调用\", {"
+      },
+      {
+        "line": 231,
+        "text": "\t\t\t\tstopReason: message.stopReason,"
+      },
+      {
+        "line": 232,
+        "text": "\t\t\t\tcontentTypes: message.content.map((content) => content.type),"
+      },
+      {
+        "line": 233,
+        "text": "\t\t\t\ttoolCallCount: message.content.filter((content) => content.type === \"toolCall\").length,"
+      },
+      {
+        "line": 234,
+        "text": "\t\t\t});"
+      },
+      {
+        "line": 235,
+        "text": ""
+      },
+      {
+        "line": 236,
+        "text": "\t\t\tif (message.stopReason === \"error\" || message.stopReason === \"aborted\") {"
+      },
+      {
+        "line": 237,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：assistant 响应异常或中断，结束本轮 Agent Loop\", {"
+      },
+      {
+        "line": 238,
+        "text": "\t\t\t\t\tstopReason: message.stopReason,"
+      },
+      {
+        "line": 239,
+        "text": "\t\t\t\t\terrorMessage: message.errorMessage,"
+      },
+      {
+        "line": 240,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 241,
+        "text": "\t\t\t\tawait emit({ type: \"turn_end\", message, toolResults: [] });"
+      },
+      {
+        "line": 242,
+        "text": "\t\t\t\tawait emit({ type: \"agent_end\", messages: newMessages });"
+      },
+      {
+        "line": 243,
+        "text": "\t\t\t\treturn;"
+      },
+      {
+        "line": 244,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 245,
+        "text": ""
+      },
+      {
+        "line": 246,
+        "text": "\t\t\t// Check for tool calls"
+      },
+      {
+        "line": 247,
+        "text": "\t\t\tconst toolCalls = message.content.filter((c) => c.type === \"toolCall\");"
+      },
+      {
+        "line": 248,
+        "text": ""
+      },
+      {
+        "line": 249,
+        "text": "\t\t\tconst toolResults: ToolResultMessage[] = [];"
+      },
+      {
+        "line": 250,
+        "text": "\t\t\thasMoreToolCalls = false;"
+      },
+      {
+        "line": 251,
+        "text": "\t\t\tif (toolCalls.length > 0) {"
+      },
+      {
+        "line": 252,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：检测到工具调用，准备执行工具\", {"
+      },
+      {
+        "line": 253,
+        "text": "\t\t\t\t\ttoolCallCount: toolCalls.length,"
+      },
+      {
+        "line": 254,
+        "text": "\t\t\t\t\ttoolNames: toolCalls.map((toolCall) => toolCall.name),"
+      },
+      {
+        "line": 255,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 256,
+        "text": "\t\t\t\tconst executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);"
+      },
+      {
+        "line": 257,
+        "text": "\t\t\t\ttoolResults.push(...executedToolBatch.messages);"
+      },
+      {
+        "line": 258,
+        "text": "\t\t\t\thasMoreToolCalls = !executedToolBatch.terminate;"
+      },
+      {
+        "line": 259,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：工具调用执行完成，准备把工具结果写回上下文\", {"
+      },
+      {
+        "line": 260,
+        "text": "\t\t\t\t\ttoolResultCount: toolResults.length,"
+      },
+      {
+        "line": 261,
+        "text": "\t\t\t\t\thasMoreToolCalls,"
+      },
+      {
+        "line": 262,
+        "text": "\t\t\t\t\tterminate: executedToolBatch.terminate,"
+      },
+      {
+        "line": 263,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 264,
+        "text": ""
+      },
+      {
+        "line": 265,
+        "text": "\t\t\t\tfor (const result of toolResults) {"
+      },
+      {
+        "line": 266,
+        "text": "\t\t\t\t\tcurrentContext.messages.push(result);"
+      },
+      {
+        "line": 267,
+        "text": "\t\t\t\t\tnewMessages.push(result);"
+      },
+      {
+        "line": 268,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 269,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 270,
+        "text": ""
+      },
+      {
+        "line": 271,
+        "text": "\t\t\tawait emit({ type: \"turn_end\", message, toolResults });"
+      },
+      {
+        "line": 272,
+        "text": ""
+      },
+      {
+        "line": 273,
+        "text": "\t\t\tconst nextTurnContext = {"
+      },
+      {
+        "line": 274,
+        "text": "\t\t\t\tmessage,"
+      },
+      {
+        "line": 275,
+        "text": "\t\t\t\ttoolResults,"
+      },
+      {
+        "line": 276,
+        "text": "\t\t\t\tcontext: currentContext,"
+      },
+      {
+        "line": 277,
+        "text": "\t\t\t\tnewMessages,"
+      },
+      {
+        "line": 278,
+        "text": "\t\t\t};"
+      },
+      {
+        "line": 279,
+        "text": "\t\t\tconst nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);"
+      },
+      {
+        "line": 280,
+        "text": "\t\t\tif (nextTurnSnapshot) {"
+      },
+      {
+        "line": 281,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：prepareNextTurn 返回了下一轮配置，准备更新上下文或模型\", {"
+      },
+      {
+        "line": 282,
+        "text": "\t\t\t\t\thasContext: Boolean(nextTurnSnapshot.context),"
+      },
+      {
+        "line": 283,
+        "text": "\t\t\t\t\tnextProvider: nextTurnSnapshot.model?.provider,"
+      },
+      {
+        "line": 284,
+        "text": "\t\t\t\t\tnextModel: nextTurnSnapshot.model?.id,"
+      },
+      {
+        "line": 285,
+        "text": "\t\t\t\t\tnextThinkingLevel: nextTurnSnapshot.thinkingLevel,"
+      },
+      {
+        "line": 286,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 287,
+        "text": "\t\t\t\tcurrentContext = nextTurnSnapshot.context ?? currentContext;"
+      },
+      {
+        "line": 288,
+        "text": "\t\t\t\tconfig = {"
+      },
+      {
+        "line": 289,
+        "text": "\t\t\t\t\t...config,"
+      },
+      {
+        "line": 290,
+        "text": "\t\t\t\t\tmodel: nextTurnSnapshot.model ?? config.model,"
+      },
+      {
+        "line": 291,
+        "text": "\t\t\t\t\treasoning:"
+      },
+      {
+        "line": 292,
+        "text": "\t\t\t\t\t\tnextTurnSnapshot.thinkingLevel === undefined"
+      },
+      {
+        "line": 293,
+        "text": "\t\t\t\t\t\t\t? config.reasoning"
+      },
+      {
+        "line": 294,
+        "text": "\t\t\t\t\t\t\t: nextTurnSnapshot.thinkingLevel === \"off\""
+      },
+      {
+        "line": 295,
+        "text": "\t\t\t\t\t\t\t\t? undefined"
+      },
+      {
+        "line": 296,
+        "text": "\t\t\t\t\t\t\t\t: nextTurnSnapshot.thinkingLevel,"
+      },
+      {
+        "line": 297,
+        "text": "\t\t\t\t};"
+      },
+      {
+        "line": 298,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 299,
+        "text": ""
+      },
+      {
+        "line": 300,
+        "text": "\t\t\tif ("
+      },
+      {
+        "line": 301,
+        "text": "\t\t\t\tawait config.shouldStopAfterTurn?.({"
+      },
+      {
+        "line": 302,
+        "text": "\t\t\t\t\tmessage,"
+      },
+      {
+        "line": 303,
+        "text": "\t\t\t\t\ttoolResults,"
+      },
+      {
+        "line": 304,
+        "text": "\t\t\t\t\tcontext: currentContext,"
+      },
+      {
+        "line": 305,
+        "text": "\t\t\t\t\tnewMessages,"
+      },
+      {
+        "line": 306,
+        "text": "\t\t\t\t})"
+      },
+      {
+        "line": 307,
+        "text": "\t\t\t) {"
+      },
+      {
+        "line": 308,
+        "text": "\t\t\t\tawait emit({ type: \"agent_end\", messages: newMessages });"
+      },
+      {
+        "line": 309,
+        "text": "\t\t\t\treturn;"
+      },
+      {
+        "line": 310,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 311,
+        "text": ""
+      },
+      {
+        "line": 312,
+        "text": "\t\t\tpendingMessages = (await config.getSteeringMessages?.()) || [];"
+      },
+      {
+        "line": 313,
+        "text": "\t\t\tif (pendingMessages.length > 0) {"
+      },
+      {
+        "line": 314,
+        "text": "\t\t\t\tconsole.log(\"[调试] runLoop：本轮结束后发现新的 steering 消息，继续内层循环\", {"
+      },
+      {
+        "line": 315,
+        "text": "\t\t\t\t\tpendingSteeringCount: pendingMessages.length,"
+      },
+      {
+        "line": 316,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 317,
+        "text": "\t\t\t}"
+      },
+      {
+        "line": 318,
+        "text": "\t\t}"
+      },
+      {
+        "line": 319,
+        "text": ""
+      },
+      {
+        "line": 320,
+        "text": "\t\t// Agent would stop here. Check for follow-up messages."
+      },
+      {
+        "line": 321,
+        "text": "\t\tconst followUpMessages = (await config.getFollowUpMessages?.()) || [];"
+      },
+      {
+        "line": 322,
+        "text": "\t\tif (followUpMessages.length > 0) {"
+      },
+      {
+        "line": 323,
+        "text": "\t\t\tconsole.log(\"[调试] runLoop：发现 follow-up 消息，作为下一轮 pending 消息继续处理\", {"
+      },
+      {
+        "line": 324,
+        "text": "\t\t\t\tfollowUpCount: followUpMessages.length,"
+      },
+      {
+        "line": 325,
+        "text": "\t\t\t\troles: followUpMessages.map((message) => message.role),"
+      },
+      {
+        "line": 326,
+        "text": "\t\t\t});"
+      },
+      {
+        "line": 327,
+        "text": "\t\t\t// Set as pending so inner loop processes them"
+      },
+      {
+        "line": 328,
+        "text": "\t\t\tpendingMessages = followUpMessages;"
+      },
+      {
+        "line": 329,
+        "text": "\t\t\tcontinue;"
+      },
+      {
+        "line": 330,
+        "text": "\t\t}"
+      },
+      {
+        "line": 331,
+        "text": ""
+      },
+      {
+        "line": 332,
+        "text": "\t\t// No more messages, exit"
+      },
+      {
+        "line": 333,
+        "text": "\t\tbreak;"
+      },
+      {
+        "line": 334,
+        "text": "\t}"
+      },
+      {
+        "line": 335,
+        "text": ""
+      },
+      {
+        "line": 336,
+        "text": "\tawait emit({ type: \"agent_end\", messages: newMessages });"
+      },
+      {
+        "line": 337,
+        "text": "\tconsole.log(\"[调试] runLoop：没有新的工具调用或排队消息，Agent Loop 正常结束\", {"
+      },
+      {
+        "line": 338,
+        "text": "\t\tnewMessageCount: newMessages.length,"
+      },
+      {
+        "line": 339,
+        "text": "\t});"
+      },
+      {
+        "line": 340,
+        "text": "}"
+      }
+    ]
+  },
+  "stream.ts": {
+    "file": "packages/ai/src/stream.ts",
+    "ranges": "40-75",
+    "lines": [
+      {
+        "line": 40,
+        "text": "export function stream<TApi extends Api>("
+      },
+      {
+        "line": 41,
+        "text": "\tmodel: Model<TApi>,"
+      },
+      {
+        "line": 42,
+        "text": "\tcontext: Context,"
+      },
+      {
+        "line": 43,
+        "text": "\toptions?: ProviderStreamOptions,"
+      },
+      {
+        "line": 44,
+        "text": "): AssistantMessageEventStream {"
+      },
+      {
+        "line": 45,
+        "text": "\tconst provider = resolveApiProvider(model.api);"
+      },
+      {
+        "line": 46,
+        "text": "\treturn provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);"
+      },
+      {
+        "line": 47,
+        "text": "}"
+      },
+      {
+        "line": 48,
+        "text": ""
+      },
+      {
+        "line": 49,
+        "text": "export async function complete<TApi extends Api>("
+      },
+      {
+        "line": 50,
+        "text": "\tmodel: Model<TApi>,"
+      },
+      {
+        "line": 51,
+        "text": "\tcontext: Context,"
+      },
+      {
+        "line": 52,
+        "text": "\toptions?: ProviderStreamOptions,"
+      },
+      {
+        "line": 53,
+        "text": "): Promise<AssistantMessage> {"
+      },
+      {
+        "line": 54,
+        "text": "\tconst s = stream(model, context, options);"
+      },
+      {
+        "line": 55,
+        "text": "\treturn s.result();"
+      },
+      {
+        "line": 56,
+        "text": "}"
+      },
+      {
+        "line": 57,
+        "text": ""
+      },
+      {
+        "line": 58,
+        "text": "export function streamSimple<TApi extends Api>("
+      },
+      {
+        "line": 59,
+        "text": "\tmodel: Model<TApi>,"
+      },
+      {
+        "line": 60,
+        "text": "\tcontext: Context,"
+      },
+      {
+        "line": 61,
+        "text": "\toptions?: SimpleStreamOptions,"
+      },
+      {
+        "line": 62,
+        "text": "): AssistantMessageEventStream {"
+      },
+      {
+        "line": 63,
+        "text": "\tconst provider = resolveApiProvider(model.api);"
+      },
+      {
+        "line": 64,
+        "text": "\treturn provider.streamSimple(model, context, withEnvApiKey(model, options));"
+      },
+      {
+        "line": 65,
+        "text": "}"
+      },
+      {
+        "line": 66,
+        "text": ""
+      },
+      {
+        "line": 67,
+        "text": "export async function completeSimple<TApi extends Api>("
+      },
+      {
+        "line": 68,
+        "text": "\tmodel: Model<TApi>,"
+      },
+      {
+        "line": 69,
+        "text": "\tcontext: Context,"
+      },
+      {
+        "line": 70,
+        "text": "\toptions?: SimpleStreamOptions,"
+      },
+      {
+        "line": 71,
+        "text": "): Promise<AssistantMessage> {"
+      },
+      {
+        "line": 72,
+        "text": "\tconst s = streamSimple(model, context, options);"
+      },
+      {
+        "line": 73,
+        "text": "\treturn s.result();"
+      },
+      {
+        "line": 74,
+        "text": "}"
+      },
+      {
+        "line": 75,
+        "text": ""
+      }
+    ]
+  },
+  "tools-read.ts": {
+    "file": "packages/coding-agent/src/core/tools/read.ts",
+    "ranges": "33-40,203-260",
+    "lines": [
+      {
+        "line": 33,
+        "text": "\tkind: \"docs\" | \"resource\" | \"skill\";"
+      },
+      {
+        "line": 34,
+        "text": "\tlabel: string;"
+      },
+      {
+        "line": 35,
+        "text": "}"
+      },
+      {
+        "line": 36,
+        "text": ""
+      },
+      {
+        "line": 37,
+        "text": "const COMPACT_RESOURCE_FILE_NAMES = new Set([\"AGENTS.md\", \"AGENTS.MD\", \"CLAUDE.md\", \"CLAUDE.MD\"]);"
+      },
+      {
+        "line": 38,
+        "text": ""
+      },
+      {
+        "line": 39,
+        "text": "/**"
+      },
+      {
+        "line": 40,
+        "text": " * Pluggable operations for the read tool."
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 203,
+        "text": "export function createReadToolDefinition("
+      },
+      {
+        "line": 204,
+        "text": "\tcwd: string,"
+      },
+      {
+        "line": 205,
+        "text": "\toptions?: ReadToolOptions,"
+      },
+      {
+        "line": 206,
+        "text": "): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {"
+      },
+      {
+        "line": 207,
+        "text": "\tconst autoResizeImages = options?.autoResizeImages ?? true;"
+      },
+      {
+        "line": 208,
+        "text": "\tconst ops = options?.operations ?? defaultReadOperations;"
+      },
+      {
+        "line": 209,
+        "text": "\treturn {"
+      },
+      {
+        "line": 210,
+        "text": "\t\tname: \"read\","
+      },
+      {
+        "line": 211,
+        "text": "\t\tlabel: \"read\","
+      },
+      {
+        "line": 212,
+        "text": "\t\tdescription: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,"
+      },
+      {
+        "line": 213,
+        "text": "\t\tpromptSnippet: \"Read file contents\","
+      },
+      {
+        "line": 214,
+        "text": "\t\tpromptGuidelines: [\"Use read to examine files instead of cat or sed.\"],"
+      },
+      {
+        "line": 215,
+        "text": "\t\tparameters: readSchema,"
+      },
+      {
+        "line": 216,
+        "text": "\t\tasync execute("
+      },
+      {
+        "line": 217,
+        "text": "\t\t\t_toolCallId,"
+      },
+      {
+        "line": 218,
+        "text": "\t\t\t{ path, offset, limit }: { path: string; offset?: number; limit?: number },"
+      },
+      {
+        "line": 219,
+        "text": "\t\t\tsignal?: AbortSignal,"
+      },
+      {
+        "line": 220,
+        "text": "\t\t\t_onUpdate?,"
+      },
+      {
+        "line": 221,
+        "text": "\t\t\tctx?,"
+      },
+      {
+        "line": 222,
+        "text": "\t\t) {"
+      },
+      {
+        "line": 223,
+        "text": "\t\t\treturn new Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }>("
+      },
+      {
+        "line": 224,
+        "text": "\t\t\t\t(resolve, reject) => {"
+      },
+      {
+        "line": 225,
+        "text": "\t\t\t\t\tif (signal?.aborted) {"
+      },
+      {
+        "line": 226,
+        "text": "\t\t\t\t\t\treject(new Error(\"Operation aborted\"));"
+      },
+      {
+        "line": 227,
+        "text": "\t\t\t\t\t\treturn;"
+      },
+      {
+        "line": 228,
+        "text": "\t\t\t\t\t}"
+      },
+      {
+        "line": 229,
+        "text": "\t\t\t\t\tlet aborted = false;"
+      },
+      {
+        "line": 230,
+        "text": "\t\t\t\t\tconst onAbort = () => {"
+      },
+      {
+        "line": 231,
+        "text": "\t\t\t\t\t\taborted = true;"
+      },
+      {
+        "line": 232,
+        "text": "\t\t\t\t\t\treject(new Error(\"Operation aborted\"));"
+      },
+      {
+        "line": 233,
+        "text": "\t\t\t\t\t};"
+      },
+      {
+        "line": 234,
+        "text": "\t\t\t\t\tsignal?.addEventListener(\"abort\", onAbort, { once: true });"
+      },
+      {
+        "line": 235,
+        "text": ""
+      },
+      {
+        "line": 236,
+        "text": "\t\t\t\t\t(async () => {"
+      },
+      {
+        "line": 237,
+        "text": "\t\t\t\t\t\ttry {"
+      },
+      {
+        "line": 238,
+        "text": "\t\t\t\t\t\t\tconst absolutePath = await resolveReadPathAsync(path, cwd);"
+      },
+      {
+        "line": 239,
+        "text": "\t\t\t\t\t\t\tif (aborted) return;"
+      },
+      {
+        "line": 240,
+        "text": "\t\t\t\t\t\t\t// Check if file exists and is readable."
+      },
+      {
+        "line": 241,
+        "text": "\t\t\t\t\t\t\tawait ops.access(absolutePath);"
+      },
+      {
+        "line": 242,
+        "text": "\t\t\t\t\t\t\tif (aborted) return;"
+      },
+      {
+        "line": 243,
+        "text": "\t\t\t\t\t\t\tconst mimeType = ops.detectImageMimeType ? await ops.detectImageMimeType(absolutePath) : undefined;"
+      },
+      {
+        "line": 244,
+        "text": "\t\t\t\t\t\t\tlet content: (TextContent | ImageContent)[];"
+      },
+      {
+        "line": 245,
+        "text": "\t\t\t\t\t\t\tlet details: ReadToolDetails | undefined;"
+      },
+      {
+        "line": 246,
+        "text": "\t\t\t\t\t\t\tconst nonVisionImageNote = getNonVisionImageNote(ctx?.model);"
+      },
+      {
+        "line": 247,
+        "text": "\t\t\t\t\t\t\tif (mimeType) {"
+      },
+      {
+        "line": 248,
+        "text": "\t\t\t\t\t\t\t\t// Read image as binary."
+      },
+      {
+        "line": 249,
+        "text": "\t\t\t\t\t\t\t\tconst buffer = await ops.readFile(absolutePath);"
+      },
+      {
+        "line": 250,
+        "text": "\t\t\t\t\t\t\t\tif (autoResizeImages) {"
+      },
+      {
+        "line": 251,
+        "text": "\t\t\t\t\t\t\t\t\t// Resize image if needed before sending it back to the model."
+      },
+      {
+        "line": 252,
+        "text": "\t\t\t\t\t\t\t\t\tconst resized = await resizeImage(buffer, mimeType);"
+      },
+      {
+        "line": 253,
+        "text": "\t\t\t\t\t\t\t\t\tif (!resized) {"
+      },
+      {
+        "line": 254,
+        "text": "\t\t\t\t\t\t\t\t\t\tlet textNote = `Read image file [${mimeType}]\\n[Image omitted: could not be resized below the inline image size limit.]`;"
+      },
+      {
+        "line": 255,
+        "text": "\t\t\t\t\t\t\t\t\t\tif (nonVisionImageNote) textNote += `\\n${nonVisionImageNote}`;"
+      },
+      {
+        "line": 256,
+        "text": "\t\t\t\t\t\t\t\t\t\tcontent = [{ type: \"text\", text: textNote }];"
+      },
+      {
+        "line": 257,
+        "text": "\t\t\t\t\t\t\t\t\t} else {"
+      },
+      {
+        "line": 258,
+        "text": "\t\t\t\t\t\t\t\t\t\tconst dimensionNote = formatDimensionNote(resized);"
+      },
+      {
+        "line": 259,
+        "text": "\t\t\t\t\t\t\t\t\t\tlet textNote = `Read image file [${resized.mimeType}]`;"
+      },
+      {
+        "line": 260,
+        "text": "\t\t\t\t\t\t\t\t\t\tif (dimensionNote) textNote += `\\n${dimensionNote}`;"
+      }
+    ]
+  },
+  "tools-bash.ts": {
+    "file": "packages/coding-agent/src/core/tools/bash.ts",
+    "ranges": "22-29,269-320",
+    "lines": [
+      {
+        "line": 22,
+        "text": "import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from \"./truncate.ts\";"
+      },
+      {
+        "line": 23,
+        "text": ""
+      },
+      {
+        "line": 24,
+        "text": "const bashSchema = Type.Object({"
+      },
+      {
+        "line": 25,
+        "text": "\tcommand: Type.String({ description: \"Bash command to execute\" }),"
+      },
+      {
+        "line": 26,
+        "text": "\ttimeout: Type.Optional(Type.Number({ description: \"Timeout in seconds (optional, no default timeout)\" })),"
+      },
+      {
+        "line": 27,
+        "text": "});"
+      },
+      {
+        "line": 28,
+        "text": ""
+      },
+      {
+        "line": 29,
+        "text": "export type BashToolInput = Static<typeof bashSchema>;"
+      },
+      {
+        "line": null,
+        "text": "..."
+      },
+      {
+        "line": 269,
+        "text": "export function createBashToolDefinition("
+      },
+      {
+        "line": 270,
+        "text": "\tcwd: string,"
+      },
+      {
+        "line": 271,
+        "text": "\toptions?: BashToolOptions,"
+      },
+      {
+        "line": 272,
+        "text": "): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {"
+      },
+      {
+        "line": 273,
+        "text": "\tconst ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });"
+      },
+      {
+        "line": 274,
+        "text": "\tconst commandPrefix = options?.commandPrefix;"
+      },
+      {
+        "line": 275,
+        "text": "\tconst spawnHook = options?.spawnHook;"
+      },
+      {
+        "line": 276,
+        "text": "\treturn {"
+      },
+      {
+        "line": 277,
+        "text": "\t\tname: \"bash\","
+      },
+      {
+        "line": 278,
+        "text": "\t\tlabel: \"bash\","
+      },
+      {
+        "line": 279,
+        "text": "\t\tdescription: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,"
+      },
+      {
+        "line": 280,
+        "text": "\t\tpromptSnippet: \"Execute bash commands (ls, grep, find, etc.)\","
+      },
+      {
+        "line": 281,
+        "text": "\t\tparameters: bashSchema,"
+      },
+      {
+        "line": 282,
+        "text": "\t\tasync execute("
+      },
+      {
+        "line": 283,
+        "text": "\t\t\t_toolCallId,"
+      },
+      {
+        "line": 284,
+        "text": "\t\t\t{ command, timeout }: { command: string; timeout?: number },"
+      },
+      {
+        "line": 285,
+        "text": "\t\t\tsignal?: AbortSignal,"
+      },
+      {
+        "line": 286,
+        "text": "\t\t\tonUpdate?,"
+      },
+      {
+        "line": 287,
+        "text": "\t\t\t_ctx?,"
+      },
+      {
+        "line": 288,
+        "text": "\t\t) {"
+      },
+      {
+        "line": 289,
+        "text": "\t\t\tconst resolvedCommand = commandPrefix ? `${commandPrefix}\\n${command}` : command;"
+      },
+      {
+        "line": 290,
+        "text": "\t\t\tconst spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);"
+      },
+      {
+        "line": 291,
+        "text": "\t\t\tconst output = new OutputAccumulator({ tempFilePrefix: \"pi-bash\" });"
+      },
+      {
+        "line": 292,
+        "text": "\t\t\tlet updateTimer: NodeJS.Timeout | undefined;"
+      },
+      {
+        "line": 293,
+        "text": "\t\t\tlet updateDirty = false;"
+      },
+      {
+        "line": 294,
+        "text": "\t\t\tlet lastUpdateAt = 0;"
+      },
+      {
+        "line": 295,
+        "text": ""
+      },
+      {
+        "line": 296,
+        "text": "\t\t\tconst emitOutputUpdate = () => {"
+      },
+      {
+        "line": 297,
+        "text": "\t\t\t\tif (!onUpdate || !updateDirty) return;"
+      },
+      {
+        "line": 298,
+        "text": "\t\t\t\tupdateDirty = false;"
+      },
+      {
+        "line": 299,
+        "text": "\t\t\t\tlastUpdateAt = Date.now();"
+      },
+      {
+        "line": 300,
+        "text": "\t\t\t\tconst snapshot = output.snapshot({ persistIfTruncated: true });"
+      },
+      {
+        "line": 301,
+        "text": "\t\t\t\tonUpdate({"
+      },
+      {
+        "line": 302,
+        "text": "\t\t\t\t\tcontent: [{ type: \"text\", text: snapshot.content || \"\" }],"
+      },
+      {
+        "line": 303,
+        "text": "\t\t\t\t\tdetails: {"
+      },
+      {
+        "line": 304,
+        "text": "\t\t\t\t\t\ttruncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,"
+      },
+      {
+        "line": 305,
+        "text": "\t\t\t\t\t\tfullOutputPath: snapshot.fullOutputPath,"
+      },
+      {
+        "line": 306,
+        "text": "\t\t\t\t\t},"
+      },
+      {
+        "line": 307,
+        "text": "\t\t\t\t});"
+      },
+      {
+        "line": 308,
+        "text": "\t\t\t};"
+      },
+      {
+        "line": 309,
+        "text": ""
+      },
+      {
+        "line": 310,
+        "text": "\t\t\tconst clearUpdateTimer = () => {"
+      },
+      {
+        "line": 311,
+        "text": "\t\t\t\tif (updateTimer) {"
+      },
+      {
+        "line": 312,
+        "text": "\t\t\t\t\tclearTimeout(updateTimer);"
+      },
+      {
+        "line": 313,
+        "text": "\t\t\t\t\tupdateTimer = undefined;"
+      },
+      {
+        "line": 314,
+        "text": "\t\t\t\t}"
+      },
+      {
+        "line": 315,
+        "text": "\t\t\t};"
+      },
+      {
+        "line": 316,
+        "text": ""
+      },
+      {
+        "line": 317,
+        "text": "\t\t\tconst scheduleOutputUpdate = () => {"
+      },
+      {
+        "line": 318,
+        "text": "\t\t\t\tif (!onUpdate) return;"
+      },
+      {
+        "line": 319,
+        "text": "\t\t\t\tupdateDirty = true;"
+      },
+      {
+        "line": 320,
+        "text": "\t\t\t\tconst delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);"
+      }
+    ]
+  }
+}
